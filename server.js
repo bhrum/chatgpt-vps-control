@@ -16,7 +16,7 @@ const MCP_PREFIX = process.env.MCP_PATH_PREFIX ?? "/mcp";
 const TOKEN = process.env.VPS_APP_TOKEN ?? "";
 const HISTORY_PATH = process.env.HISTORY_PATH ?? resolve(process.cwd(), "history.jsonl");
 const MAX_OUTPUT_CHARS = Number(process.env.MAX_OUTPUT_CHARS ?? 12000);
-const MAX_TIMEOUT_SECONDS = Number(process.env.MAX_TIMEOUT_SECONDS ?? 30);
+const MAX_TIMEOUT_SECONDS = Number(process.env.MAX_TIMEOUT_SECONDS ?? 600);
 
 if (!TOKEN || TOKEN.length < 24) {
   console.error("VPS_APP_TOKEN must be set to a random token of at least 24 characters.");
@@ -26,7 +26,7 @@ if (!TOKEN || TOKEN.length < 24) {
 const commandResultSchema = {
   command: z.string(),
   cwd: z.string(),
-  status: z.enum(["completed", "failed", "blocked"]),
+  status: z.enum(["completed", "failed"]),
   exitCode: z.number().nullable(),
   signal: z.string().nullable(),
   durationMs: z.number(),
@@ -105,35 +105,6 @@ function clipOutput(value) {
   };
 }
 
-function blockedReason(command) {
-  const normalized = command.toLowerCase();
-  const patterns = [
-    /\brm\s+(-[^\s]*[rf][^\s]*|--recursive|--force)[^;&|]*\//i,
-    /\bmkfs(\.\w+)?\b/i,
-    /\bdd\b.*\bof=\/dev\//i,
-    /\bshutdown\b|\breboot\b|\bpoweroff\b|\bhalt\b/i,
-    /\bpasswd\b|\bchpasswd\b/i,
-    /\buserdel\b|\bdeluser\b/i,
-    /\bvisudo\b/i,
-    /\biptables\b|\bnft\b|\bufw\b/i,
-    /\bsudo\b|\bsu\s+-?\b/i,
-    /\/etc\/shadow|\/etc\/sudoers|\/proc\/\d+\/environ/i,
-    /(^|\/)\.ssh(\/|$)/i,
-    /vps_app_token/i,
-    /:\(\)\s*\{\s*:\|:\s*&\s*\}/,
-  ];
-
-  if (normalized.length > 2000) {
-    return "Command is too long.";
-  }
-
-  if (patterns.some((pattern) => pattern.test(command))) {
-    return "Command matched a high-risk pattern that this connector blocks.";
-  }
-
-  return "";
-}
-
 function safeCwd(cwd) {
   const fallback = homedir();
   if (!cwd) {
@@ -184,25 +155,6 @@ async function runCommand(command, cwd, timeoutSeconds, options = {}) {
   const workingDirectory = safeCwd(cwd);
   const timeoutMs = Math.min(Math.max(Number(timeoutSeconds ?? 10), 1), MAX_TIMEOUT_SECONDS) * 1000;
   const started = Date.now();
-  const reason = blockedReason(command);
-
-  if (reason) {
-    const blocked = {
-      command,
-      cwd: workingDirectory,
-      status: "blocked",
-      exitCode: null,
-      signal: null,
-      durationMs: Date.now() - started,
-      stdout: "",
-      stderr: reason,
-      truncated: false,
-    };
-    if (audit) {
-      await writeHistory(blocked);
-    }
-    return blocked;
-  }
 
   try {
     const result = await execFileAsync("/bin/bash", ["-lc", command], {
@@ -305,7 +257,7 @@ async function createVpsServer() {
     {
       title: "Run shell command",
       description:
-        "Run a Bash command on the Oracle VPS as the service user. Use short, explicit commands. High-risk root, firewall, reboot, credential, and destructive patterns are blocked.",
+        "Run any Bash command on the Oracle VPS as the service user. For root-level operations, prefix commands with sudo.",
       inputSchema: {
         command: z.string().min(1).max(2000),
         cwd: z.string().optional().describe("Working directory. Defaults to the service user's home directory."),

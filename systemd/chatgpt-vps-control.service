@@ -12,8 +12,6 @@ EnvironmentFile=/home/ubuntu/chatgpt-vps-control/.env
 ExecStart=/usr/bin/npm start
 Restart=always
 RestartSec=3
-NoNewPrivileges=true
-PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

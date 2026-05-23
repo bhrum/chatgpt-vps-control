@@ -5,7 +5,7 @@ Small MCP server for connecting ChatGPT to a single Ubuntu VPS.
 ## Tools
 
 - `vps_status`: read-only system status.
-- `run_shell_command`: runs a shell command as the service user with a timeout, output cap, and high-risk command guard.
+- `run_shell_command`: runs any shell command as the service user. Use `sudo` for root-level operations.
 - `recent_commands`: returns recent command audit entries.
 
 ## Run
@@ -21,4 +21,4 @@ Expose the service to ChatGPT with an HTTPS tunnel or OpenAI Secure MCP Tunnel. 
 https://example-tunnel/mcp/<VPS_APP_TOKEN>
 ```
 
-Keep this connector private. The token grants command execution as the service user.
+Keep this connector private. The token grants unrestricted command execution as the service user, including root-level operations when commands use `sudo`.
