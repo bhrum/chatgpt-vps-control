@@ -2,11 +2,13 @@ import { createServer } from "node:http";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
 import { execFile } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { homedir, hostname, platform, release, totalmem, freemem } from "node:os";
 import { dirname, resolve } from "node:path";
 import { promisify } from "node:util";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 const execFileAsync = promisify(execFile);
@@ -18,6 +20,12 @@ const HISTORY_PATH = process.env.HISTORY_PATH ?? resolve(process.cwd(), "history
 const MAX_OUTPUT_CHARS = Number(process.env.MAX_OUTPUT_CHARS ?? 12000);
 const MAX_TIMEOUT_SECONDS = Number(process.env.MAX_TIMEOUT_SECONDS ?? 600);
 const NO_AUTH_SECURITY_SCHEMES = [{ type: "noauth" }];
+const WRITE_SECURITY_SCHEMES = [{ type: "oauth2", scopes: ["vps.write"] }];
+const OAUTH_SCOPES = ["vps.read", "vps.write"];
+const OAUTH_CODES = new Map();
+const OAUTH_TOKENS = new Map();
+const OAUTH_CODE_TTL_MS = 5 * 60 * 1000;
+const OAUTH_TOKEN_TTL_SECONDS = 24 * 60 * 60;
 
 if (!TOKEN || TOKEN.length < 24) {
   console.error("VPS_APP_TOKEN must be set to a random token of at least 24 characters.");
@@ -57,10 +65,49 @@ const writeTextFileResultSchema = {
   message: z.string(),
 };
 
-function tokenFromRequest(req, url) {
+const commandResultJsonSchema = {
+  type: "object",
+  properties: {
+    command: { type: "string" },
+    cwd: { type: "string" },
+    status: { type: "string", enum: ["completed", "failed"] },
+    exitCode: { type: ["number", "null"] },
+    signal: { type: ["string", "null"] },
+    durationMs: { type: "number" },
+    stdout: { type: "string" },
+    stderr: { type: "string" },
+    truncated: { type: "boolean" },
+  },
+  required: ["command", "cwd", "status", "exitCode", "signal", "durationMs", "stdout", "stderr", "truncated"],
+  additionalProperties: false,
+};
+
+const writeTextFileResultJsonSchema = {
+  type: "object",
+  properties: {
+    filePath: { type: "string" },
+    mode: { type: "string", enum: ["create", "append"] },
+    bytesWritten: { type: "number" },
+    status: { type: "string", enum: ["written", "failed"] },
+    message: { type: "string" },
+  },
+  required: ["filePath", "mode", "bytesWritten", "status", "message"],
+  additionalProperties: false,
+};
+
+function bearerTokenFromRequest(req) {
   const auth = req.headers.authorization ?? "";
   if (auth.toLowerCase().startsWith("bearer ")) {
     return auth.slice("bearer ".length).trim();
+  }
+
+  return "";
+}
+
+function tokenFromRequest(req, url) {
+  const bearerToken = bearerTokenFromRequest(req);
+  if (bearerToken) {
+    return bearerToken;
   }
 
   const queryToken = url.searchParams.get("token");
@@ -80,8 +127,22 @@ function isMcpPath(pathname) {
   return pathname === MCP_PREFIX || pathname.startsWith(`${MCP_PREFIX}/`);
 }
 
+function hasValidOAuthToken(token, requiredScope = "vps.write") {
+  const entry = OAUTH_TOKENS.get(token);
+  if (!entry) {
+    return false;
+  }
+
+  if (entry.expiresAt <= Date.now()) {
+    OAUTH_TOKENS.delete(token);
+    return false;
+  }
+
+  return entry.scopes.includes(requiredScope);
+}
+
 function isAuthorized(req, url) {
-  return tokenFromRequest(req, url) === TOKEN;
+  return tokenFromRequest(req, url) === TOKEN || hasValidOAuthToken(bearerTokenFromRequest(req));
 }
 
 function corsHeaders() {
@@ -99,6 +160,68 @@ function writeJson(res, statusCode, payload) {
     ...corsHeaders(),
   });
   res.end(JSON.stringify(payload, null, 2));
+}
+
+function publicOrigin(req) {
+  const forwardedProto = String(req.headers["x-forwarded-proto"] ?? "").split(",")[0].trim();
+  const forwardedHost = String(req.headers["x-forwarded-host"] ?? "").split(",")[0].trim();
+  const proto = forwardedProto || (req.headers.host?.startsWith("127.0.0.1") ? "http" : "https");
+  const host = forwardedHost || req.headers.host || `127.0.0.1:${PORT}`;
+  return `${proto}://${host}`;
+}
+
+function oauthMetadata(req) {
+  const origin = publicOrigin(req);
+  return {
+    issuer: origin,
+    authorization_endpoint: `${origin}/oauth/authorize`,
+    token_endpoint: `${origin}/oauth/token`,
+    registration_endpoint: `${origin}/oauth/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
+    client_id_metadata_document_supported: true,
+    scopes_supported: OAUTH_SCOPES,
+  };
+}
+
+function protectedResourceMetadata(req) {
+  const origin = publicOrigin(req);
+  return {
+    resource: `${origin}${MCP_PREFIX}`,
+    authorization_servers: [origin],
+    scopes_supported: OAUTH_SCOPES,
+    resource_documentation: "https://github.com/bhrum/chatgpt-vps-control",
+  };
+}
+
+async function readRequestText(req, maxBytes = 1024 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxBytes) {
+      throw new Error("Request body is too large.");
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function randomToken(bytes = 32) {
+  return randomBytes(bytes).toString("base64url");
+}
+
+function pkceChallenge(verifier) {
+  return createHash("sha256").update(verifier).digest("base64url");
+}
+
+function htmlEscape(value) {
+  return String(value).replace(/[&<>"']/g, (char) => {
+    const escapes = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+    return escapes[char];
+  });
 }
 
 function clipOutput(value) {
@@ -142,14 +265,145 @@ function byteLength(value) {
   return Buffer.byteLength(String(value), "utf8");
 }
 
-function toolMeta(invoking, invoked) {
+function toolMeta(invoking, invoked, securitySchemes = NO_AUTH_SECURITY_SCHEMES) {
   return {
-    securitySchemes: NO_AUTH_SECURITY_SCHEMES,
+    securitySchemes,
     "openai/visibility": "public",
     "openai/toolInvocation/invoking": invoking,
     "openai/toolInvocation/invoked": invoked,
   };
 }
+
+const TOOL_DESCRIPTORS = [
+  {
+    name: "vps_status",
+    title: "VPS status",
+    description: "Read-only status summary for this Oracle Ubuntu VPS.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    outputSchema: {
+      type: "object",
+      properties: {
+        hostname: { type: "string" },
+        platform: { type: "string" },
+        release: { type: "string" },
+        uptime: { type: "string" },
+        memory: {
+          type: "object",
+          properties: {
+            totalBytes: { type: "number" },
+            freeBytes: { type: "number" },
+          },
+          required: ["totalBytes", "freeBytes"],
+          additionalProperties: false,
+        },
+        disk: { type: "string" },
+        processes: { type: "string" },
+      },
+      required: ["hostname", "platform", "release", "uptime", "memory", "disk", "processes"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: true,
+      idempotentHint: true,
+    },
+    securitySchemes: NO_AUTH_SECURITY_SCHEMES,
+    _meta: toolMeta("Checking VPS status", "VPS status ready"),
+  },
+  {
+    name: "run_shell_command",
+    title: "Run shell command",
+    description:
+      "Run any Bash command on the Oracle VPS as the service user. For root-level operations, prefix commands with sudo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        command: { type: "string", minLength: 1, maxLength: 2000 },
+        cwd: { type: "string", description: "Working directory. Defaults to the service user's home directory." },
+        timeoutSeconds: { type: "integer", minimum: 1, maximum: MAX_TIMEOUT_SECONDS },
+      },
+      required: ["command"],
+      additionalProperties: false,
+    },
+    outputSchema: commandResultJsonSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: true,
+    },
+    securitySchemes: WRITE_SECURITY_SCHEMES,
+    _meta: toolMeta("Running shell command", "Shell command finished", WRITE_SECURITY_SCHEMES),
+  },
+  {
+    name: "write_text_file",
+    title: "Write text file",
+    description:
+      "Create a new UTF-8 text file or append text to an existing file on the Oracle VPS. Create mode fails if the file already exists.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        filePath: {
+          type: "string",
+          minLength: 1,
+          maxLength: 1000,
+          description: "Absolute path, ~/path, or path relative to cwd.",
+        },
+        content: { type: "string", maxLength: 200000 },
+        mode: { type: "string", enum: ["create", "append"], default: "create" },
+        cwd: { type: "string", description: "Base directory for relative filePath values." },
+      },
+      required: ["filePath", "content"],
+      additionalProperties: false,
+    },
+    outputSchema: writeTextFileResultJsonSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: true,
+    },
+    securitySchemes: WRITE_SECURITY_SCHEMES,
+    _meta: toolMeta("Writing text file", "Text file write finished", WRITE_SECURITY_SCHEMES),
+  },
+  {
+    name: "recent_commands",
+    title: "Recent commands",
+    description: "Show recent command audit entries from this connector.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", minimum: 1, maximum: 20 },
+      },
+      additionalProperties: false,
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        commands: {
+          type: "array",
+          items: {
+            ...commandResultJsonSchema,
+            properties: {
+              ...commandResultJsonSchema.properties,
+              at: { type: "string" },
+            },
+            required: [...commandResultJsonSchema.required, "at"],
+          },
+        },
+      },
+      required: ["commands"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    securitySchemes: NO_AUTH_SECURITY_SCHEMES,
+    _meta: toolMeta("Reading command history", "Command history ready"),
+  },
+];
 
 function commandEnv() {
   return {
@@ -301,7 +555,7 @@ async function createVpsServer() {
         destructiveHint: true,
         openWorldHint: true,
       },
-      _meta: toolMeta("Running shell command", "Shell command finished"),
+      _meta: toolMeta("Running shell command", "Shell command finished", WRITE_SECURITY_SCHEMES),
     },
     async ({ command, cwd, timeoutSeconds }) => {
       const result = await runCommand(command, cwd, timeoutSeconds);
@@ -338,7 +592,7 @@ async function createVpsServer() {
         destructiveHint: false,
         openWorldHint: true,
       },
-      _meta: toolMeta("Writing text file", "Text file write finished"),
+      _meta: toolMeta("Writing text file", "Text file write finished", WRITE_SECURITY_SCHEMES),
     },
     async ({ filePath, content, mode, cwd }) => {
       const writeMode = mode ?? "create";
@@ -437,7 +691,117 @@ async function createVpsServer() {
     }
   );
 
+  server.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: TOOL_DESCRIPTORS,
+  }));
+
   return server;
+}
+
+async function handleOAuthRegister(req, res) {
+  let body = {};
+  try {
+    const text = await readRequestText(req);
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    body = {};
+  }
+
+  writeJson(res, 201, {
+    client_id: body.client_id || `chatgpt-${randomToken(12)}`,
+    client_id_issued_at: Math.floor(Date.now() / 1000),
+    redirect_uris: body.redirect_uris || [],
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code"],
+    response_types: ["code"],
+  });
+}
+
+function handleOAuthAuthorize(req, res, url) {
+  const params = Object.fromEntries(url.searchParams.entries());
+  const required = ["client_id", "redirect_uri", "response_type", "state"];
+  const missing = required.filter((name) => !params[name]);
+  if (missing.length || params.response_type !== "code") {
+    writeJson(res, 400, { error: "invalid_request", error_description: `Missing or invalid: ${missing.join(", ")}` });
+    return;
+  }
+
+  if (url.searchParams.get("approve") !== "1") {
+    const hidden = Object.entries(params)
+      .map(([key, value]) => `<input type="hidden" name="${htmlEscape(key)}" value="${htmlEscape(value)}">`)
+      .join("\n");
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(`<!doctype html>
+<html>
+  <head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Oracle VPS Control</title></head>
+  <body style="font-family: system-ui, sans-serif; max-width: 560px; margin: 48px auto; line-height: 1.5;">
+    <h1>Authorize Oracle VPS Control</h1>
+    <p>This grants ChatGPT permission to use the VPS write tools exposed by this connector.</p>
+    <form method="get" action="/oauth/authorize">
+      ${hidden}
+      <input type="hidden" name="approve" value="1">
+      <button style="font: inherit; padding: 10px 16px;">Authorize</button>
+    </form>
+  </body>
+</html>`);
+    return;
+  }
+
+  const code = randomToken(24);
+  const scope = params.scope || OAUTH_SCOPES.join(" ");
+  OAUTH_CODES.set(code, {
+    clientId: params.client_id,
+    redirectUri: params.redirect_uri,
+    codeChallenge: params.code_challenge,
+    codeChallengeMethod: params.code_challenge_method,
+    scopes: scope.split(/\s+/).filter(Boolean),
+    expiresAt: Date.now() + OAUTH_CODE_TTL_MS,
+  });
+
+  const redirectUrl = new URL(params.redirect_uri);
+  redirectUrl.searchParams.set("code", code);
+  redirectUrl.searchParams.set("state", params.state);
+  res.writeHead(302, { location: redirectUrl.href });
+  res.end();
+}
+
+async function handleOAuthToken(req, res) {
+  const text = await readRequestText(req);
+  const params = new URLSearchParams(text);
+  const grantType = params.get("grant_type");
+
+  if (grantType !== "authorization_code") {
+    writeJson(res, 400, { error: "unsupported_grant_type" });
+    return;
+  }
+
+  const code = params.get("code") || "";
+  const entry = OAUTH_CODES.get(code);
+  if (!entry || entry.expiresAt <= Date.now()) {
+    OAUTH_CODES.delete(code);
+    writeJson(res, 400, { error: "invalid_grant" });
+    return;
+  }
+
+  const verifier = params.get("code_verifier") || "";
+  if (entry.codeChallengeMethod === "S256" && entry.codeChallenge && pkceChallenge(verifier) !== entry.codeChallenge) {
+    writeJson(res, 400, { error: "invalid_grant", error_description: "PKCE verification failed." });
+    return;
+  }
+
+  OAUTH_CODES.delete(code);
+  const accessToken = randomToken(32);
+  OAUTH_TOKENS.set(accessToken, {
+    scopes: Array.from(new Set([...entry.scopes, ...OAUTH_SCOPES])),
+    expiresAt: Date.now() + OAUTH_TOKEN_TTL_SECONDS * 1000,
+  });
+
+  writeJson(res, 200, {
+    access_token: accessToken,
+    token_type: "Bearer",
+    expires_in: OAUTH_TOKEN_TTL_SECONDS,
+    scope: OAUTH_SCOPES.join(" "),
+  });
 }
 
 const httpServer = createServer(async (req, res) => {
@@ -448,7 +812,7 @@ const httpServer = createServer(async (req, res) => {
 
   const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
 
-  if (req.method === "OPTIONS" && isMcpPath(url.pathname)) {
+  if (req.method === "OPTIONS" && (isMcpPath(url.pathname) || url.pathname.startsWith("/oauth/"))) {
     res.writeHead(204, corsHeaders());
     res.end();
     return;
@@ -471,12 +835,45 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
+  if (
+    req.method === "GET" &&
+    (url.pathname === "/.well-known/oauth-protected-resource" ||
+      url.pathname === `/.well-known/oauth-protected-resource${MCP_PREFIX}`)
+  ) {
+    writeJson(res, 200, protectedResourceMetadata(req));
+    return;
+  }
+
+  if (
+    req.method === "GET" &&
+    (url.pathname === "/.well-known/oauth-authorization-server" ||
+      url.pathname === "/.well-known/openid-configuration")
+  ) {
+    writeJson(res, 200, oauthMetadata(req));
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/oauth/register") {
+    await handleOAuthRegister(req, res);
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/oauth/authorize") {
+    handleOAuthAuthorize(req, res, url);
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/oauth/token") {
+    await handleOAuthToken(req, res);
+    return;
+  }
+
   const allowedMethods = new Set(["POST", "GET", "DELETE"]);
   if (isMcpPath(url.pathname) && req.method && allowedMethods.has(req.method)) {
     if (!isAuthorized(req, url)) {
       res.writeHead(401, {
         ...corsHeaders(),
-        "WWW-Authenticate": 'Bearer realm="oracle-vps-control"',
+        "WWW-Authenticate": `Bearer resource_metadata="${publicOrigin(req)}/.well-known/oauth-protected-resource", scope="vps.write"`,
       });
       res.end("Unauthorized");
       return;

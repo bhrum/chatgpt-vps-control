@@ -9,7 +9,7 @@ Small MCP server for connecting ChatGPT to a single Ubuntu VPS.
 - `write_text_file`: creates a new UTF-8 file or appends text to an existing file without overwriting existing data.
 - `recent_commands`: returns recent command audit entries.
 
-Each tool advertises explicit Apps SDK metadata: read/write annotations plus a `noauth` `securitySchemes` mirror in `_meta`. ChatGPT uses these hints to classify read and write operations and frame confirmation prompts; the server still enforces the private connector token on every MCP request.
+Each tool advertises explicit Apps SDK metadata: read/write annotations plus tool-level `securitySchemes`. Read-only tools allow `noauth`; write tools advertise OAuth scope `vps.write` and mirror the same scheme in `_meta` for ChatGPT compatibility. The server still accepts the private connector token on every MCP request and also includes a minimal OAuth 2.1 flow for ChatGPT account linking tests.
 
 ## Run
 
