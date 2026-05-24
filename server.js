@@ -1,9 +1,9 @@
 import { createServer } from "node:http";
-import { appendFile, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { homedir, hostname, platform, release, totalmem, freemem } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { promisify } from "node:util";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -17,6 +17,7 @@ const TOKEN = process.env.VPS_APP_TOKEN ?? "";
 const HISTORY_PATH = process.env.HISTORY_PATH ?? resolve(process.cwd(), "history.jsonl");
 const MAX_OUTPUT_CHARS = Number(process.env.MAX_OUTPUT_CHARS ?? 12000);
 const MAX_TIMEOUT_SECONDS = Number(process.env.MAX_TIMEOUT_SECONDS ?? 600);
+const NO_AUTH_SECURITY_SCHEMES = [{ type: "noauth" }];
 
 if (!TOKEN || TOKEN.length < 24) {
   console.error("VPS_APP_TOKEN must be set to a random token of at least 24 characters.");
@@ -46,6 +47,14 @@ const statusSchema = {
   }),
   disk: z.string(),
   processes: z.string(),
+};
+
+const writeTextFileResultSchema = {
+  filePath: z.string(),
+  mode: z.enum(["create", "append"]),
+  bytesWritten: z.number(),
+  status: z.enum(["written", "failed"]),
+  message: z.string(),
 };
 
 function tokenFromRequest(req, url) {
@@ -118,6 +127,28 @@ function safeCwd(cwd) {
 
   const stat = statSync(candidate);
   return stat.isDirectory() ? candidate : fallback;
+}
+
+function resolveFilePath(filePath, cwd) {
+  if (!filePath || filePath.includes("\0")) {
+    throw new Error("filePath must be a non-empty path without null bytes.");
+  }
+
+  const expanded = filePath.replace(/^~(?=$|\/)/, homedir());
+  return resolve(safeCwd(cwd), expanded);
+}
+
+function byteLength(value) {
+  return Buffer.byteLength(String(value), "utf8");
+}
+
+function toolMeta(invoking, invoked) {
+  return {
+    securitySchemes: NO_AUTH_SECURITY_SCHEMES,
+    "openai/visibility": "public",
+    "openai/toolInvocation/invoking": invoking,
+    "openai/toolInvocation/invoked": invoked,
+  };
 }
 
 function commandEnv() {
@@ -220,6 +251,7 @@ async function createVpsServer() {
         openWorldHint: true,
         idempotentHint: true,
       },
+      _meta: toolMeta("Checking VPS status", "VPS status ready"),
     },
     async () => {
       const [uptime, disk, processes] = await Promise.all([
@@ -269,6 +301,7 @@ async function createVpsServer() {
         destructiveHint: true,
         openWorldHint: true,
       },
+      _meta: toolMeta("Running shell command", "Shell command finished"),
     },
     async ({ command, cwd, timeoutSeconds }) => {
       const result = await runCommand(command, cwd, timeoutSeconds);
@@ -284,6 +317,95 @@ async function createVpsServer() {
           },
         ],
       };
+    }
+  );
+
+  server.registerTool(
+    "write_text_file",
+    {
+      title: "Write text file",
+      description:
+        "Create a new UTF-8 text file or append text to an existing file on the Oracle VPS. Create mode fails if the file already exists.",
+      inputSchema: {
+        filePath: z.string().min(1).max(1000).describe("Absolute path, ~/path, or path relative to cwd."),
+        content: z.string().max(200000),
+        mode: z.enum(["create", "append"]).default("create"),
+        cwd: z.string().optional().describe("Base directory for relative filePath values."),
+      },
+      outputSchema: writeTextFileResultSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: true,
+      },
+      _meta: toolMeta("Writing text file", "Text file write finished"),
+    },
+    async ({ filePath, content, mode, cwd }) => {
+      const writeMode = mode ?? "create";
+      let targetPath = "";
+      try {
+        targetPath = resolveFilePath(filePath, cwd);
+        await mkdir(dirname(targetPath), { recursive: true });
+        if (writeMode === "append") {
+          await appendFile(targetPath, content, "utf8");
+        } else {
+          await writeFile(targetPath, content, { encoding: "utf8", flag: "wx" });
+        }
+
+        const structuredContent = {
+          filePath: targetPath,
+          mode: writeMode,
+          bytesWritten: byteLength(content),
+          status: "written",
+          message:
+            writeMode === "append"
+              ? `Appended ${byteLength(content)} bytes to ${targetPath}.`
+              : `Created ${targetPath} with ${byteLength(content)} bytes.`,
+        };
+
+        await writeHistory({
+          command: `write_text_file ${writeMode} ${targetPath}`,
+          cwd: dirname(targetPath),
+          status: "completed",
+          exitCode: 0,
+          signal: null,
+          durationMs: 0,
+          stdout: structuredContent.message,
+          stderr: "",
+          truncated: false,
+        });
+
+        return {
+          structuredContent,
+          content: [{ type: "text", text: structuredContent.message }],
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const structuredContent = {
+          filePath: targetPath,
+          mode: writeMode,
+          bytesWritten: 0,
+          status: "failed",
+          message,
+        };
+
+        await writeHistory({
+          command: `write_text_file ${writeMode} ${targetPath || filePath}`,
+          cwd: targetPath ? dirname(targetPath) : safeCwd(cwd),
+          status: "failed",
+          exitCode: null,
+          signal: null,
+          durationMs: 0,
+          stdout: "",
+          stderr: message,
+          truncated: false,
+        });
+
+        return {
+          structuredContent,
+          content: [{ type: "text", text: `File write failed: ${message}` }],
+        };
+      }
     }
   );
 
@@ -304,6 +426,7 @@ async function createVpsServer() {
         openWorldHint: false,
         idempotentHint: true,
       },
+      _meta: toolMeta("Reading command history", "Command history ready"),
     },
     async ({ limit }) => {
       const commands = await readHistory(limit ?? 10);
