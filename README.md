@@ -11,6 +11,24 @@ Small MCP server for connecting ChatGPT to a single Ubuntu VPS.
 
 Each tool advertises explicit Apps SDK metadata: read/write annotations plus tool-level `securitySchemes`. Read-only tools allow `noauth`; write tools advertise OAuth scope `vps.write` and mirror the same scheme in `_meta` for ChatGPT compatibility. The server still accepts the private connector token on every MCP request and also includes a minimal OAuth 2.1 flow for ChatGPT account linking tests.
 
+## Auth behavior
+
+The MCP endpoint uses mixed authentication:
+
+- `initialize`, `tools/list`, `vps_status`, and `recent_commands` can run without OAuth so ChatGPT can keep the app connected and refresh tool metadata.
+- `run_shell_command` and `write_text_file` require either the private `VPS_APP_TOKEN` in the URL/query/Bearer token or OAuth scope `vps.write`.
+- When a write tool is called without a valid token, the tool result returns `_meta["mcp/www_authenticate"]` so ChatGPT can launch the OAuth flow for that tool instead of marking the whole app disconnected.
+
+OAuth access tokens default to a 10-year lifetime. Refresh tokens do not expire in this server. Tokens are persisted by default at `~/.chatgpt-vps-control/oauth-tokens.json`, with a one-time migration from the older `./oauth-tokens.json` path when present. Override the store with `OAUTH_TOKEN_STORE_PATH` if systemd should keep it somewhere else.
+
+ChatGPT may still force a fresh authorization for account, workspace, or product-side security reasons. This server can keep its own OAuth tokens valid and refreshable, but it cannot force ChatGPT to retain a connector grant forever.
+
+## Command and file size behavior
+
+The server no longer advertises a fixed `maxLength` for `run_shell_command.command` or `write_text_file.content`. Shell commands are sent to Bash over stdin instead of as a single `bash -lc` argument, which avoids the operating system's argument-length ceiling for long commands.
+
+There is still no true infinite payload in practice: ChatGPT, the MCP transport/client, Cloudflare or other proxies, Node memory, and server disk space can all impose outer limits. Command output is intentionally clipped by `MAX_OUTPUT_CHARS` so one tool call cannot exhaust memory while streaming logs.
+
 ## Run
 
 ```bash
@@ -22,6 +40,12 @@ Expose the service to ChatGPT with an HTTPS tunnel or OpenAI Secure MCP Tunnel. 
 
 ```text
 https://example-tunnel/mcp/<VPS_APP_TOKEN>
+```
+
+For OAuth-only ChatGPT app setup, use the public MCP URL without the private token:
+
+```text
+https://example-tunnel/mcp
 ```
 
 ### Permanent Cloudflare Named Tunnel Setup

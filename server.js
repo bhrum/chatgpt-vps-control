@@ -1,17 +1,14 @@
 import { createServer } from "node:http";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { homedir, hostname, platform, release, totalmem, freemem } from "node:os";
 import { dirname, resolve } from "node:path";
-import { promisify } from "node:util";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-
-const execFileAsync = promisify(execFile);
 
 const PORT = Number(process.env.PORT ?? 8787);
 const MCP_PREFIX = process.env.MCP_PATH_PREFIX ?? "/mcp";
@@ -24,8 +21,12 @@ const WRITE_SECURITY_SCHEMES = [{ type: "oauth2", scopes: ["vps.write"] }];
 const OAUTH_SCOPES = ["vps.read", "vps.write"];
 const OAUTH_CODES = new Map();
 const OAUTH_TOKENS = new Map();
+const OAUTH_REFRESH_TOKENS = new Map();
 const OAUTH_CODE_TTL_MS = 5 * 60 * 1000;
-const OAUTH_TOKEN_TTL_SECONDS = 24 * 60 * 60;
+const OAUTH_TOKEN_TTL_SECONDS = Number(process.env.OAUTH_TOKEN_TTL_SECONDS ?? 10 * 365 * 24 * 60 * 60);
+const LEGACY_OAUTH_TOKEN_STORE_PATH = resolve(process.cwd(), "oauth-tokens.json");
+const OAUTH_TOKEN_STORE_PATH =
+  process.env.OAUTH_TOKEN_STORE_PATH ?? resolve(homedir(), ".chatgpt-vps-control", "oauth-tokens.json");
 
 if (!TOKEN || TOKEN.length < 24) {
   console.error("VPS_APP_TOKEN must be set to a random token of at least 24 characters.");
@@ -104,12 +105,7 @@ function bearerTokenFromRequest(req) {
   return "";
 }
 
-function tokenFromRequest(req, url) {
-  const bearerToken = bearerTokenFromRequest(req);
-  if (bearerToken) {
-    return bearerToken;
-  }
-
+function urlTokenFromRequest(url) {
   const queryToken = url.searchParams.get("token");
   if (queryToken) {
     return queryToken;
@@ -123,26 +119,165 @@ function tokenFromRequest(req, url) {
   return "";
 }
 
+function resourceForRequest(req) {
+  return `${publicOrigin(req)}${MCP_PREFIX}`;
+}
+
 function isMcpPath(pathname) {
   return pathname === MCP_PREFIX || pathname.startsWith(`${MCP_PREFIX}/`);
 }
 
-function hasValidOAuthToken(token, requiredScope = "vps.write") {
+function getOAuthTokenEntry(token, expectedResource = "") {
   const entry = OAUTH_TOKENS.get(token);
   if (!entry) {
-    return false;
+    return null;
   }
 
-  if (entry.expiresAt <= Date.now()) {
+  if (entry.expiresAt && entry.expiresAt <= Date.now()) {
     OAUTH_TOKENS.delete(token);
-    return false;
+    void trySaveOAuthTokenStore();
+    return null;
   }
 
-  return entry.scopes.includes(requiredScope);
+  if (entry.resource && expectedResource && entry.resource !== expectedResource) {
+    return null;
+  }
+
+  return entry;
 }
 
-function isAuthorized(req, url) {
-  return tokenFromRequest(req, url) === TOKEN || hasValidOAuthToken(bearerTokenFromRequest(req));
+function authorizationForRequest(req, url) {
+  const expectedResource = resourceForRequest(req);
+  const bearerToken = bearerTokenFromRequest(req);
+  if (bearerToken === TOKEN || urlTokenFromRequest(url) === TOKEN) {
+    return {
+      source: "static",
+      scopes: OAUTH_SCOPES,
+      expectedResource,
+    };
+  }
+
+  const entry = getOAuthTokenEntry(bearerToken, expectedResource);
+  if (entry) {
+    return {
+      source: "oauth",
+      scopes: entry.scopes,
+      expectedResource,
+    };
+  }
+
+  return {
+    source: "none",
+    scopes: [],
+    expectedResource,
+  };
+}
+
+function hasScope(authContext, requiredScope) {
+  return authContext.source === "static" || authContext.scopes.includes(requiredScope);
+}
+
+function wwwAuthenticateChallenge(req, scope = "vps.write", error = "", errorDescription = "") {
+  const parts = [
+    `Bearer resource_metadata="${publicOrigin(req)}/.well-known/oauth-protected-resource"`,
+    `scope="${scope}"`,
+  ];
+  if (error) {
+    parts.push(`error="${error}"`);
+  }
+  if (errorDescription) {
+    parts.push(`error_description="${errorDescription}"`);
+  }
+  return parts.join(", ");
+}
+
+function toolAuthError(challenge) {
+  return {
+    isError: true,
+    content: [{ type: "text", text: "Authentication required: authorize this app to use VPS write tools." }],
+    _meta: {
+      "mcp/www_authenticate": [challenge],
+    },
+  };
+}
+
+async function readOAuthTokenStore(path) {
+  try {
+    const text = await readFile(path, "utf8");
+    const data = JSON.parse(text);
+    for (const item of data.accessTokens ?? []) {
+      if (!item?.token || !Array.isArray(item.scopes)) continue;
+      const expiresAt = Number(item.expiresAt || 0) || null;
+      if (expiresAt && expiresAt <= Date.now()) continue;
+      OAUTH_TOKENS.set(item.token, {
+        scopes: item.scopes,
+        expiresAt,
+        resource: item.resource || "",
+        clientId: item.clientId || "",
+        createdAt: Number(item.createdAt || Date.now()),
+      });
+    }
+    for (const item of data.refreshTokens ?? []) {
+      if (!item?.token || !Array.isArray(item.scopes)) continue;
+      OAUTH_REFRESH_TOKENS.set(item.token, {
+        scopes: item.scopes,
+        clientId: item.clientId || "",
+        createdAt: Number(item.createdAt || Date.now()),
+        resource: item.resource || "",
+      });
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function saveOAuthTokenStore() {
+  const payload = {
+    accessTokens: Array.from(OAUTH_TOKENS.entries()).map(([token, entry]) => ({
+      token,
+      scopes: entry.scopes,
+      expiresAt: entry.expiresAt,
+      resource: entry.resource,
+      clientId: entry.clientId,
+      createdAt: entry.createdAt,
+    })),
+    refreshTokens: Array.from(OAUTH_REFRESH_TOKENS.entries()).map(([token, entry]) => ({
+      token,
+      scopes: entry.scopes,
+      clientId: entry.clientId,
+      createdAt: entry.createdAt,
+      resource: entry.resource,
+    })),
+  };
+  await mkdir(dirname(OAUTH_TOKEN_STORE_PATH), { recursive: true });
+  const tempPath = `${OAUTH_TOKEN_STORE_PATH}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tempPath, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
+  await rename(tempPath, OAUTH_TOKEN_STORE_PATH);
+}
+
+async function trySaveOAuthTokenStore() {
+  try {
+    await saveOAuthTokenStore();
+    return true;
+  } catch (error) {
+    console.error("Failed to save OAuth token store:", error);
+    return false;
+  }
+}
+
+async function loadOAuthTokenStore() {
+  const loaded = await readOAuthTokenStore(OAUTH_TOKEN_STORE_PATH);
+  if (loaded) {
+    return;
+  }
+
+  if (OAUTH_TOKEN_STORE_PATH !== LEGACY_OAUTH_TOKEN_STORE_PATH && existsSync(LEGACY_OAUTH_TOKEN_STORE_PATH)) {
+    const migrated = await readOAuthTokenStore(LEGACY_OAUTH_TOKEN_STORE_PATH);
+    if (migrated) {
+      await trySaveOAuthTokenStore();
+    }
+  }
 }
 
 function corsHeaders() {
@@ -187,10 +322,9 @@ function oauthMetadata(req) {
 }
 
 function protectedResourceMetadata(req) {
-  const origin = publicOrigin(req);
   return {
-    resource: `${origin}${MCP_PREFIX}`,
-    authorization_servers: [origin],
+    resource: resourceForRequest(req),
+    authorization_servers: [publicOrigin(req)],
     scopes_supported: OAUTH_SCOPES,
     resource_documentation: "https://github.com/bhrum/chatgpt-vps-control",
   };
@@ -224,15 +358,33 @@ function htmlEscape(value) {
   });
 }
 
-function clipOutput(value) {
-  const text = String(value ?? "");
-  if (text.length <= MAX_OUTPUT_CHARS) {
-    return { text, truncated: false };
+function createOutputCapture() {
+  return {
+    text: "",
+    truncated: false,
+    omittedChars: 0,
+  };
+}
+
+function appendOutputChunk(capture, chunk) {
+  const text = String(chunk ?? "");
+  const remaining = Math.max(MAX_OUTPUT_CHARS - capture.text.length, 0);
+  if (remaining > 0) {
+    capture.text += text.slice(0, remaining);
+  }
+  if (text.length > remaining) {
+    capture.truncated = true;
+    capture.omittedChars += text.length - remaining;
+  }
+}
+
+function finishOutputCapture(capture) {
+  if (!capture.truncated) {
+    return { text: capture.text, truncated: false };
   }
 
-  const omitted = text.length - MAX_OUTPUT_CHARS;
   return {
-    text: `${text.slice(0, MAX_OUTPUT_CHARS)}\n...[truncated ${omitted} chars]`,
+    text: `${capture.text}\n...[truncated ${capture.omittedChars} chars]`,
     truncated: true,
   };
 }
@@ -319,7 +471,7 @@ const TOOL_DESCRIPTORS = [
     inputSchema: {
       type: "object",
       properties: {
-        command: { type: "string", minLength: 1, maxLength: 2000 },
+        command: { type: "string", minLength: 1 },
         cwd: { type: "string", description: "Working directory. Defaults to the service user's home directory." },
         timeoutSeconds: { type: "integer", minimum: 1, maximum: MAX_TIMEOUT_SECONDS },
       },
@@ -349,7 +501,7 @@ const TOOL_DESCRIPTORS = [
           maxLength: 1000,
           description: "Absolute path, ~/path, or path relative to cwd.",
         },
-        content: { type: "string", maxLength: 200000 },
+        content: { type: "string" },
         mode: { type: "string", enum: ["create", "append"], default: "create" },
         cwd: { type: "string", description: "Base directory for relative filePath values." },
       },
@@ -435,58 +587,76 @@ async function readHistory(limit) {
   }
 }
 
+function executeBashScript(command, workingDirectory, timeoutMs) {
+  return new Promise((resolveRun) => {
+    const started = Date.now();
+    const stdoutCapture = createOutputCapture();
+    const stderrCapture = createOutputCapture();
+    let spawnError = null;
+    let timedOut = false;
+    let forceKillTimer = null;
+
+    const child = spawn("/bin/bash", ["-l", "-s"], {
+      cwd: workingDirectory,
+      env: commandEnv(),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      appendOutputChunk(stderrCapture, `Command timed out after ${timeoutMs / 1000} seconds.\n`);
+      child.kill("SIGTERM");
+      forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 2000);
+    }, timeoutMs);
+
+    child.stdout.on("data", (chunk) => appendOutputChunk(stdoutCapture, chunk));
+    child.stderr.on("data", (chunk) => appendOutputChunk(stderrCapture, chunk));
+    child.stdin.on("error", () => {
+      // The command may have exited before stdin finished writing.
+    });
+    child.on("error", (error) => {
+      spawnError = error;
+      appendOutputChunk(stderrCapture, `${error.message}\n`);
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timeoutTimer);
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer);
+      }
+
+      const stdout = finishOutputCapture(stdoutCapture);
+      const stderr = finishOutputCapture(stderrCapture);
+      const status = code === 0 && !signal && !spawnError && !timedOut ? "completed" : "failed";
+      resolveRun({
+        command,
+        cwd: workingDirectory,
+        status,
+        exitCode: Number.isInteger(code) ? code : null,
+        signal: typeof signal === "string" ? signal : null,
+        durationMs: Date.now() - started,
+        stdout: stdout.text,
+        stderr: stderr.text,
+        truncated: stdout.truncated || stderr.truncated,
+      });
+    });
+
+    child.stdin.end(command);
+  });
+}
+
 async function runCommand(command, cwd, timeoutSeconds, options = {}) {
   const { audit = true } = options;
   const workingDirectory = safeCwd(cwd);
   const timeoutMs = Math.min(Math.max(Number(timeoutSeconds ?? 10), 1), MAX_TIMEOUT_SECONDS) * 1000;
-  const started = Date.now();
 
-  try {
-    const result = await execFileAsync("/bin/bash", ["-lc", command], {
-      cwd: workingDirectory,
-      env: commandEnv(),
-      timeout: timeoutMs,
-      maxBuffer: 1024 * 1024,
-    });
-    const stdout = clipOutput(result.stdout);
-    const stderr = clipOutput(result.stderr);
-    const completed = {
-      command,
-      cwd: workingDirectory,
-      status: "completed",
-      exitCode: 0,
-      signal: null,
-      durationMs: Date.now() - started,
-      stdout: stdout.text,
-      stderr: stderr.text,
-      truncated: stdout.truncated || stderr.truncated,
-    };
-    if (audit) {
-      await writeHistory(completed);
-    }
-    return completed;
-  } catch (error) {
-    const stdout = clipOutput(error.stdout);
-    const stderr = clipOutput(error.stderr || error.message);
-    const failed = {
-      command,
-      cwd: workingDirectory,
-      status: "failed",
-      exitCode: Number.isInteger(error.code) ? error.code : null,
-      signal: typeof error.signal === "string" ? error.signal : null,
-      durationMs: Date.now() - started,
-      stdout: stdout.text,
-      stderr: stderr.text,
-      truncated: stdout.truncated || stderr.truncated,
-    };
-    if (audit) {
-      await writeHistory(failed);
-    }
-    return failed;
+  const result = await executeBashScript(command, workingDirectory, timeoutMs);
+  if (audit) {
+    await writeHistory(result);
   }
+  return result;
 }
 
-async function createVpsServer() {
+async function createVpsServer(authContext, authChallenge) {
   const server = new McpServer({
     name: "oracle-vps-control",
     version: "0.1.0",
@@ -505,6 +675,7 @@ async function createVpsServer() {
         openWorldHint: true,
         idempotentHint: true,
       },
+      securitySchemes: NO_AUTH_SECURITY_SCHEMES,
       _meta: toolMeta("Checking VPS status", "VPS status ready"),
     },
     async () => {
@@ -545,7 +716,7 @@ async function createVpsServer() {
       description:
         "Run any Bash command on the Oracle VPS as the service user. For root-level operations, prefix commands with sudo.",
       inputSchema: {
-        command: z.string().min(1).max(2000),
+        command: z.string().min(1),
         cwd: z.string().optional().describe("Working directory. Defaults to the service user's home directory."),
         timeoutSeconds: z.number().int().min(1).max(MAX_TIMEOUT_SECONDS).optional(),
       },
@@ -555,9 +726,14 @@ async function createVpsServer() {
         destructiveHint: true,
         openWorldHint: true,
       },
+      securitySchemes: WRITE_SECURITY_SCHEMES,
       _meta: toolMeta("Running shell command", "Shell command finished", WRITE_SECURITY_SCHEMES),
     },
     async ({ command, cwd, timeoutSeconds }) => {
+      if (!hasScope(authContext, "vps.write")) {
+        return toolAuthError(authChallenge);
+      }
+
       const result = await runCommand(command, cwd, timeoutSeconds);
       return {
         structuredContent: result,
@@ -582,7 +758,7 @@ async function createVpsServer() {
         "Create a new UTF-8 text file or append text to an existing file on the Oracle VPS. Create mode fails if the file already exists.",
       inputSchema: {
         filePath: z.string().min(1).max(1000).describe("Absolute path, ~/path, or path relative to cwd."),
-        content: z.string().max(200000),
+        content: z.string(),
         mode: z.enum(["create", "append"]).default("create"),
         cwd: z.string().optional().describe("Base directory for relative filePath values."),
       },
@@ -592,9 +768,14 @@ async function createVpsServer() {
         destructiveHint: false,
         openWorldHint: true,
       },
+      securitySchemes: WRITE_SECURITY_SCHEMES,
       _meta: toolMeta("Writing text file", "Text file write finished", WRITE_SECURITY_SCHEMES),
     },
     async ({ filePath, content, mode, cwd }) => {
+      if (!hasScope(authContext, "vps.write")) {
+        return toolAuthError(authChallenge);
+      }
+
       const writeMode = mode ?? "create";
       let targetPath = "";
       try {
@@ -680,6 +861,7 @@ async function createVpsServer() {
         openWorldHint: false,
         idempotentHint: true,
       },
+      securitySchemes: NO_AUTH_SECURITY_SCHEMES,
       _meta: toolMeta("Reading command history", "Command history ready"),
     },
     async ({ limit }) => {
@@ -712,9 +894,25 @@ async function handleOAuthRegister(req, res) {
     client_id_issued_at: Math.floor(Date.now() / 1000),
     redirect_uris: body.redirect_uris || [],
     token_endpoint_auth_method: "none",
-    grant_types: ["authorization_code"],
+    grant_types: ["authorization_code", "refresh_token"],
     response_types: ["code"],
   });
+}
+
+async function readOAuthParams(req) {
+  const text = await readRequestText(req);
+  const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
+  if (contentType.includes("application/json")) {
+    const body = text ? JSON.parse(text) : {};
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(body)) {
+      if (value === undefined || value === null) continue;
+      params.set(key, String(value));
+    }
+    return params;
+  }
+
+  return new URLSearchParams(text);
 }
 
 function handleOAuthAuthorize(req, res, url) {
@@ -755,6 +953,7 @@ function handleOAuthAuthorize(req, res, url) {
     codeChallenge: params.code_challenge,
     codeChallengeMethod: params.code_challenge_method,
     scopes: scope.split(/\s+/).filter(Boolean),
+    resource: params.resource || resourceForRequest(req),
     expiresAt: Date.now() + OAUTH_CODE_TTL_MS,
   });
 
@@ -766,9 +965,54 @@ function handleOAuthAuthorize(req, res, url) {
 }
 
 async function handleOAuthToken(req, res) {
-  const text = await readRequestText(req);
-  const params = new URLSearchParams(text);
+  let params;
+  try {
+    params = await readOAuthParams(req);
+  } catch {
+    writeJson(res, 400, { error: "invalid_request" });
+    return;
+  }
+
   const grantType = params.get("grant_type");
+  const requestedResource = params.get("resource") || "";
+
+  if (grantType === "refresh_token") {
+    const refreshToken = params.get("refresh_token") || "";
+    const entry = OAUTH_REFRESH_TOKENS.get(refreshToken);
+    if (!entry) {
+      writeJson(res, 400, { error: "invalid_grant" });
+      return;
+    }
+    if (requestedResource && entry.resource && requestedResource !== entry.resource) {
+      writeJson(res, 400, { error: "invalid_grant", error_description: "Resource does not match refresh token." });
+      return;
+    }
+
+    const accessToken = randomToken(32);
+    const resource = requestedResource || entry.resource || resourceForRequest(req);
+    OAUTH_TOKENS.set(accessToken, {
+      scopes: Array.from(new Set([...entry.scopes, ...OAUTH_SCOPES])),
+      expiresAt: Date.now() + OAUTH_TOKEN_TTL_SECONDS * 1000,
+      resource,
+      clientId: entry.clientId,
+      createdAt: Date.now(),
+    });
+    const saved = await trySaveOAuthTokenStore();
+    if (!saved) {
+      OAUTH_TOKENS.delete(accessToken);
+      writeJson(res, 500, { error: "server_error", error_description: "Failed to persist OAuth token." });
+      return;
+    }
+
+    writeJson(res, 200, {
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: OAUTH_TOKEN_TTL_SECONDS,
+      refresh_token: refreshToken,
+      scope: OAUTH_SCOPES.join(" "),
+    });
+    return;
+  }
 
   if (grantType !== "authorization_code") {
     writeJson(res, 400, { error: "unsupported_grant_type" });
@@ -788,18 +1032,42 @@ async function handleOAuthToken(req, res) {
     writeJson(res, 400, { error: "invalid_grant", error_description: "PKCE verification failed." });
     return;
   }
+  if (requestedResource && entry.resource && requestedResource !== entry.resource) {
+    writeJson(res, 400, { error: "invalid_grant", error_description: "Resource does not match authorization code." });
+    return;
+  }
 
   OAUTH_CODES.delete(code);
   const accessToken = randomToken(32);
+  const refreshToken = randomToken(32);
+  const scopes = Array.from(new Set([...entry.scopes, ...OAUTH_SCOPES]));
+  const resource = requestedResource || entry.resource || resourceForRequest(req);
   OAUTH_TOKENS.set(accessToken, {
-    scopes: Array.from(new Set([...entry.scopes, ...OAUTH_SCOPES])),
+    scopes,
     expiresAt: Date.now() + OAUTH_TOKEN_TTL_SECONDS * 1000,
+    resource,
+    clientId: entry.clientId,
+    createdAt: Date.now(),
   });
+  OAUTH_REFRESH_TOKENS.set(refreshToken, {
+    scopes,
+    clientId: entry.clientId,
+    createdAt: Date.now(),
+    resource,
+  });
+  const saved = await trySaveOAuthTokenStore();
+  if (!saved) {
+    OAUTH_TOKENS.delete(accessToken);
+    OAUTH_REFRESH_TOKENS.delete(refreshToken);
+    writeJson(res, 500, { error: "server_error", error_description: "Failed to persist OAuth token." });
+    return;
+  }
 
   writeJson(res, 200, {
     access_token: accessToken,
     token_type: "Bearer",
     expires_in: OAUTH_TOKEN_TTL_SECONDS,
+    refresh_token: refreshToken,
     scope: OAUTH_SCOPES.join(" "),
   });
 }
@@ -870,16 +1138,14 @@ const httpServer = createServer(async (req, res) => {
 
   const allowedMethods = new Set(["POST", "GET", "DELETE"]);
   if (isMcpPath(url.pathname) && req.method && allowedMethods.has(req.method)) {
-    if (!isAuthorized(req, url)) {
-      res.writeHead(401, {
-        ...corsHeaders(),
-        "WWW-Authenticate": `Bearer resource_metadata="${publicOrigin(req)}/.well-known/oauth-protected-resource", scope="vps.write"`,
-      });
-      res.end("Unauthorized");
-      return;
-    }
-
-    const server = await createVpsServer();
+    const authContext = authorizationForRequest(req, url);
+    const authChallenge = wwwAuthenticateChallenge(
+      req,
+      "vps.write",
+      authContext.source === "none" ? "" : "insufficient_scope",
+      "Authorize this app to use VPS write tools."
+    );
+    const server = await createVpsServer(authContext, authChallenge);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
@@ -906,6 +1172,8 @@ const httpServer = createServer(async (req, res) => {
 
   res.writeHead(404).end("Not Found");
 });
+
+await loadOAuthTokenStore();
 
 httpServer.listen(PORT, "127.0.0.1", () => {
   console.log(`Oracle VPS MCP server listening on http://127.0.0.1:${PORT}${MCP_PREFIX}/<token>`);
