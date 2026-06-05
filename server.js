@@ -23,7 +23,10 @@ const OAUTH_CODES = new Map();
 const OAUTH_TOKENS = new Map();
 const OAUTH_REFRESH_TOKENS = new Map();
 const OAUTH_CODE_TTL_MS = 5 * 60 * 1000;
-const OAUTH_TOKEN_TTL_SECONDS = Number(process.env.OAUTH_TOKEN_TTL_SECONDS ?? 10 * 365 * 24 * 60 * 60);
+const OAUTH_TOKEN_TTL_SECONDS = process.env.OAUTH_TOKEN_TTL_SECONDS
+  ? Number(process.env.OAUTH_TOKEN_TTL_SECONDS)
+  : null;
+const MAX_FILE_CONTENT_BASE64_CHARS = Number(process.env.MAX_FILE_CONTENT_BASE64_CHARS ?? 12 * 1024 * 1024);
 const LEGACY_OAUTH_TOKEN_STORE_PATH = resolve(process.cwd(), "oauth-tokens.json");
 const OAUTH_TOKEN_STORE_PATH =
   process.env.OAUTH_TOKEN_STORE_PATH ?? resolve(homedir(), ".chatgpt-vps-control", "oauth-tokens.json");
@@ -66,6 +69,14 @@ const writeTextFileResultSchema = {
   message: z.string(),
 };
 
+const writeFileResultSchema = {
+  filePath: z.string(),
+  mode: z.enum(["create", "overwrite", "append"]),
+  bytesWritten: z.number(),
+  status: z.enum(["written", "failed"]),
+  message: z.string(),
+};
+
 const commandResultJsonSchema = {
   type: "object",
   properties: {
@@ -88,6 +99,19 @@ const writeTextFileResultJsonSchema = {
   properties: {
     filePath: { type: "string" },
     mode: { type: "string", enum: ["create", "append"] },
+    bytesWritten: { type: "number" },
+    status: { type: "string", enum: ["written", "failed"] },
+    message: { type: "string" },
+  },
+  required: ["filePath", "mode", "bytesWritten", "status", "message"],
+  additionalProperties: false,
+};
+
+const writeFileResultJsonSchema = {
+  type: "object",
+  properties: {
+    filePath: { type: "string" },
+    mode: { type: "string", enum: ["create", "overwrite", "append"] },
     bytesWritten: { type: "number" },
     status: { type: "string", enum: ["written", "failed"] },
     message: { type: "string" },
@@ -417,6 +441,32 @@ function byteLength(value) {
   return Buffer.byteLength(String(value), "utf8");
 }
 
+function decodeBase64FileContent(value) {
+  const text = String(value ?? "").trim();
+  const payload = text.startsWith("data:") ? text.slice(text.indexOf(",") + 1) : text;
+  const normalized = payload.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
+
+  if (normalized.length % 4 === 1 || /[^A-Za-z0-9+/=]/.test(normalized)) {
+    throw new Error("contentBase64 must be valid base64 data.");
+  }
+
+  return Buffer.from(normalized, "base64");
+}
+
+function oauthTokenPayload(accessToken, refreshToken, scope) {
+  return {
+    access_token: accessToken,
+    token_type: "Bearer",
+    ...(OAUTH_TOKEN_TTL_SECONDS ? { expires_in: OAUTH_TOKEN_TTL_SECONDS } : {}),
+    refresh_token: refreshToken,
+    scope,
+  };
+}
+
+function oauthTokenExpiresAt() {
+  return OAUTH_TOKEN_TTL_SECONDS ? Date.now() + OAUTH_TOKEN_TTL_SECONDS * 1000 : null;
+}
+
 function toolMeta(invoking, invoked, securitySchemes = NO_AUTH_SECURITY_SCHEMES) {
   return {
     securitySchemes,
@@ -516,6 +566,40 @@ const TOOL_DESCRIPTORS = [
     },
     securitySchemes: WRITE_SECURITY_SCHEMES,
     _meta: toolMeta("Writing text file", "Text file write finished", WRITE_SECURITY_SCHEMES),
+  },
+  {
+    name: "write_file",
+    title: "Write file",
+    description:
+      "Create, overwrite, or append any file on the Oracle VPS from base64 content. Use append for additional chunks of large files.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        filePath: {
+          type: "string",
+          minLength: 1,
+          maxLength: 1000,
+          description: "Absolute path, ~/path, or path relative to cwd.",
+        },
+        contentBase64: {
+          type: "string",
+          maxLength: MAX_FILE_CONTENT_BASE64_CHARS,
+          description: "Base64 or data-URL content to write. Send additional chunks with mode=append for large files.",
+        },
+        mode: { type: "string", enum: ["create", "overwrite", "append"], default: "create" },
+        cwd: { type: "string", description: "Base directory for relative filePath values." },
+      },
+      required: ["filePath", "contentBase64"],
+      additionalProperties: false,
+    },
+    outputSchema: writeFileResultJsonSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: true,
+    },
+    securitySchemes: WRITE_SECURITY_SCHEMES,
+    _meta: toolMeta("Writing file", "File write finished", WRITE_SECURITY_SCHEMES),
   },
   {
     name: "recent_commands",
@@ -845,6 +929,104 @@ async function createVpsServer(authContext, authChallenge) {
   );
 
   server.registerTool(
+    "write_file",
+    {
+      title: "Write file",
+      description:
+        "Create, overwrite, or append any file on the Oracle VPS from base64 content. Use append for additional chunks of large files.",
+      inputSchema: {
+        filePath: z.string().min(1).max(1000).describe("Absolute path, ~/path, or path relative to cwd."),
+        contentBase64: z
+          .string()
+          .max(MAX_FILE_CONTENT_BASE64_CHARS)
+          .describe("Base64 or data-URL content to write. Send additional chunks with mode=append for large files."),
+        mode: z.enum(["create", "overwrite", "append"]).default("create"),
+        cwd: z.string().optional().describe("Base directory for relative filePath values."),
+      },
+      outputSchema: writeFileResultSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: true,
+      },
+      securitySchemes: WRITE_SECURITY_SCHEMES,
+      _meta: toolMeta("Writing file", "File write finished", WRITE_SECURITY_SCHEMES),
+    },
+    async ({ filePath, contentBase64, mode, cwd }) => {
+      if (!hasScope(authContext, "vps.write")) {
+        return toolAuthError(authChallenge);
+      }
+
+      const writeMode = mode ?? "create";
+      let targetPath = "";
+      try {
+        targetPath = resolveFilePath(filePath, cwd);
+        const content = decodeBase64FileContent(contentBase64);
+        await mkdir(dirname(targetPath), { recursive: true });
+        if (writeMode === "append") {
+          await appendFile(targetPath, content);
+        } else {
+          await writeFile(targetPath, content, { flag: writeMode === "overwrite" ? "w" : "wx" });
+        }
+
+        const structuredContent = {
+          filePath: targetPath,
+          mode: writeMode,
+          bytesWritten: content.length,
+          status: "written",
+          message:
+            writeMode === "append"
+              ? `Appended ${content.length} bytes to ${targetPath}.`
+              : `${writeMode === "overwrite" ? "Wrote" : "Created"} ${targetPath} with ${content.length} bytes.`,
+        };
+
+        await writeHistory({
+          command: `write_file ${writeMode} ${targetPath}`,
+          cwd: dirname(targetPath),
+          status: "completed",
+          exitCode: 0,
+          signal: null,
+          durationMs: 0,
+          stdout: structuredContent.message,
+          stderr: "",
+          truncated: false,
+        });
+
+        return {
+          structuredContent,
+          content: [{ type: "text", text: structuredContent.message }],
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const structuredContent = {
+          filePath: targetPath,
+          mode: writeMode,
+          bytesWritten: 0,
+          status: "failed",
+          message,
+        };
+
+        await writeHistory({
+          command: `write_file ${writeMode} ${targetPath || filePath}`,
+          cwd: targetPath ? dirname(targetPath) : safeCwd(cwd),
+          status: "failed",
+          exitCode: null,
+          signal: null,
+          durationMs: 0,
+          stdout: "",
+          stderr: message,
+          truncated: false,
+        });
+
+        return {
+          structuredContent,
+          content: [{ type: "text", text: `File write failed: ${message}` }],
+        };
+      }
+    }
+  );
+
+  server.registerTool(
     "recent_commands",
     {
       title: "Recent commands",
@@ -992,7 +1174,7 @@ async function handleOAuthToken(req, res) {
     const resource = requestedResource || entry.resource || resourceForRequest(req);
     OAUTH_TOKENS.set(accessToken, {
       scopes: Array.from(new Set([...entry.scopes, ...OAUTH_SCOPES])),
-      expiresAt: Date.now() + OAUTH_TOKEN_TTL_SECONDS * 1000,
+      expiresAt: oauthTokenExpiresAt(),
       resource,
       clientId: entry.clientId,
       createdAt: Date.now(),
@@ -1004,13 +1186,7 @@ async function handleOAuthToken(req, res) {
       return;
     }
 
-    writeJson(res, 200, {
-      access_token: accessToken,
-      token_type: "Bearer",
-      expires_in: OAUTH_TOKEN_TTL_SECONDS,
-      refresh_token: refreshToken,
-      scope: OAUTH_SCOPES.join(" "),
-    });
+    writeJson(res, 200, oauthTokenPayload(accessToken, refreshToken, OAUTH_SCOPES.join(" ")));
     return;
   }
 
@@ -1044,7 +1220,7 @@ async function handleOAuthToken(req, res) {
   const resource = requestedResource || entry.resource || resourceForRequest(req);
   OAUTH_TOKENS.set(accessToken, {
     scopes,
-    expiresAt: Date.now() + OAUTH_TOKEN_TTL_SECONDS * 1000,
+    expiresAt: oauthTokenExpiresAt(),
     resource,
     clientId: entry.clientId,
     createdAt: Date.now(),
@@ -1063,13 +1239,7 @@ async function handleOAuthToken(req, res) {
     return;
   }
 
-  writeJson(res, 200, {
-    access_token: accessToken,
-    token_type: "Bearer",
-    expires_in: OAUTH_TOKEN_TTL_SECONDS,
-    refresh_token: refreshToken,
-    scope: OAUTH_SCOPES.join(" "),
-  });
+  writeJson(res, 200, oauthTokenPayload(accessToken, refreshToken, OAUTH_SCOPES.join(" ")));
 }
 
 const httpServer = createServer(async (req, res) => {
