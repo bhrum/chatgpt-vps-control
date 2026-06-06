@@ -1,10 +1,10 @@
 import { createServer } from "node:http";
-import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { existsSync, statSync } from "node:fs";
+import { appendFile, mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
+import { createReadStream, existsSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { homedir, hostname, platform, release, totalmem, freemem } from "node:os";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, extname, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -17,16 +17,20 @@ const HISTORY_PATH = process.env.HISTORY_PATH ?? resolve(process.cwd(), "history
 const MAX_OUTPUT_CHARS = Number(process.env.MAX_OUTPUT_CHARS ?? 12000);
 const MAX_TIMEOUT_SECONDS = Number(process.env.MAX_TIMEOUT_SECONDS ?? 600);
 const NO_AUTH_SECURITY_SCHEMES = [{ type: "noauth" }];
+const READ_SECURITY_SCHEMES = [{ type: "oauth2", scopes: ["vps.read"] }];
 const WRITE_SECURITY_SCHEMES = [{ type: "oauth2", scopes: ["vps.write"] }];
 const OAUTH_SCOPES = ["vps.read", "vps.write"];
 const OAUTH_CODES = new Map();
 const OAUTH_TOKENS = new Map();
 const OAUTH_REFRESH_TOKENS = new Map();
+const DOWNLOAD_TOKENS = new Map();
 const OAUTH_CODE_TTL_MS = 5 * 60 * 1000;
 const OAUTH_TOKEN_TTL_SECONDS = process.env.OAUTH_TOKEN_TTL_SECONDS
   ? Number(process.env.OAUTH_TOKEN_TTL_SECONDS)
   : null;
 const MAX_FILE_CONTENT_BASE64_CHARS = Number(process.env.MAX_FILE_CONTENT_BASE64_CHARS ?? 12 * 1024 * 1024);
+const MAX_FILE_READ_BYTES = Number(process.env.MAX_FILE_READ_BYTES ?? 5 * 1024 * 1024);
+const MAX_DOWNLOAD_TTL_SECONDS = Number(process.env.MAX_DOWNLOAD_TTL_SECONDS ?? 24 * 60 * 60);
 const LEGACY_OAUTH_TOKEN_STORE_PATH = resolve(process.cwd(), "oauth-tokens.json");
 const OAUTH_TOKEN_STORE_PATH =
   process.env.OAUTH_TOKEN_STORE_PATH ?? resolve(homedir(), ".chatgpt-vps-control", "oauth-tokens.json");
@@ -77,6 +81,41 @@ const writeFileResultSchema = {
   message: z.string(),
 };
 
+const fileInfoResultSchema = {
+  filePath: z.string(),
+  exists: z.boolean(),
+  type: z.enum(["file", "directory", "other", "missing"]),
+  sizeBytes: z.number().nullable(),
+  mimeType: z.string().nullable(),
+  mode: z.string().nullable(),
+  modifiedAt: z.string().nullable(),
+  sha256: z.string().nullable(),
+  message: z.string(),
+};
+
+const readFileResultSchema = {
+  filePath: z.string(),
+  offset: z.number(),
+  bytesRead: z.number(),
+  totalBytes: z.number(),
+  mimeType: z.string(),
+  encoding: z.literal("base64"),
+  contentBase64: z.string(),
+  truncated: z.boolean(),
+  nextOffset: z.number().nullable(),
+  textPreview: z.string().nullable(),
+  message: z.string(),
+};
+
+const downloadLinkResultSchema = {
+  filePath: z.string(),
+  url: z.string(),
+  expiresAt: z.string(),
+  sizeBytes: z.number(),
+  mimeType: z.string(),
+  message: z.string(),
+};
+
 const commandResultJsonSchema = {
   type: "object",
   properties: {
@@ -117,6 +156,68 @@ const writeFileResultJsonSchema = {
     message: { type: "string" },
   },
   required: ["filePath", "mode", "bytesWritten", "status", "message"],
+  additionalProperties: false,
+};
+
+const fileInfoResultJsonSchema = {
+  type: "object",
+  properties: {
+    filePath: { type: "string" },
+    exists: { type: "boolean" },
+    type: { type: "string", enum: ["file", "directory", "other", "missing"] },
+    sizeBytes: { type: ["number", "null"] },
+    mimeType: { type: ["string", "null"] },
+    mode: { type: ["string", "null"] },
+    modifiedAt: { type: ["string", "null"] },
+    sha256: { type: ["string", "null"] },
+    message: { type: "string" },
+  },
+  required: ["filePath", "exists", "type", "sizeBytes", "mimeType", "mode", "modifiedAt", "sha256", "message"],
+  additionalProperties: false,
+};
+
+const readFileResultJsonSchema = {
+  type: "object",
+  properties: {
+    filePath: { type: "string" },
+    offset: { type: "number" },
+    bytesRead: { type: "number" },
+    totalBytes: { type: "number" },
+    mimeType: { type: "string" },
+    encoding: { type: "string", enum: ["base64"] },
+    contentBase64: { type: "string" },
+    truncated: { type: "boolean" },
+    nextOffset: { type: ["number", "null"] },
+    textPreview: { type: ["string", "null"] },
+    message: { type: "string" },
+  },
+  required: [
+    "filePath",
+    "offset",
+    "bytesRead",
+    "totalBytes",
+    "mimeType",
+    "encoding",
+    "contentBase64",
+    "truncated",
+    "nextOffset",
+    "textPreview",
+    "message",
+  ],
+  additionalProperties: false,
+};
+
+const downloadLinkResultJsonSchema = {
+  type: "object",
+  properties: {
+    filePath: { type: "string" },
+    url: { type: "string" },
+    expiresAt: { type: "string" },
+    sizeBytes: { type: "number" },
+    mimeType: { type: "string" },
+    message: { type: "string" },
+  },
+  required: ["filePath", "url", "expiresAt", "sizeBytes", "mimeType", "message"],
   additionalProperties: false,
 };
 
@@ -218,7 +319,7 @@ function wwwAuthenticateChallenge(req, scope = "vps.write", error = "", errorDes
 function toolAuthError(challenge) {
   return {
     isError: true,
-    content: [{ type: "text", text: "Authentication required: authorize this app to use VPS write tools." }],
+    content: [{ type: "text", text: "Authentication required: authorize this app to use the requested VPS tool." }],
     _meta: {
       "mcp/www_authenticate": [challenge],
     },
@@ -453,6 +554,135 @@ function decodeBase64FileContent(value) {
   return Buffer.from(normalized, "base64");
 }
 
+function mimeTypeForPath(filePath) {
+  const ext = extname(filePath).toLowerCase();
+  const types = {
+    ".aac": "audio/aac",
+    ".avif": "image/avif",
+    ".bin": "application/octet-stream",
+    ".bmp": "image/bmp",
+    ".csv": "text/csv; charset=utf-8",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".gif": "image/gif",
+    ".gz": "application/gzip",
+    ".htm": "text/html; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".json": "application/json; charset=utf-8",
+    ".log": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".mp3": "audio/mpeg",
+    ".mp4": "video/mp4",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".svg": "image/svg+xml",
+    ".tar": "application/x-tar",
+    ".tgz": "application/gzip",
+    ".txt": "text/plain; charset=utf-8",
+    ".wav": "audio/wav",
+    ".webm": "video/webm",
+    ".webp": "image/webp",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xml": "application/xml; charset=utf-8",
+    ".zip": "application/zip",
+  };
+  return types[ext] || "application/octet-stream";
+}
+
+function isTextMimeType(mimeType) {
+  return mimeType.startsWith("text/") || /json|xml|javascript|typescript|yaml|markdown/.test(mimeType);
+}
+
+function isImageMimeType(mimeType) {
+  return mimeType.startsWith("image/");
+}
+
+function statType(stat) {
+  if (stat.isFile()) return "file";
+  if (stat.isDirectory()) return "directory";
+  return "other";
+}
+
+function fileMode(stat) {
+  return `0${(stat.mode & 0o777).toString(8)}`;
+}
+
+async function sha256File(filePath) {
+  const result = await runCommand(`sha256sum -- ${JSON.stringify(filePath)}`, dirname(filePath), 30, { audit: false });
+  if (result.status !== "completed") {
+    return null;
+  }
+  return result.stdout.trim().split(/\s+/)[0] || null;
+}
+
+async function getFileInfo(filePath, cwd, includeSha256 = false) {
+  const targetPath = resolveFilePath(filePath, cwd);
+  try {
+    const stat = statSync(targetPath);
+    const type = statType(stat);
+    const mimeType = stat.isFile() ? mimeTypeForPath(targetPath) : null;
+    const sha256 = includeSha256 && stat.isFile() ? await sha256File(targetPath) : null;
+    return {
+      filePath: targetPath,
+      exists: true,
+      type,
+      sizeBytes: stat.isFile() ? stat.size : null,
+      mimeType,
+      mode: fileMode(stat),
+      modifiedAt: stat.mtime.toISOString(),
+      sha256,
+      message: `${targetPath} is a ${type}.`,
+    };
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+    return {
+      filePath: targetPath,
+      exists: false,
+      type: "missing",
+      sizeBytes: null,
+      mimeType: null,
+      mode: null,
+      modifiedAt: null,
+      sha256: null,
+      message: `${targetPath} does not exist.`,
+    };
+  }
+}
+
+async function readFileChunk(filePath, offset, length) {
+  const handle = await open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, offset);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+
+function textPreviewForBuffer(buffer, mimeType) {
+  if (!isTextMimeType(mimeType)) {
+    return null;
+  }
+  return buffer.toString("utf8").slice(0, 8000);
+}
+
+function cleanupDownloadTokens() {
+  const now = Date.now();
+  for (const [token, entry] of DOWNLOAD_TOKENS.entries()) {
+    if (entry.expiresAt <= now) {
+      DOWNLOAD_TOKENS.delete(token);
+    }
+  }
+}
+
 function oauthTokenPayload(accessToken, refreshToken, scope) {
   return {
     access_token: accessToken,
@@ -602,6 +832,81 @@ const TOOL_DESCRIPTORS = [
     _meta: toolMeta("Writing file", "File write finished", WRITE_SECURITY_SCHEMES),
   },
   {
+    name: "file_info",
+    title: "File info",
+    description: "Inspect any VPS path, returning type, size, permissions, modified time, MIME type, and optionally sha256.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        filePath: { type: "string", minLength: 1, maxLength: 1000, description: "Absolute path, ~/path, or path relative to cwd." },
+        cwd: { type: "string", description: "Base directory for relative filePath values." },
+        includeSha256: { type: "boolean", default: false, description: "Hash file contents. This can be slow for large files." },
+      },
+      required: ["filePath"],
+      additionalProperties: false,
+    },
+    outputSchema: fileInfoResultJsonSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: true,
+      idempotentHint: true,
+    },
+    securitySchemes: READ_SECURITY_SCHEMES,
+    _meta: toolMeta("Inspecting file", "File info ready", READ_SECURITY_SCHEMES),
+  },
+  {
+    name: "read_file",
+    title: "Read file",
+    description:
+      "Read any file from the VPS as base64. Supports offset/length chunking and can return images inline for viewing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        filePath: { type: "string", minLength: 1, maxLength: 1000, description: "Absolute path, ~/path, or path relative to cwd." },
+        cwd: { type: "string", description: "Base directory for relative filePath values." },
+        offset: { type: "integer", minimum: 0, default: 0, description: "Byte offset to start reading." },
+        length: { type: "integer", minimum: 1, maximum: MAX_FILE_READ_BYTES, description: "Maximum bytes to read in this call." },
+        inlineImage: { type: "boolean", default: true, description: "For image files, also return MCP image content when the chunk is the whole file." },
+      },
+      required: ["filePath"],
+      additionalProperties: false,
+    },
+    outputSchema: readFileResultJsonSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: true,
+      idempotentHint: true,
+    },
+    securitySchemes: READ_SECURITY_SCHEMES,
+    _meta: toolMeta("Reading file", "File read finished", READ_SECURITY_SCHEMES),
+  },
+  {
+    name: "create_download_link",
+    title: "Create download link",
+    description: "Create a temporary signed URL for downloading any file from the VPS through this MCP server.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        filePath: { type: "string", minLength: 1, maxLength: 1000, description: "Absolute path, ~/path, or path relative to cwd." },
+        cwd: { type: "string", description: "Base directory for relative filePath values." },
+        ttlSeconds: { type: "integer", minimum: 1, maximum: MAX_DOWNLOAD_TTL_SECONDS, default: 600 },
+      },
+      required: ["filePath"],
+      additionalProperties: false,
+    },
+    outputSchema: downloadLinkResultJsonSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: true,
+      idempotentHint: false,
+    },
+    securitySchemes: READ_SECURITY_SCHEMES,
+    _meta: toolMeta("Creating download link", "Download link ready", READ_SECURITY_SCHEMES),
+  },
+  {
     name: "recent_commands",
     title: "Recent commands",
     description: "Show recent command audit entries from this connector.",
@@ -740,7 +1045,7 @@ async function runCommand(command, cwd, timeoutSeconds, options = {}) {
   return result;
 }
 
-async function createVpsServer(authContext, authChallenge) {
+async function createVpsServer(authContext, readAuthChallenge, writeAuthChallenge) {
   const server = new McpServer({
     name: "oracle-vps-control",
     version: "0.1.0",
@@ -815,7 +1120,7 @@ async function createVpsServer(authContext, authChallenge) {
     },
     async ({ command, cwd, timeoutSeconds }) => {
       if (!hasScope(authContext, "vps.write")) {
-        return toolAuthError(authChallenge);
+        return toolAuthError(writeAuthChallenge);
       }
 
       const result = await runCommand(command, cwd, timeoutSeconds);
@@ -857,7 +1162,7 @@ async function createVpsServer(authContext, authChallenge) {
     },
     async ({ filePath, content, mode, cwd }) => {
       if (!hasScope(authContext, "vps.write")) {
-        return toolAuthError(authChallenge);
+        return toolAuthError(writeAuthChallenge);
       }
 
       const writeMode = mode ?? "create";
@@ -954,7 +1259,7 @@ async function createVpsServer(authContext, authChallenge) {
     },
     async ({ filePath, contentBase64, mode, cwd }) => {
       if (!hasScope(authContext, "vps.write")) {
-        return toolAuthError(authChallenge);
+        return toolAuthError(writeAuthChallenge);
       }
 
       const writeMode = mode ?? "create";
@@ -1021,6 +1326,219 @@ async function createVpsServer(authContext, authChallenge) {
         return {
           structuredContent,
           content: [{ type: "text", text: `File write failed: ${message}` }],
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    "file_info",
+    {
+      title: "File info",
+      description: "Inspect any VPS path, returning type, size, permissions, modified time, MIME type, and optionally sha256.",
+      inputSchema: {
+        filePath: z.string().min(1).max(1000).describe("Absolute path, ~/path, or path relative to cwd."),
+        cwd: z.string().optional().describe("Base directory for relative filePath values."),
+        includeSha256: z.boolean().default(false).optional().describe("Hash file contents. This can be slow for large files."),
+      },
+      outputSchema: fileInfoResultSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: true,
+      },
+      securitySchemes: READ_SECURITY_SCHEMES,
+      _meta: toolMeta("Inspecting file", "File info ready", READ_SECURITY_SCHEMES),
+    },
+    async ({ filePath, cwd, includeSha256 }) => {
+      if (!hasScope(authContext, "vps.read")) {
+        return toolAuthError(readAuthChallenge);
+      }
+
+      try {
+        const structuredContent = await getFileInfo(filePath, cwd, Boolean(includeSha256));
+        return {
+          structuredContent,
+          content: [{ type: "text", text: structuredContent.message }],
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const targetPath = resolveFilePath(filePath, cwd);
+        return {
+          isError: true,
+          structuredContent: {
+            filePath: targetPath,
+            exists: false,
+            type: "missing",
+            sizeBytes: null,
+            mimeType: null,
+            mode: null,
+            modifiedAt: null,
+            sha256: null,
+            message,
+          },
+          content: [{ type: "text", text: `File info failed: ${message}` }],
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    "read_file",
+    {
+      title: "Read file",
+      description:
+        "Read any file from the VPS as base64. Supports offset/length chunking and can return images inline for viewing.",
+      inputSchema: {
+        filePath: z.string().min(1).max(1000).describe("Absolute path, ~/path, or path relative to cwd."),
+        cwd: z.string().optional().describe("Base directory for relative filePath values."),
+        offset: z.number().int().min(0).default(0).optional().describe("Byte offset to start reading."),
+        length: z.number().int().min(1).max(MAX_FILE_READ_BYTES).optional().describe("Maximum bytes to read in this call."),
+        inlineImage: z.boolean().default(true).optional().describe("For image files, also return MCP image content when the chunk is the whole file."),
+      },
+      outputSchema: readFileResultSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: true,
+      },
+      securitySchemes: READ_SECURITY_SCHEMES,
+      _meta: toolMeta("Reading file", "File read finished", READ_SECURITY_SCHEMES),
+    },
+    async ({ filePath, cwd, offset, length, inlineImage }) => {
+      if (!hasScope(authContext, "vps.read")) {
+        return toolAuthError(readAuthChallenge);
+      }
+
+      try {
+        const targetPath = resolveFilePath(filePath, cwd);
+        const stat = statSync(targetPath);
+        if (!stat.isFile()) {
+          throw new Error("read_file can only read regular files.");
+        }
+        const start = Math.min(Number(offset ?? 0), stat.size);
+        const maxLength = Math.min(Number(length ?? MAX_FILE_READ_BYTES), MAX_FILE_READ_BYTES);
+        const readLength = Math.min(maxLength, stat.size - start);
+        const chunk = readLength > 0 ? await readFileChunk(targetPath, start, readLength) : Buffer.alloc(0);
+        const mimeType = mimeTypeForPath(targetPath);
+        const nextOffset = start + chunk.length < stat.size ? start + chunk.length : null;
+        const structuredContent = {
+          filePath: targetPath,
+          offset: start,
+          bytesRead: chunk.length,
+          totalBytes: stat.size,
+          mimeType,
+          encoding: "base64",
+          contentBase64: chunk.toString("base64"),
+          truncated: nextOffset !== null,
+          nextOffset,
+          textPreview: textPreviewForBuffer(chunk, mimeType),
+          message:
+            nextOffset === null
+              ? `Read ${chunk.length} bytes from ${targetPath}.`
+              : `Read ${chunk.length} bytes from ${targetPath}; continue at offset ${nextOffset}.`,
+        };
+        const content = [{ type: "text", text: structuredContent.message }];
+        if (inlineImage !== false && isImageMimeType(mimeType) && start === 0 && nextOffset === null) {
+          content.push({ type: "image", data: structuredContent.contentBase64, mimeType });
+        }
+        return { structuredContent, content };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const targetPath = resolveFilePath(filePath, cwd);
+        return {
+          isError: true,
+          structuredContent: {
+            filePath: targetPath,
+            offset: Number(offset ?? 0),
+            bytesRead: 0,
+            totalBytes: 0,
+            mimeType: "application/octet-stream",
+            encoding: "base64",
+            contentBase64: "",
+            truncated: false,
+            nextOffset: null,
+            textPreview: null,
+            message,
+          },
+          content: [{ type: "text", text: `File read failed: ${message}` }],
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    "create_download_link",
+    {
+      title: "Create download link",
+      description: "Create a temporary signed URL for downloading any file from the VPS through this MCP server.",
+      inputSchema: {
+        filePath: z.string().min(1).max(1000).describe("Absolute path, ~/path, or path relative to cwd."),
+        cwd: z.string().optional().describe("Base directory for relative filePath values."),
+        ttlSeconds: z.number().int().min(1).max(MAX_DOWNLOAD_TTL_SECONDS).default(600).optional(),
+      },
+      outputSchema: downloadLinkResultSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: false,
+      },
+      securitySchemes: READ_SECURITY_SCHEMES,
+      _meta: toolMeta("Creating download link", "Download link ready", READ_SECURITY_SCHEMES),
+    },
+    async ({ filePath, cwd, ttlSeconds }) => {
+      if (!hasScope(authContext, "vps.read")) {
+        return toolAuthError(readAuthChallenge);
+      }
+
+      try {
+        cleanupDownloadTokens();
+        const targetPath = resolveFilePath(filePath, cwd);
+        const stat = statSync(targetPath);
+        if (!stat.isFile()) {
+          throw new Error("create_download_link can only download regular files.");
+        }
+        const ttl = Math.min(Math.max(Number(ttlSeconds ?? 600), 1), MAX_DOWNLOAD_TTL_SECONDS);
+        const token = randomToken(32);
+        const expiresAtMs = Date.now() + ttl * 1000;
+        const mimeType = mimeTypeForPath(targetPath);
+        DOWNLOAD_TOKENS.set(token, {
+          filePath: targetPath,
+          mimeType,
+          sizeBytes: stat.size,
+          expiresAt: expiresAtMs,
+        });
+        const url = `${authContext.expectedResource.replace(/\/mcp$/, "")}/download/${token}/${encodeURIComponent(basename(targetPath))}`;
+        const structuredContent = {
+          filePath: targetPath,
+          url,
+          expiresAt: new Date(expiresAtMs).toISOString(),
+          sizeBytes: stat.size,
+          mimeType,
+          message: `Download link for ${targetPath} expires at ${new Date(expiresAtMs).toISOString()}.`,
+        };
+        return {
+          structuredContent,
+          content: [{ type: "text", text: `${structuredContent.message}
+${url}` }],
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const targetPath = resolveFilePath(filePath, cwd);
+        return {
+          isError: true,
+          structuredContent: {
+            filePath: targetPath,
+            url: "",
+            expiresAt: new Date(0).toISOString(),
+            sizeBytes: 0,
+            mimeType: "application/octet-stream",
+            message,
+          },
+          content: [{ type: "text", text: `Download link failed: ${message}` }],
         };
       }
     }
@@ -1256,6 +1774,39 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === "GET" && url.pathname.startsWith("/download/")) {
+    cleanupDownloadTokens();
+    const [, , token] = url.pathname.split("/");
+    const entry = DOWNLOAD_TOKENS.get(token || "");
+    if (!entry || entry.expiresAt <= Date.now()) {
+      DOWNLOAD_TOKENS.delete(token || "");
+      res.writeHead(404, { "content-type": "text/plain; charset=utf-8", ...corsHeaders() }).end("Download link not found or expired.");
+      return;
+    }
+
+    let stat;
+    try {
+      stat = statSync(entry.filePath);
+      if (!stat.isFile()) {
+        throw new Error("not a regular file");
+      }
+    } catch {
+      DOWNLOAD_TOKENS.delete(token || "");
+      res.writeHead(404, { "content-type": "text/plain; charset=utf-8", ...corsHeaders() }).end("File no longer exists.");
+      return;
+    }
+
+    res.writeHead(200, {
+      "content-type": entry.mimeType,
+      "content-length": stat.size,
+      "content-disposition": `attachment; filename="${basename(entry.filePath).replace(/["\r\n]/g, "_")}"`,
+      "cache-control": "no-store",
+      ...corsHeaders(),
+    });
+    createReadStream(entry.filePath).pipe(res);
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/") {
     res
       .writeHead(200, { "content-type": "text/plain; charset=utf-8" })
@@ -1309,13 +1860,19 @@ const httpServer = createServer(async (req, res) => {
   const allowedMethods = new Set(["POST", "GET", "DELETE"]);
   if (isMcpPath(url.pathname) && req.method && allowedMethods.has(req.method)) {
     const authContext = authorizationForRequest(req, url);
-    const authChallenge = wwwAuthenticateChallenge(
+    const readAuthChallenge = wwwAuthenticateChallenge(
+      req,
+      "vps.read",
+      authContext.source === "none" ? "" : "insufficient_scope",
+      "Authorize this app to inspect and download VPS files."
+    );
+    const writeAuthChallenge = wwwAuthenticateChallenge(
       req,
       "vps.write",
       authContext.source === "none" ? "" : "insufficient_scope",
       "Authorize this app to use VPS write tools."
     );
-    const server = await createVpsServer(authContext, authChallenge);
+    const server = await createVpsServer(authContext, readAuthChallenge, writeAuthChallenge);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

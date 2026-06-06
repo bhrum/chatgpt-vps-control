@@ -8,6 +8,9 @@ Small MCP server for connecting ChatGPT to a single Ubuntu VPS.
 - `run_shell_command`: runs any shell command as the service user. Use `sudo` for root-level operations.
 - `write_text_file`: creates a new UTF-8 file or appends text to an existing file without overwriting existing data.
 - `write_file`: creates, overwrites, or appends any file from base64 content. Use `append` for additional chunks when a file is too large for one request.
+- `file_info`: inspects any VPS path, including type, size, permissions, mtime, MIME type, and optional sha256.
+- `read_file`: reads any VPS file as base64, with offset/length chunking and inline image output for viewable images.
+- `create_download_link`: creates a temporary signed URL for downloading any regular file from the VPS.
 - `recent_commands`: returns recent command audit entries.
 
 Each tool advertises explicit Apps SDK metadata: read/write annotations plus tool-level `securitySchemes`. Read-only tools allow `noauth`; write tools advertise OAuth scope `vps.write` and mirror the same scheme in `_meta` for ChatGPT compatibility. The server still accepts the private connector token on every MCP request and also includes a minimal OAuth 2.1 flow for ChatGPT account linking tests.
@@ -17,16 +20,23 @@ Each tool advertises explicit Apps SDK metadata: read/write annotations plus too
 The MCP endpoint uses mixed authentication:
 
 - `initialize`, `tools/list`, `vps_status`, and `recent_commands` can run without OAuth so ChatGPT can keep the app connected and refresh tool metadata.
-- `run_shell_command` and `write_text_file` require either the private `VPS_APP_TOKEN` in the URL/query/Bearer token or OAuth scope `vps.write`.
+- `file_info`, `read_file`, and `create_download_link` require either the private `VPS_APP_TOKEN` in the URL/query/Bearer token or OAuth scope `vps.read`.
+- `run_shell_command`, `write_text_file`, and `write_file` require either the private `VPS_APP_TOKEN` in the URL/query/Bearer token or OAuth scope `vps.write`.
 - When a write tool is called without a valid token, the tool result returns `_meta["mcp/www_authenticate"]` so ChatGPT can launch the OAuth flow for that tool instead of marking the whole app disconnected.
 
 OAuth access tokens do not expire by default. Refresh tokens do not expire in this server. Tokens are persisted by default at `~/.chatgpt-vps-control/oauth-tokens.json`, with a one-time migration from the older `./oauth-tokens.json` path when present. Override the store with `OAUTH_TOKEN_STORE_PATH` if systemd should keep it somewhere else. Set `OAUTH_TOKEN_TTL_SECONDS` only if you want expiring access tokens.
 
 ChatGPT may still force a fresh authorization for account, workspace, or product-side security reasons. This server can keep its own OAuth tokens valid and refreshable, but it cannot force ChatGPT to retain a connector grant forever.
 
+## Downloading and viewing files
+
+Use `file_info` first for unknown paths. It tells you whether the path is a file, directory, or missing, and reports size and MIME type. For small or medium files, use `read_file`; it returns base64 and supports `offset` plus `length` to read large files in chunks. For images, `read_file` can also return inline MCP image content when the requested chunk is the whole image, so ChatGPT can display it directly.
+
+For large files, archives, database dumps, or anything that should be downloaded outside the chat, use `create_download_link`. The returned URL is random, temporary, and served by this MCP server under `/download/...`. Download links default to 10 minutes and are capped by `MAX_DOWNLOAD_TTL_SECONDS` unless configured otherwise.
+
 ## Command and file size behavior
 
-The server no longer advertises a fixed `maxLength` for `run_shell_command.command` or `write_text_file.content`. `write_file.contentBase64` has a configurable per-request chunk limit controlled by `MAX_FILE_CONTENT_BASE64_CHARS`, and callers can send additional chunks with `mode=append`. Shell commands are sent to Bash over stdin instead of as a single `bash -lc` argument, which avoids the operating system's argument-length ceiling for long commands.
+The server no longer advertises a fixed `maxLength` for `run_shell_command.command` or `write_text_file.content`. `write_file.contentBase64` has a configurable per-request chunk limit controlled by `MAX_FILE_CONTENT_BASE64_CHARS`, and callers can send additional chunks with `mode=append`. `read_file` is capped per request by `MAX_FILE_READ_BYTES`, so large downloads should use chunked reads or `create_download_link`. Shell commands are sent to Bash over stdin instead of as a single `bash -lc` argument, which avoids the operating system's argument-length ceiling for long commands.
 
 There is still no true infinite payload in practice: ChatGPT, the MCP transport/client, Cloudflare or other proxies, Node memory, and server disk space can all impose outer limits. Command output is intentionally clipped by `MAX_OUTPUT_CHARS` so one tool call cannot exhaust memory while streaming logs.
 
