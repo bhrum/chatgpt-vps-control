@@ -12,6 +12,8 @@ public static class NativeComputer {
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
   [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
@@ -198,7 +200,7 @@ function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path) {
   $actions = New-Object System.Collections.ArrayList
   if ($null -ne $invoke -or $null -ne $selection -or $null -ne $toggle -or $null -ne $expand) { [void]$actions.Add('press') }
   if ($element.Current.IsKeyboardFocusable) { [void]$actions.Add('focus') }
-  if (($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) -or ($type -eq 'Edit' -and $element.Current.IsKeyboardFocusable)) { [void]$actions.Add('set_value') }
+  if (($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) -or $type -eq 'Edit') { [void]$actions.Add('set_value') }
   if ($null -ne $toggle) { [void]$actions.Add('toggle') }
   if ($null -ne $range -and -not $range.Current.IsReadOnly) { [void]$actions.Add('increment'); [void]$actions.Add('decrement') }
   if ($null -ne $scrollItem) { [void]$actions.Add('scroll_into_view') }
@@ -268,11 +270,20 @@ function Invoke-UIAElementAction($request) {
         $pattern.SetValue([string]$request.value)
         break
       }
-      if (-not $element.Current.IsKeyboardFocusable) { throw 'Element does not support setting a value.' }
-      $element.SetFocus()
-      Start-Sleep -Milliseconds 60
+      $hwnd = [IntPtr][long]$payload.hwnd
+      [NativeComputer]::BringWindowToTop($hwnd) | Out-Null
+      [NativeComputer]::SetForegroundWindow($hwnd) | Out-Null
+      try { $element.SetFocus() } catch {}
+      Start-Sleep -Milliseconds 100
+      $bounds = Get-UIABounds $element
+      if ($null -ne $bounds -and $bounds.width -gt 0 -and $bounds.height -gt 0) {
+        [NativeComputer]::SetCursorPos($bounds.x + [int]($bounds.width / 2), $bounds.y + [int]($bounds.height / 2)) | Out-Null
+        [NativeComputer]::Mouse([NativeComputer]::MOUSEEVENTF_LEFTDOWN, 0)
+        [NativeComputer]::Mouse([NativeComputer]::MOUSEEVENTF_LEFTUP, 0)
+        Start-Sleep -Milliseconds 80
+      }
       Send-KeyChord 'ctrl+a'
-      Start-Sleep -Milliseconds 20
+      Start-Sleep -Milliseconds 30
       [NativeComputer]::Key([ushort]$vk['backspace'], $true)
       [NativeComputer]::Key([ushort]$vk['backspace'], $false)
       [NativeComputer]::UnicodeText([string]$request.value)
@@ -312,6 +323,9 @@ function Invoke-UIAElementAction($request) {
       }
       $bounds = Get-UIABounds $element
       if ($null -eq $bounds) { throw 'Element has no invokable UIA pattern or visible bounds.' }
+      $hwnd = [IntPtr][long]$payload.hwnd
+      [NativeComputer]::BringWindowToTop($hwnd) | Out-Null
+      [NativeComputer]::SetForegroundWindow($hwnd) | Out-Null
       [NativeComputer]::SetCursorPos($bounds.x + [int]($bounds.width/2), $bounds.y + [int]($bounds.height/2)) | Out-Null
       [NativeComputer]::Mouse([NativeComputer]::MOUSEEVENTF_LEFTDOWN,0); [NativeComputer]::Mouse([NativeComputer]::MOUSEEVENTF_LEFTUP,0)
     }

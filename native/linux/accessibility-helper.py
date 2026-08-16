@@ -20,6 +20,18 @@ STATIC_ROLES = {"heading", "image", "label", "paragraph", "static", "status bar"
 MAX_DEPTH = 18
 
 
+ROLE_ALIASES = {
+    "push button": "button",
+    "pushbutton": "button",
+    "password text": "entry",
+}
+
+
+def canonical_role(value):
+    role = str(value or "unknown").strip().lower()
+    return ROLE_ALIASES.get(role, role)
+
+
 def emit(payload):
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
 
@@ -124,7 +136,7 @@ def semantic_actions(obj, role, native_actions, editable, has_value):
 
 
 def element_info(obj, path):
-    role = str(safe(lambda: obj.getRoleName(), "unknown") or "unknown").lower()
+    role = canonical_role(safe(lambda: obj.getRoleName(), "unknown"))
     native_actions, _ = action_names(obj)
     value, editable = text_value(obj)
     numeric = value_info(obj)
@@ -146,7 +158,7 @@ def element_info(obj, path):
 
 
 def interesting(obj, include_static):
-    role = str(safe(lambda: obj.getRoleName(), "") or "").lower()
+    role = canonical_role(safe(lambda: obj.getRoleName(), ""))
     if role in INTERACTIVE_ROLES:
         return True
     if state_has(obj, pyatspi.STATE_FOCUSABLE):
@@ -160,7 +172,7 @@ def list_elements(request):
     desktop = pyatspi.Registry.getDesktop(0)
     max_elements = max(1, min(int(request.get("maxElements", 120)), 500))
     include_static = bool(request.get("includeStaticText", False))
-    role_filter = str(request.get("role", "") or "").strip().lower()
+    role_filter = canonical_role(request.get("role", "")) if request.get("role", "") else ""
     query = str(request.get("query", request.get("name", "")) or "").strip().lower()
     application = str(request.get("application", "") or "").strip().lower()
     result = []
