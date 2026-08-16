@@ -198,7 +198,7 @@ function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path) {
   $actions = New-Object System.Collections.ArrayList
   if ($null -ne $invoke -or $null -ne $selection -or $null -ne $toggle -or $null -ne $expand) { [void]$actions.Add('press') }
   if ($element.Current.IsKeyboardFocusable) { [void]$actions.Add('focus') }
-  if ($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) { [void]$actions.Add('set_value') }
+  if (($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) -or ($type -eq 'Edit' -and $element.Current.IsKeyboardFocusable)) { [void]$actions.Add('set_value') }
   if ($null -ne $toggle) { [void]$actions.Add('toggle') }
   if ($null -ne $range -and -not $range.Current.IsReadOnly) { [void]$actions.Add('increment'); [void]$actions.Add('decrement') }
   if ($null -ne $scrollItem) { [void]$actions.Add('scroll_into_view') }
@@ -264,8 +264,18 @@ function Invoke-UIAElementAction($request) {
     'focus' { $element.SetFocus() }
     'set_value' {
       $pattern = Try-Pattern $element ([System.Windows.Automation.ValuePattern]::Pattern)
-      if ($null -eq $pattern -or $pattern.Current.IsReadOnly) { throw 'Element does not support setting a value.' }
-      $pattern.SetValue([string]$request.value)
+      if ($null -ne $pattern -and -not $pattern.Current.IsReadOnly) {
+        $pattern.SetValue([string]$request.value)
+        break
+      }
+      if (-not $element.Current.IsKeyboardFocusable) { throw 'Element does not support setting a value.' }
+      $element.SetFocus()
+      Start-Sleep -Milliseconds 60
+      Send-KeyChord 'ctrl+a'
+      Start-Sleep -Milliseconds 20
+      [NativeComputer]::Key([ushort]$vk['backspace'], $true)
+      [NativeComputer]::Key([ushort]$vk['backspace'], $false)
+      [NativeComputer]::UnicodeText([string]$request.value)
     }
     'toggle' {
       $pattern = Try-Pattern $element ([System.Windows.Automation.TogglePattern]::Pattern)

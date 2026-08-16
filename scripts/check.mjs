@@ -27,7 +27,7 @@ for (const file of files) run(process.execPath, ["--check", file], `Syntax check
 if (platform() === "linux") {
   run("python3", ["-m", "py_compile", "native/linux/accessibility-helper.py"], "Linux accessibility helper syntax check");
 } else if (platform() === "darwin") {
-  run("xcrun", ["swiftc", "-typecheck", "native/macos/ComputerHelper.swift", "-framework", "AppKit", "-framework", "ApplicationServices"], "macOS helper typecheck");
+  run("xcrun", ["swiftc", "-typecheck", "native/macos/ComputerHelper.swift", "-framework", "AppKit", "-framework", "ApplicationServices", "-framework", "ScreenCaptureKit"], "macOS helper typecheck");
 } else if (platform() === "win32") {
   const script = "$errors=$null; [System.Management.Automation.Language.Parser]::ParseFile('native/windows/computer-helper.ps1',[ref]$null,[ref]$errors) | Out-Null; if ($errors.Count) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }";
   run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], "Windows helper parse check");

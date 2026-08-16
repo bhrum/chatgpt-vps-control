@@ -174,7 +174,9 @@ try {
     try {
       let snapshot = await waitForElements(
         { source: "desktop", application: "chatgpt-computer-semantic-test", includeStaticText: true, maxElements: 80 },
-        (items) => items.some((element) => ["entry", "text"].includes(element.role) && element.name.includes("Semantic entry")),
+        (items) =>
+          items.some((element) => ["entry", "text"].includes(element.role) && element.name.includes("Semantic entry")) &&
+          items.some((element) => element.role === "button" && element.name.includes("Apply semantic value")),
         "AT-SPI semantic controls",
       );
       const field = snapshot.elements.find((element) => ["entry", "text"].includes(element.role) && element.name.includes("Semantic entry"));

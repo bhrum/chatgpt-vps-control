@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import ApplicationServices
+import ScreenCaptureKit
 
 struct Point: Codable { let x: Int; let y: Int }
 struct RectInfo: Codable { let x: Int; let y: Int; let width: Int; let height: Int }
@@ -193,10 +194,45 @@ func postKey(_ raw: String) {
     down.post(tap: .cghidEventTap); usleep(20_000); up.post(tap: .cghidEventTap)
 }
 
-func screenshotBase64() -> String? {
-    guard let image = CGWindowListCreateImage(.infinite, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution]) else { return nil }
-    let rep = NSBitmapImageRep(cgImage: image)
-    return rep.representation(using: .png, properties: [:])?.base64EncodedString()
+func screenshotWithSystemTool() -> String? {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("chatgpt-computer-\(UUID().uuidString).png")
+    defer { try? FileManager.default.removeItem(at: url) }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    process.arguments = ["-x", "-t", "png", url.path]
+    do {
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        return try Data(contentsOf: url).base64EncodedString()
+    } catch {
+        return nil
+    }
+}
+
+func screenshotBase64() async -> String? {
+    if #available(macOS 14.0, *) {
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            let mainID = CGMainDisplayID()
+            guard let display = content.displays.first(where: { $0.displayID == mainID }) ?? content.displays.first else {
+                return screenshotWithSystemTool()
+            }
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let configuration = SCStreamConfiguration()
+            configuration.width = display.width
+            configuration.height = display.height
+            configuration.showsCursor = true
+            let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+            let rep = NSBitmapImageRep(cgImage: image)
+            if let data = rep.representation(using: .png, properties: [:]) {
+                return data.base64EncodedString()
+            }
+        } catch {
+            // Fall back to the system capture utility for older/limited sessions.
+        }
+    }
+    return screenshotWithSystemTool()
 }
 
 func visibleWindows() -> [WindowInfo] {
@@ -419,46 +455,51 @@ func performAXElementAction(_ request: ElementActionRequest) -> ElementActionRes
     return ElementActionResult(ok: true, source: "macos-ax", action: action)
 }
 
-let input = FileHandle.standardInput.readDataToEndOfFile()
-guard let request = try? JSONDecoder().decode(Request.self, from: input) else { fail("invalid JSON request") }
-let apiWidth = max(320, request.apiWidth ?? 1280)
-let resolutions = mainResolution(apiWidth: apiWidth)
-let shouldPrompt = request.doctor ?? false
-let permissions = Permissions(accessibility: accessibilityAllowed(prompt: shouldPrompt), screenRecording: screenRecordingAllowed(prompt: shouldPrompt))
+func runHelper() async {
+    let input = FileHandle.standardInput.readDataToEndOfFile()
+    guard let request = try? JSONDecoder().decode(Request.self, from: input) else { fail("invalid JSON request") }
+    let apiWidth = max(320, request.apiWidth ?? 1280)
+    let resolutions = mainResolution(apiWidth: apiWidth)
+    let shouldPrompt = request.doctor ?? false
+    let permissions = Permissions(accessibility: accessibilityAllowed(prompt: shouldPrompt), screenRecording: screenRecordingAllowed(prompt: shouldPrompt))
 
-if (!(request.actions ?? []).isEmpty || request.includeElements == true || request.elementAction != nil) && !permissions.accessibility {
-    fail("Accessibility permission is required. Enable this helper in System Settings > Privacy & Security > Accessibility.")
+    if (!(request.actions ?? []).isEmpty || request.includeElements == true || request.elementAction != nil) && !permissions.accessibility {
+        fail("Accessibility permission is required. Enable this helper in System Settings > Privacy & Security > Accessibility.")
+    }
+    var elementActionResult: ElementActionResult? = nil
+    if let elementAction = request.elementAction { elementActionResult = performAXElementAction(elementAction) }
+    for action in request.actions ?? [] { perform(action, display: resolutions.display, api: resolutions.api) }
+    if !(request.actions ?? []).isEmpty || request.elementAction != nil { usleep(180_000) }
+
+    var elementApplication: String? = nil
+    var elements: [ElementInfo]? = nil
+    if request.includeElements == true {
+        let listed = listAXElements(options: request.elementOptions)
+        elementApplication = listed.application
+        elements = listed.elements
+    }
+
+    let cursor = apiPoint(CGEvent(source: nil)?.location ?? .zero, display: resolutions.display, api: resolutions.api)
+    let capture = request.includeScreenshot ?? true
+    let screenshot = capture ? await screenshotBase64() : nil
+    if capture && screenshot == nil { fail("Screen Recording permission is required to capture the desktop.") }
+    emit(Response(
+        ok: true,
+        displayResolution: resolutions.display,
+        apiResolution: resolutions.api,
+        cursorPosition: cursor,
+        activeWindow: activeWindow(),
+        windows: (request.includeWindows ?? false) ? visibleWindows() : [],
+        screenshotMimeType: screenshot == nil ? nil : "image/png",
+        screenshotBase64: screenshot,
+        permissions: permissions,
+        elementSource: request.includeElements == true ? "macos-ax" : nil,
+        elementApplication: elementApplication,
+        elements: elements,
+        elementMessage: elements == nil ? nil : "Returned \(elements!.count) macOS accessibility elements.",
+        elementActionResult: elementActionResult
+    ))
 }
-var elementActionResult: ElementActionResult? = nil
-if let elementAction = request.elementAction { elementActionResult = performAXElementAction(elementAction) }
-for action in request.actions ?? [] { perform(action, display: resolutions.display, api: resolutions.api) }
-if !(request.actions ?? []).isEmpty || request.elementAction != nil { usleep(180_000) }
 
-var elementApplication: String? = nil
-var elements: [ElementInfo]? = nil
-if request.includeElements == true {
-    let listed = listAXElements(options: request.elementOptions)
-    elementApplication = listed.application
-    elements = listed.elements
-}
-
-let cursor = apiPoint(CGEvent(source: nil)?.location ?? .zero, display: resolutions.display, api: resolutions.api)
-let capture = request.includeScreenshot ?? true
-let screenshot = capture ? screenshotBase64() : nil
-if capture && screenshot == nil { fail("Screen Recording permission is required to capture the desktop.") }
-emit(Response(
-    ok: true,
-    displayResolution: resolutions.display,
-    apiResolution: resolutions.api,
-    cursorPosition: cursor,
-    activeWindow: activeWindow(),
-    windows: (request.includeWindows ?? false) ? visibleWindows() : [],
-    screenshotMimeType: screenshot == nil ? nil : "image/png",
-    screenshotBase64: screenshot,
-    permissions: permissions,
-    elementSource: request.includeElements == true ? "macos-ax" : nil,
-    elementApplication: elementApplication,
-    elements: elements,
-    elementMessage: elements == nil ? nil : "Returned \(elements!.count) macOS accessibility elements.",
-    elementActionResult: elementActionResult
-))
+Task { await runHelper() }
+RunLoop.main.run()
