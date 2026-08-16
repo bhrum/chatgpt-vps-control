@@ -3,14 +3,16 @@ import { appendFile, mkdir, open, readFile, rename, writeFile } from "node:fs/pr
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { homedir, hostname, platform, release, totalmem, freemem } from "node:os";
+import { homedir, hostname, platform, release, totalmem, freemem, uptime as osUptime } from "node:os";
 import { basename, dirname, extname, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { buildComputerToolDescriptors, registerComputerUseTools } from "./computer-use.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
+const HOST = process.env.HOST ?? "127.0.0.1";
 const MCP_PREFIX = process.env.MCP_PATH_PREFIX ?? "/mcp";
 const TOKEN = process.env.VPS_APP_TOKEN ?? "";
 const HISTORY_PATH = process.env.HISTORY_PATH ?? resolve(process.cwd(), "history.jsonl");
@@ -319,7 +321,7 @@ function wwwAuthenticateChallenge(req, scope = "vps.write", error = "", errorDes
 function toolAuthError(challenge) {
   return {
     isError: true,
-    content: [{ type: "text", text: "Authentication required: authorize this app to use the requested VPS tool." }],
+    content: [{ type: "text", text: "Authentication required: authorize this app to use the requested computer-control tool." }],
     _meta: {
       "mcp/www_authenticate": [challenge],
     },
@@ -520,7 +522,7 @@ function safeCwd(cwd) {
     return fallback;
   }
 
-  const candidate = resolve(cwd.replace(/^~(?=$|\/)/, homedir()));
+  const candidate = resolve(cwd.replace(/^~(?=$|[\\/])/, homedir()));
   if (!existsSync(candidate)) {
     return fallback;
   }
@@ -534,7 +536,7 @@ function resolveFilePath(filePath, cwd) {
     throw new Error("filePath must be a non-empty path without null bytes.");
   }
 
-  const expanded = filePath.replace(/^~(?=$|\/)/, homedir());
+  const expanded = filePath.replace(/^~(?=$|[\\/])/, homedir());
   return resolve(safeCwd(cwd), expanded);
 }
 
@@ -613,11 +615,13 @@ function fileMode(stat) {
 }
 
 async function sha256File(filePath) {
-  const result = await runCommand(`sha256sum -- ${JSON.stringify(filePath)}`, dirname(filePath), 30, { audit: false });
-  if (result.status !== "completed") {
-    return null;
-  }
-  return result.stdout.trim().split(/\s+/)[0] || null;
+  return new Promise((resolveHash, rejectHash) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", rejectHash);
+    stream.on("end", () => resolveHash(hash.digest("hex")));
+  });
 }
 
 async function getFileInfo(filePath, cwd, includeSha256 = false) {
@@ -709,8 +713,8 @@ function toolMeta(invoking, invoked, securitySchemes = NO_AUTH_SECURITY_SCHEMES)
 const TOOL_DESCRIPTORS = [
   {
     name: "vps_status",
-    title: "VPS status",
-    description: "Read-only status summary for this Oracle Ubuntu VPS.",
+    title: "Computer status",
+    description: "Read-only status summary for the computer running this MCP server.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     outputSchema: {
       type: "object",
@@ -741,13 +745,13 @@ const TOOL_DESCRIPTORS = [
       idempotentHint: true,
     },
     securitySchemes: NO_AUTH_SECURITY_SCHEMES,
-    _meta: toolMeta("Checking VPS status", "VPS status ready"),
+    _meta: toolMeta("Checking computer status", "Computer status ready"),
   },
   {
     name: "run_shell_command",
     title: "Run shell command",
     description:
-      "Run any Bash command on the Oracle VPS as the service user. For root-level operations, prefix commands with sudo.",
+      "Run a shell command on this computer as the MCP service user. Uses Bash on Linux/macOS and PowerShell on Windows.",
     inputSchema: {
       type: "object",
       properties: {
@@ -771,7 +775,7 @@ const TOOL_DESCRIPTORS = [
     name: "write_text_file",
     title: "Write text file",
     description:
-      "Create a new UTF-8 text file or append text to an existing file on the Oracle VPS. Create mode fails if the file already exists.",
+      "Create a new UTF-8 text file or append text to an existing file on this computer. Create mode fails if the file already exists.",
     inputSchema: {
       type: "object",
       properties: {
@@ -801,7 +805,7 @@ const TOOL_DESCRIPTORS = [
     name: "write_file",
     title: "Write file",
     description:
-      "Create, overwrite, or append any file on the Oracle VPS from base64 content. Use append for additional chunks of large files.",
+      "Create, overwrite, or append any file on this computer from base64 content. Use append for additional chunks of large files.",
     inputSchema: {
       type: "object",
       properties: {
@@ -834,7 +838,7 @@ const TOOL_DESCRIPTORS = [
   {
     name: "file_info",
     title: "File info",
-    description: "Inspect any VPS path, returning type, size, permissions, modified time, MIME type, and optionally sha256.",
+    description: "Inspect any local path, returning type, size, permissions, modified time, MIME type, and optionally sha256.",
     inputSchema: {
       type: "object",
       properties: {
@@ -859,7 +863,7 @@ const TOOL_DESCRIPTORS = [
     name: "read_file",
     title: "Read file",
     description:
-      "Read any file from the VPS as base64. Supports offset/length chunking and can return images inline for viewing.",
+      "Read any local file as base64. Supports offset/length chunking and can return images inline for viewing.",
     inputSchema: {
       type: "object",
       properties: {
@@ -885,7 +889,7 @@ const TOOL_DESCRIPTORS = [
   {
     name: "create_download_link",
     title: "Create download link",
-    description: "Create a temporary signed URL for downloading any file from the VPS through this MCP server.",
+    description: "Create a temporary signed URL for downloading any local file through this MCP server.",
     inputSchema: {
       type: "object",
       properties: {
@@ -944,16 +948,25 @@ const TOOL_DESCRIPTORS = [
     securitySchemes: NO_AUTH_SECURITY_SCHEMES,
     _meta: toolMeta("Reading command history", "Command history ready"),
   },
+  ...buildComputerToolDescriptors({
+    readSecuritySchemes: READ_SECURITY_SCHEMES,
+    writeSecuritySchemes: WRITE_SECURITY_SCHEMES,
+    toolMeta,
+  }),
 ];
 
 function commandEnv() {
+  if (platform() === "win32") {
+    return { ...process.env, USERPROFILE: process.env.USERPROFILE ?? homedir(), HOME: homedir() };
+  }
   return {
+    ...process.env,
     HOME: homedir(),
     LANG: process.env.LANG ?? "C.UTF-8",
     LC_ALL: process.env.LC_ALL ?? "C.UTF-8",
-    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    SHELL: "/bin/bash",
-    USER: process.env.USER ?? "ubuntu",
+    PATH: process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    SHELL: process.env.SHELL ?? "/bin/bash",
+    USER: process.env.USER ?? process.env.LOGNAME ?? "user",
   };
 }
 
@@ -976,7 +989,7 @@ async function readHistory(limit) {
   }
 }
 
-function executeBashScript(command, workingDirectory, timeoutMs) {
+function executeShellScript(command, workingDirectory, timeoutMs) {
   return new Promise((resolveRun) => {
     const started = Date.now();
     const stdoutCapture = createOutputCapture();
@@ -985,10 +998,16 @@ function executeBashScript(command, workingDirectory, timeoutMs) {
     let timedOut = false;
     let forceKillTimer = null;
 
-    const child = spawn("/bin/bash", ["-l", "-s"], {
+    const isWindows = platform() === "win32";
+    const shell = isWindows ? "powershell.exe" : "/bin/bash";
+    const args = isWindows
+      ? ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "-"]
+      : ["-l", "-s"];
+    const child = spawn(shell, args, {
       cwd: workingDirectory,
       env: commandEnv(),
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
 
     const timeoutTimer = setTimeout(() => {
@@ -1038,7 +1057,7 @@ async function runCommand(command, cwd, timeoutSeconds, options = {}) {
   const workingDirectory = safeCwd(cwd);
   const timeoutMs = Math.min(Math.max(Number(timeoutSeconds ?? 10), 1), MAX_TIMEOUT_SECONDS) * 1000;
 
-  const result = await executeBashScript(command, workingDirectory, timeoutMs);
+  const result = await executeShellScript(command, workingDirectory, timeoutMs);
   if (audit) {
     await writeHistory(result);
   }
@@ -1047,15 +1066,15 @@ async function runCommand(command, cwd, timeoutSeconds, options = {}) {
 
 async function createVpsServer(authContext, readAuthChallenge, writeAuthChallenge) {
   const server = new McpServer({
-    name: "oracle-vps-control",
-    version: "0.1.0",
+    name: "chatgpt-computer-control",
+    version: "0.2.0",
   });
 
   server.registerTool(
     "vps_status",
     {
-      title: "VPS status",
-      description: "Read-only status summary for this Oracle Ubuntu VPS.",
+      title: "Computer status",
+      description: "Read-only status summary for the computer running this MCP server.",
       inputSchema: {},
       outputSchema: statusSchema,
       annotations: {
@@ -1065,19 +1084,34 @@ async function createVpsServer(authContext, readAuthChallenge, writeAuthChalleng
         idempotentHint: true,
       },
       securitySchemes: NO_AUTH_SECURITY_SCHEMES,
-      _meta: toolMeta("Checking VPS status", "VPS status ready"),
+      _meta: toolMeta("Checking computer status", "Computer status ready"),
     },
     async () => {
-      const [uptime, disk, processes] = await Promise.all([
-        runCommand("uptime", homedir(), 5, { audit: false }),
-        runCommand("df -h / /home 2>/dev/null || df -h /", homedir(), 5, { audit: false }),
-        runCommand("ps -eo pid,comm,%cpu,%mem --sort=-%cpu | head -12", homedir(), 5, { audit: false }),
+      const os = platform();
+      const statusCommands = os === "win32"
+        ? {
+            disk: "Get-PSDrive -PSProvider FileSystem | Select-Object Name,Used,Free | Format-Table -AutoSize | Out-String",
+            processes: "Get-Process | Sort-Object CPU -Descending | Select-Object -First 10 Id,ProcessName,CPU,WorkingSet64 | Format-Table -AutoSize | Out-String",
+          }
+        : os === "darwin"
+          ? {
+              disk: "df -h /",
+              processes: "ps -Ao pid,comm,%cpu,%mem -r | head -12",
+            }
+          : {
+              disk: "df -h / /home 2>/dev/null || df -h /",
+              processes: "ps -eo pid,comm,%cpu,%mem --sort=-%cpu | head -12",
+            };
+      const [disk, processes] = await Promise.all([
+        runCommand(statusCommands.disk, homedir(), 5, { audit: false }),
+        runCommand(statusCommands.processes, homedir(), 5, { audit: false }),
       ]);
+      const uptimeText = `${Math.floor(osUptime() / 86400)}d ${Math.floor((osUptime() % 86400) / 3600)}h ${Math.floor((osUptime() % 3600) / 60)}m`;
       const structuredContent = {
         hostname: hostname(),
         platform: platform(),
         release: release(),
-        uptime: uptime.stdout.trim() || uptime.stderr.trim(),
+        uptime: uptimeText,
         memory: {
           totalBytes: totalmem(),
           freeBytes: freemem(),
@@ -1091,7 +1125,7 @@ async function createVpsServer(authContext, readAuthChallenge, writeAuthChalleng
         content: [
           {
             type: "text",
-            text: `VPS ${structuredContent.hostname} is reachable. Uptime: ${structuredContent.uptime}`,
+            text: `Computer ${structuredContent.hostname} is reachable. Uptime: ${structuredContent.uptime}`,
           },
         ],
       };
@@ -1103,7 +1137,7 @@ async function createVpsServer(authContext, readAuthChallenge, writeAuthChalleng
     {
       title: "Run shell command",
       description:
-        "Run any Bash command on the Oracle VPS as the service user. For root-level operations, prefix commands with sudo.",
+        "Run a shell command on this computer as the MCP service user. Uses Bash on Linux/macOS and PowerShell on Windows.",
       inputSchema: {
         command: z.string().min(1),
         cwd: z.string().optional().describe("Working directory. Defaults to the service user's home directory."),
@@ -1144,7 +1178,7 @@ async function createVpsServer(authContext, readAuthChallenge, writeAuthChalleng
     {
       title: "Write text file",
       description:
-        "Create a new UTF-8 text file or append text to an existing file on the Oracle VPS. Create mode fails if the file already exists.",
+        "Create a new UTF-8 text file or append text to an existing file on this computer. Create mode fails if the file already exists.",
       inputSchema: {
         filePath: z.string().min(1).max(1000).describe("Absolute path, ~/path, or path relative to cwd."),
         content: z.string(),
@@ -1238,7 +1272,7 @@ async function createVpsServer(authContext, readAuthChallenge, writeAuthChalleng
     {
       title: "Write file",
       description:
-        "Create, overwrite, or append any file on the Oracle VPS from base64 content. Use append for additional chunks of large files.",
+        "Create, overwrite, or append any file on this computer from base64 content. Use append for additional chunks of large files.",
       inputSchema: {
         filePath: z.string().min(1).max(1000).describe("Absolute path, ~/path, or path relative to cwd."),
         contentBase64: z
@@ -1335,7 +1369,7 @@ async function createVpsServer(authContext, readAuthChallenge, writeAuthChalleng
     "file_info",
     {
       title: "File info",
-      description: "Inspect any VPS path, returning type, size, permissions, modified time, MIME type, and optionally sha256.",
+      description: "Inspect any local path, returning type, size, permissions, modified time, MIME type, and optionally sha256.",
       inputSchema: {
         filePath: z.string().min(1).max(1000).describe("Absolute path, ~/path, or path relative to cwd."),
         cwd: z.string().optional().describe("Base directory for relative filePath values."),
@@ -1389,7 +1423,7 @@ async function createVpsServer(authContext, readAuthChallenge, writeAuthChalleng
     {
       title: "Read file",
       description:
-        "Read any file from the VPS as base64. Supports offset/length chunking and can return images inline for viewing.",
+        "Read any local file as base64. Supports offset/length chunking and can return images inline for viewing.",
       inputSchema: {
         filePath: z.string().min(1).max(1000).describe("Absolute path, ~/path, or path relative to cwd."),
         cwd: z.string().optional().describe("Base directory for relative filePath values."),
@@ -1473,7 +1507,7 @@ async function createVpsServer(authContext, readAuthChallenge, writeAuthChalleng
     "create_download_link",
     {
       title: "Create download link",
-      description: "Create a temporary signed URL for downloading any file from the VPS through this MCP server.",
+      description: "Create a temporary signed URL for downloading any local file through this MCP server.",
       inputSchema: {
         filePath: z.string().min(1).max(1000).describe("Absolute path, ~/path, or path relative to cwd."),
         cwd: z.string().optional().describe("Base directory for relative filePath values."),
@@ -1573,6 +1607,18 @@ ${url}` }],
     }
   );
 
+  registerComputerUseTools(server, {
+    hasReadScope: () => hasScope(authContext, "vps.read"),
+    hasWriteScope: () => hasScope(authContext, "vps.write"),
+    readAuthChallenge,
+    writeAuthChallenge,
+    toolAuthError,
+    readSecuritySchemes: READ_SECURITY_SCHEMES,
+    writeSecuritySchemes: WRITE_SECURITY_SCHEMES,
+    toolMeta,
+    audit: writeHistory,
+  });
+
   server.server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: TOOL_DESCRIPTORS,
   }));
@@ -1631,10 +1677,10 @@ function handleOAuthAuthorize(req, res, url) {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(`<!doctype html>
 <html>
-  <head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Oracle VPS Control</title></head>
+  <head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize ChatGPT Computer Control</title></head>
   <body style="font-family: system-ui, sans-serif; max-width: 560px; margin: 48px auto; line-height: 1.5;">
-    <h1>Authorize Oracle VPS Control</h1>
-    <p>This grants ChatGPT permission to use the VPS write tools exposed by this connector.</p>
+    <h1>Authorize ChatGPT Computer Control</h1>
+    <p>This grants ChatGPT permission to use the computer-control tools exposed by this connector.</p>
     <form method="get" action="/oauth/authorize">
       ${hidden}
       <input type="hidden" name="approve" value="1">
@@ -1810,7 +1856,7 @@ const httpServer = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/") {
     res
       .writeHead(200, { "content-type": "text/plain; charset=utf-8" })
-      .end("Oracle VPS ChatGPT MCP server. Use /mcp/<token> as the connector URL.");
+      .end("ChatGPT Computer Control MCP server. Use /mcp/<token> as the connector URL.");
     return;
   }
 
@@ -1864,13 +1910,13 @@ const httpServer = createServer(async (req, res) => {
       req,
       "vps.read",
       authContext.source === "none" ? "" : "insufficient_scope",
-      "Authorize this app to inspect and download VPS files."
+      "Authorize this app to inspect and download local files."
     );
     const writeAuthChallenge = wwwAuthenticateChallenge(
       req,
       "vps.write",
       authContext.source === "none" ? "" : "insufficient_scope",
-      "Authorize this app to use VPS write tools."
+      "Authorize this app to use computer-control write tools."
     );
     const server = await createVpsServer(authContext, readAuthChallenge, writeAuthChallenge);
     const transport = new StreamableHTTPServerTransport({
@@ -1902,6 +1948,6 @@ const httpServer = createServer(async (req, res) => {
 
 await loadOAuthTokenStore();
 
-httpServer.listen(PORT, "127.0.0.1", () => {
-  console.log(`Oracle VPS MCP server listening on http://127.0.0.1:${PORT}${MCP_PREFIX}/<token>`);
+httpServer.listen(PORT, HOST, () => {
+  console.log(`ChatGPT Computer Control MCP server listening on http://${HOST}:${PORT}${MCP_PREFIX}/<token>`);
 });
