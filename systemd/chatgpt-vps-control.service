@@ -1,5 +1,5 @@
 [Unit]
-Description=ChatGPT Oracle VPS MCP control server
+Description=ChatGPT Computer Control MCP server
 After=network-online.target
 Wants=network-online.target
 

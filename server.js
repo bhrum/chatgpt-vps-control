@@ -1863,7 +1863,7 @@ const httpServer = createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/health") {
     writeJson(res, 200, {
       ok: true,
-      name: "oracle-vps-control",
+      name: "chatgpt-computer-control",
       hostname: hostname(),
       mcpPath: `${MCP_PREFIX}/<token>`,
     });
