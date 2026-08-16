@@ -1,0 +1,79 @@
+name: cross-platform-computer-control
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  node:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm audit --omit=dev
+
+  macos-native-helper:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and probe macOS native helper
+        run: bash scripts/macos-helper-smoke.sh
+
+  windows-native-helper:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse and exercise Windows UI Automation helper
+        shell: powershell
+        run: |
+          $errors=$null
+          [System.Management.Automation.Language.Parser]::ParseFile('native/windows/computer-helper.ps1',[ref]$null,[ref]$errors) | Out-Null
+          if ($errors.Count) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File scripts/windows-uia-smoke.ps1
+
+  linux-managed-semantic-desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Install X11, AT-SPI, and GTK test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xdotool ffmpeg x11-utils x11-xserver-utils xvfb x11vnc xfwm4 dbus-x11 at-spi2-core python3-pyatspi gir1.2-atspi-2.0 libglib2.0-bin python3-gi gir1.2-gtk-3.0
+          google-chrome --version
+      - name: Configure managed headless desktop
+        shell: bash
+        run: |
+          env -u DISPLAY -u DBUS_SESSION_BUS_ADDRESS CHATGPT_COMPUTER_HOME="$RUNNER_TEMP/computer-control" node bin/chatgpt-computer-control.js setup --no-deps --port 18995
+          grep '^COMPUTER_MANAGED_X11=1$' "$RUNNER_TEMP/computer-control/.env"
+          grep '^NO_AT_BRIDGE=0$' "$RUNNER_TEMP/computer-control/.env"
+      - name: Start MCP and exercise coordinate plus semantic control
+        shell: bash
+        run: |
+          env -u DISPLAY -u DBUS_SESSION_BUS_ADDRESS CHATGPT_COMPUTER_HOME="$RUNNER_TEMP/computer-control" COMPUTER_CDP_ENDPOINTS=http://127.0.0.1:9222 node bin/chatgpt-computer-control.js serve >"$RUNNER_TEMP/server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/server.pid"
+          for i in $(seq 1 120); do curl -fsS http://127.0.0.1:18995/health >/dev/null && break; sleep 0.1; done
+          TOKEN=$(awk -F= '$1=="VPS_APP_TOKEN"{print $2}' "$RUNNER_TEMP/computer-control/.env")
+          MCP_SMOKE_TOKEN="$TOKEN" MCP_SMOKE_PORT=18995 node scripts/mcp-smoke.mjs
+          MCP_SMOKE_TOKEN="$TOKEN" MCP_SMOKE_PORT=18995 MCP_SMOKE_CDP_ENDPOINT=http://127.0.0.1:9222 MCP_SMOKE_LAUNCH_CHROME=1 MCP_SMOKE_ATSPI=1 node scripts/semantic-mcp-smoke.mjs
+      - if: always()
+        shell: bash
+        run: |
+          test -f "$RUNNER_TEMP/server.log" && cat "$RUNNER_TEMP/server.log" || true
+          test -f "$RUNNER_TEMP/server.pid" && kill "$(cat "$RUNNER_TEMP/server.pid")" 2>/dev/null || true
