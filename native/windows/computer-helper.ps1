@@ -129,12 +129,12 @@ function Send-KeyChord($raw) {
   if ($parts.Count -eq 0) { return }
   $mods = @(); if ($parts.Count -gt 1) { $mods = @($parts[0..($parts.Count-2)]) }
   $keyPart = $parts[-1]; $pressed = @()
-  foreach ($m in $mods) { if ($vk.ContainsKey($m)) { [NativeComputer]::Key([ushort]$vk[$m], $true); $pressed += [ushort]$vk[$m] } }
-  if ($vk.ContainsKey($keyPart)) { $keyCode = [ushort]$vk[$keyPart] }
-  elseif ($keyPart.Length -eq 1) { $keyCode = [ushort][char]$keyPart.ToUpperInvariant() }
+  foreach ($m in $mods) { if ($vk.ContainsKey($m)) { [NativeComputer]::Key([uint16]$vk[$m], $true); $pressed += [uint16]$vk[$m] } }
+  if ($vk.ContainsKey($keyPart)) { $keyCode = [uint16]$vk[$keyPart] }
+  elseif ($keyPart.Length -eq 1) { $keyCode = [uint16][char]$keyPart.ToUpperInvariant() }
   else { [NativeComputer]::UnicodeText($raw); return }
   [NativeComputer]::Key($keyCode, $true); Start-Sleep -Milliseconds 15; [NativeComputer]::Key($keyCode, $false)
-  [array]::Reverse($pressed); foreach ($m in $pressed) { [NativeComputer]::Key([ushort]$m, $false) }
+  [array]::Reverse($pressed); foreach ($m in $pressed) { [NativeComputer]::Key([uint16]$m, $false) }
 }
 
 # UI Automation semantic tree
@@ -284,8 +284,8 @@ function Invoke-UIAElementAction($request) {
       }
       Send-KeyChord 'ctrl+a'
       Start-Sleep -Milliseconds 30
-      [NativeComputer]::Key([ushort]$vk['backspace'], $true)
-      [NativeComputer]::Key([ushort]$vk['backspace'], $false)
+      [NativeComputer]::Key([uint16]$vk['backspace'], $true)
+      [NativeComputer]::Key([uint16]$vk['backspace'], $false)
       [NativeComputer]::UnicodeText([string]$request.value)
     }
     'toggle' {
