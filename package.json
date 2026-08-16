@@ -1,17 +1,18 @@
 {
   "name": "chatgpt-computer-control",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
-    "check": "node --check server.js && node --check computer-use.js && node --check bin/chatgpt-computer-control.js && node --check lib/local-install.js && node --check lib/service-manager.js && node --check lib/native-computer-backend.js && node --check lib/linux-desktop.js",
+    "check": "node scripts/check.mjs",
     "doctor": "node bin/chatgpt-computer-control.js doctor",
     "setup": "node bin/chatgpt-computer-control.js setup",
     "test": "node --test tests/*.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.2",
+    "ws": "^8.21.3",
     "zod": "^3.25.76"
   },
   "description": "Installable cross-platform MCP server for authenticated computer control.",

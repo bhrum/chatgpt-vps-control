@@ -21,9 +21,11 @@ The recovered Grok Bot implementation is an OS-level X11 controller, not a DOM a
 
 ## Connector implementation
 
-`computer-use.js` ports that mechanism into the installable connector and exposes three computer MCP tools:
+`computer-use.js` ports that mechanism into the installable connector and exposes five computer MCP tools:
 
 - `computer_environment` (`vps.read`): reports the selected platform backend and readiness/permission state.
+- `computer_elements` (`vps.read`): creates a short-lived indexed accessibility snapshot from AT-SPI, AXUIElement, Windows UI Automation, or browser CDP.
+- `computer_element_action` (`vps.write`): performs semantic element actions and returns a post-action screenshot; text values are redacted from audit history.
 - `computer_state` (`vps.read`): returns the selected display, display/API resolution, cursor position, active/visible windows, and optionally an inline screenshot.
 - `computer_use` (`vps.write`): supports `screenshot`, `click`, `move`, `drag`, `type`, `key`, `scroll`, and `wait`, plus up to nine known follow-up actions in `then`; one final inline screenshot is returned.
 
@@ -72,3 +74,16 @@ The installable 0.2.x architecture preserves the recovered X11 backend on Linux 
 - Windows: a PowerShell/C# helper using User32 `SendInput`, cursor/window APIs, and GDI screenshot capture.
 
 The MCP API and normalized coordinates remain the same across all three backends. The server shell runner and SHA-256 implementation were also made cross-platform so installation does not leave non-computer tools Linux-only.
+
+## Semantic control layer
+
+Version 0.3 adds a structure-first control layer above the recovered coordinate backend:
+
+- Linux native applications: AT-SPI through a bounded Python helper.
+- Chrome/Electron: Chrome DevTools Protocol Accessibility and DOM domains through loopback-only configured endpoints.
+- macOS: AXUIElement traversal and actions in the compiled Swift helper.
+- Windows: UI Automation control patterns in the native PowerShell/C# helper.
+
+The MCP stores opaque platform handles only inside a 90-second server-side snapshot and exposes indexes to the model. After an action the snapshot is invalidated, and the returned screenshot plus a new `computer_elements` call form the verification loop. Coordinate control remains available for canvases, remote desktops, inaccessible applications, and visual fallbacks.
+
+Linux verification covers both a real X11 session and a clean headless installation that creates its own D-Bus, AT-SPI bus, Xvfb display, window manager, browser, and GTK application. Browser and native semantic tests each perform a value update, invoke a button, re-read the accessibility tree, and verify the resulting state.

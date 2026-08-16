@@ -3,6 +3,7 @@ import AppKit
 import ApplicationServices
 
 struct Point: Codable { let x: Int; let y: Int }
+struct RectInfo: Codable { let x: Int; let y: Int; let width: Int; let height: Int }
 struct WindowInfo: Codable { let id: String; let name: String }
 struct Resolution: Codable { let width: Int; let height: Int }
 struct Action: Codable {
@@ -20,33 +21,70 @@ struct Action: Codable {
     let amount: Int?
     let durationMs: Int?
 }
+struct ElementOptions: Codable {
+    let maxElements: Int?
+    let includeStaticText: Bool?
+    let role: String?
+    let query: String?
+    let name: String?
+    let application: String?
+}
+struct ElementActionRequest: Codable { let elementId: String; let action: String; let value: String? }
 struct Request: Codable {
     let apiWidth: Int?
     let actions: [Action]?
     let includeScreenshot: Bool?
     let includeWindows: Bool?
     let doctor: Bool?
+    let includeElements: Bool?
+    let elementOptions: ElementOptions?
+    let elementAction: ElementActionRequest?
 }
 struct Permissions: Codable { let accessibility: Bool; let screenRecording: Bool }
+struct ElementInfo: Codable {
+    let id: String
+    let source: String
+    let role: String
+    let name: String
+    let value: String
+    let description: String
+    let enabled: Bool
+    let focused: Bool
+    let selected: Bool
+    let checked: Bool?
+    let expanded: Bool?
+    let bounds: RectInfo?
+    let actions: [String]
+    let nativeActions: [String]
+}
+struct ElementActionResult: Codable { let ok: Bool; let source: String; let action: String }
 struct Response: Codable {
-    let ok: Bool
-    let error: String?
-    let displayResolution: Resolution?
-    let apiResolution: Resolution?
-    let cursorPosition: Point?
-    let activeWindow: WindowInfo?
-    let windows: [WindowInfo]?
-    let screenshotMimeType: String?
-    let screenshotBase64: String?
-    let permissions: Permissions?
+    var ok: Bool
+    var error: String? = nil
+    var displayResolution: Resolution? = nil
+    var apiResolution: Resolution? = nil
+    var cursorPosition: Point? = nil
+    var activeWindow: WindowInfo? = nil
+    var windows: [WindowInfo]? = nil
+    var screenshotMimeType: String? = nil
+    var screenshotBase64: String? = nil
+    var permissions: Permissions? = nil
+    var elementSource: String? = nil
+    var elementApplication: String? = nil
+    var elements: [ElementInfo]? = nil
+    var elementMessage: String? = nil
+    var elementActionResult: ElementActionResult? = nil
 }
 
-func fail(_ message: String) -> Never {
-    let response = Response(ok: false, error: message, displayResolution: nil, apiResolution: nil, cursorPosition: nil, activeWindow: nil, windows: nil, screenshotMimeType: nil, screenshotBase64: nil, permissions: nil)
-    let data = try! JSONEncoder().encode(response)
+func emit(_ response: Response) -> Never {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.withoutEscapingSlashes]
+    let data = try! encoder.encode(response)
     FileHandle.standardOutput.write(data)
     exit(0)
 }
+
+func fail(_ message: String) -> Never { emit(Response(ok: false, error: message)) }
 
 func screenRecordingAllowed(prompt: Bool = false) -> Bool {
     if #available(macOS 10.15, *) {
@@ -72,9 +110,10 @@ func mainResolution(apiWidth: Int) -> (display: Resolution, api: Resolution) {
 }
 
 func scale(_ point: Point, display: Resolution, api: Resolution) -> CGPoint {
-    let x = Double(point.x) / Double(api.width) * Double(display.width)
-    let y = Double(point.y) / Double(api.height) * Double(display.height)
-    return CGPoint(x: x.rounded(), y: y.rounded())
+    CGPoint(
+        x: (Double(point.x) / Double(api.width) * Double(display.width)).rounded(),
+        y: (Double(point.y) / Double(api.height) * Double(display.height)).rounded()
+    )
 }
 
 func apiPoint(_ point: CGPoint, display: Resolution, api: Resolution) -> Point {
@@ -100,22 +139,16 @@ func mouseEventType(button: CGMouseButton, down: Bool) -> CGEventType {
 }
 
 func postMouseMove(_ p: CGPoint) {
-    if let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left) {
-        event.post(tap: .cghidEventTap)
-    }
+    CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
 }
 
 func postClick(_ p: CGPoint, button: CGMouseButton, count: Int) {
     for i in 1...max(1, count) {
-        if let down = CGEvent(mouseEventSource: nil, mouseType: mouseEventType(button: button, down: true), mouseCursorPosition: p, mouseButton: button),
-           let up = CGEvent(mouseEventSource: nil, mouseType: mouseEventType(button: button, down: false), mouseCursorPosition: p, mouseButton: button) {
-            down.setIntegerValueField(.mouseEventClickState, value: Int64(i))
-            up.setIntegerValueField(.mouseEventClickState, value: Int64(i))
-            down.post(tap: .cghidEventTap)
-            usleep(35_000)
-            up.post(tap: .cghidEventTap)
-            usleep(35_000)
-        }
+        guard let down = CGEvent(mouseEventSource: nil, mouseType: mouseEventType(button: button, down: true), mouseCursorPosition: p, mouseButton: button),
+              let up = CGEvent(mouseEventSource: nil, mouseType: mouseEventType(button: button, down: false), mouseCursorPosition: p, mouseButton: button) else { continue }
+        down.setIntegerValueField(.mouseEventClickState, value: Int64(i))
+        up.setIntegerValueField(.mouseEventClickState, value: Int64(i))
+        down.post(tap: .cghidEventTap); usleep(35_000); up.post(tap: .cghidEventTap); usleep(35_000)
     }
 }
 
@@ -126,9 +159,7 @@ func typeUnicode(_ text: String) {
               let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else { continue }
         down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &chars)
         up.keyboardSetUnicodeString(stringLength: 1, unicodeString: &chars)
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
-        usleep(7_000)
+        down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap); usleep(7_000)
     }
 }
 
@@ -145,10 +176,7 @@ let keyCodes: [String: CGKeyCode] = [
 
 func postKey(_ raw: String) {
     let parts = raw.lowercased().split(separator: "+").map(String.init)
-    guard let keyPart = parts.last, let code = keyCodes[keyPart] else {
-        typeUnicode(raw)
-        return
-    }
+    guard let keyPart = parts.last, let code = keyCodes[keyPart] else { typeUnicode(raw); return }
     var flags: CGEventFlags = []
     for part in parts.dropLast() {
         switch part {
@@ -159,35 +187,27 @@ func postKey(_ raw: String) {
         default: break
         }
     }
-    if let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
-       let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) {
-        down.flags = flags
-        up.flags = flags
-        down.post(tap: .cghidEventTap)
-        usleep(20_000)
-        up.post(tap: .cghidEventTap)
-    }
+    guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
+          let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) else { return }
+    down.flags = flags; up.flags = flags
+    down.post(tap: .cghidEventTap); usleep(20_000); up.post(tap: .cghidEventTap)
 }
 
 func screenshotBase64() -> String? {
     guard let image = CGWindowListCreateImage(.infinite, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution]) else { return nil }
     let rep = NSBitmapImageRep(cgImage: image)
-    guard let data = rep.representation(using: .png, properties: [:]) else { return nil }
-    return data.base64EncodedString()
+    return rep.representation(using: .png, properties: [:])?.base64EncodedString()
 }
 
 func visibleWindows() -> [WindowInfo] {
     guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return [] }
-    var result: [WindowInfo] = []
-    for item in list.prefix(40) {
+    return list.prefix(40).compactMap { item in
         let owner = item[kCGWindowOwnerName as String] as? String ?? ""
         let title = item[kCGWindowName as String] as? String ?? ""
         let number = item[kCGWindowNumber as String] as? NSNumber
         let name = title.isEmpty ? owner : "\(owner) — \(title)"
-        if name.isEmpty { continue }
-        result.append(WindowInfo(id: number?.stringValue ?? "", name: name))
+        return name.isEmpty ? nil : WindowInfo(id: number?.stringValue ?? "", name: name)
     }
-    return result
 }
 
 func activeWindow() -> WindowInfo? {
@@ -204,37 +224,199 @@ func perform(_ action: Action, display: Resolution, api: Resolution) {
     case "click":
         let current = CGEvent(source: nil)?.location ?? .zero
         let target = (action.x != nil && action.y != nil) ? scale(Point(x: action.x!, y: action.y!), display: display, api: api) : current
-        postMouseMove(target)
-        postClick(target, button: mouseButton(action.button), count: action.count ?? 1)
+        postMouseMove(target); postClick(target, button: mouseButton(action.button), count: action.count ?? 1)
     case "drag":
         let points: [Point]
         if let path = action.path, path.count >= 2 { points = path }
-        else if let x = action.x, let y = action.y, let x2 = action.x2, let y2 = action.y2 { points = [Point(x:x,y:y), Point(x:x2,y:y2)] }
+        else if let x = action.x, let y = action.y, let x2 = action.x2, let y2 = action.y2 { points = [Point(x: x, y: y), Point(x: x2, y: y2)] }
         else { fail("drag requires path or x/y/x2/y2") }
         let button = mouseButton(action.button)
         let scaled = points.map { scale($0, display: display, api: api) }
         postMouseMove(scaled[0])
-        if let down = CGEvent(mouseEventSource: nil, mouseType: mouseEventType(button: button, down: true), mouseCursorPosition: scaled[0], mouseButton: button) { down.post(tap: .cghidEventTap) }
+        CGEvent(mouseEventSource: nil, mouseType: mouseEventType(button: button, down: true), mouseCursorPosition: scaled[0], mouseButton: button)?.post(tap: .cghidEventTap)
         for p in scaled.dropFirst() {
-            if let drag = CGEvent(mouseEventSource: nil, mouseType: button == .right ? .rightMouseDragged : (button == .center ? .otherMouseDragged : .leftMouseDragged), mouseCursorPosition: p, mouseButton: button) { drag.post(tap: .cghidEventTap) }
+            let kind: CGEventType = button == .right ? .rightMouseDragged : (button == .center ? .otherMouseDragged : .leftMouseDragged)
+            CGEvent(mouseEventSource: nil, mouseType: kind, mouseCursorPosition: p, mouseButton: button)?.post(tap: .cghidEventTap)
             usleep(12_000)
         }
-        if let up = CGEvent(mouseEventSource: nil, mouseType: mouseEventType(button: button, down: false), mouseCursorPosition: scaled.last!, mouseButton: button) { up.post(tap: .cghidEventTap) }
-    case "type":
-        typeUnicode(action.text ?? "")
-    case "key":
-        postKey(action.key ?? "")
+        CGEvent(mouseEventSource: nil, mouseType: mouseEventType(button: button, down: false), mouseCursorPosition: scaled.last!, mouseButton: button)?.post(tap: .cghidEventTap)
+    case "type": typeUnicode(action.text ?? "")
+    case "key": postKey(action.key ?? "")
     case "scroll":
         let amount = Int32(max(1, action.amount ?? 3))
         let direction = action.direction ?? "down"
         let dy: Int32 = direction == "up" ? amount : (direction == "down" ? -amount : 0)
         let dx: Int32 = direction == "left" ? amount : (direction == "right" ? -amount : 0)
-        if let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) { event.post(tap: .cghidEventTap) }
-    case "wait":
-        usleep(useconds_t(max(0, action.durationMs ?? 1000) * 1000))
-    default:
-        fail("unsupported action \(action.action)")
+        CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0)?.post(tap: .cghidEventTap)
+    case "wait": usleep(useconds_t(max(0, action.durationMs ?? 1000) * 1000))
+    default: fail("unsupported action \(action.action)")
     }
+}
+
+// MARK: - AX semantic control
+
+func axAttribute(_ element: AXUIElement, _ attribute: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    return AXUIElementCopyAttributeValue(element, attribute, &value) == .success ? value : nil
+}
+
+func axString(_ element: AXUIElement, _ attribute: CFString) -> String {
+    guard let value = axAttribute(element, attribute) else { return "" }
+    if let text = value as? String { return text }
+    if let number = value as? NSNumber { return number.stringValue }
+    return String(describing: value)
+}
+
+func axBool(_ element: AXUIElement, _ attribute: CFString, default fallback: Bool = false) -> Bool {
+    guard let value = axAttribute(element, attribute) else { return fallback }
+    if let boolean = value as? Bool { return boolean }
+    if let number = value as? NSNumber { return number.boolValue }
+    return fallback
+}
+
+func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+    (axAttribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement]) ?? []
+}
+
+func axActions(_ element: AXUIElement) -> [String] {
+    var names: CFArray?
+    guard AXUIElementCopyActionNames(element, &names) == .success else { return [] }
+    return (names as? [String]) ?? []
+}
+
+func axSettable(_ element: AXUIElement, _ attribute: CFString) -> Bool {
+    var settable: DarwinBoolean = false
+    return AXUIElementIsAttributeSettable(element, attribute, &settable) == .success && settable.boolValue
+}
+
+func axRect(_ element: AXUIElement) -> RectInfo? {
+    guard let positionValue = axAttribute(element, kAXPositionAttribute as CFString),
+          let sizeValue = axAttribute(element, kAXSizeAttribute as CFString),
+          CFGetTypeID(positionValue) == AXValueGetTypeID(), CFGetTypeID(sizeValue) == AXValueGetTypeID() else { return nil }
+    var position = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
+          AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else { return nil }
+    return RectInfo(x: Int(position.x.rounded()), y: Int(position.y.rounded()), width: max(0, Int(size.width.rounded())), height: max(0, Int(size.height.rounded())))
+}
+
+func axEncodeElementId(pid: pid_t, path: [Int]) -> String {
+    let payload: [String: Any] = ["source": "macos-ax", "pid": Int(pid), "path": path]
+    let data = try! JSONSerialization.data(withJSONObject: payload)
+    return data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+}
+
+func axDecodeElementId(_ value: String) -> (pid: pid_t, path: [Int])? {
+    var base64 = value.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+    while base64.count % 4 != 0 { base64 += "=" }
+    guard let data = Data(base64Encoded: base64),
+          let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          payload["source"] as? String == "macos-ax",
+          let pid = payload["pid"] as? Int,
+          let path = payload["path"] as? [Int] else { return nil }
+    return (pid_t(pid), path)
+}
+
+func axResolve(pid: pid_t, path: [Int]) -> AXUIElement? {
+    var element = AXUIElementCreateApplication(pid)
+    for index in path {
+        let children = axChildren(element)
+        guard index >= 0 && index < children.count else { return nil }
+        element = children[index]
+    }
+    return element
+}
+
+let axInteractiveRoles: Set<String> = [
+    "AXButton", "AXCheckBox", "AXComboBox", "AXDisclosureTriangle", "AXLink", "AXMenuItem",
+    "AXPopUpButton", "AXRadioButton", "AXSearchField", "AXSlider", "AXTab", "AXTextArea",
+    "AXTextField", "AXToolbarButton"
+]
+let axStaticRoles: Set<String> = ["AXHeading", "AXImage", "AXStaticText"]
+
+func semanticActions(_ element: AXUIElement, role: String, native: [String]) -> [String] {
+    var result: [String] = []
+    if native.contains(kAXPressAction as String) || axInteractiveRoles.contains(role) { result.append("press") }
+    if axSettable(element, kAXFocusedAttribute as CFString) { result.append("focus") }
+    if axSettable(element, kAXValueAttribute as CFString) { result.append("set_value") }
+    if native.contains(kAXIncrementAction as String) { result.append("increment") }
+    if native.contains(kAXDecrementAction as String) { result.append("decrement") }
+    if role == "AXCheckBox" || role == "AXRadioButton" { result.append("toggle") }
+    result.append("scroll_into_view")
+    return Array(NSOrderedSet(array: result)) as? [String] ?? result
+}
+
+func axElementInfo(_ element: AXUIElement, pid: pid_t, path: [Int]) -> ElementInfo {
+    let role = axString(element, kAXRoleAttribute as CFString)
+    let native = axActions(element)
+    let rawValue = axString(element, kAXValueAttribute as CFString)
+    let checked: Bool? = (role == "AXCheckBox" || role == "AXRadioButton") ? axBool(element, kAXValueAttribute as CFString) : nil
+    let expanded: Bool? = axAttribute(element, kAXExpandedAttribute as CFString) == nil ? nil : axBool(element, kAXExpandedAttribute as CFString)
+    return ElementInfo(
+        id: axEncodeElementId(pid: pid, path: path), source: "macos-ax", role: role,
+        name: axString(element, kAXTitleAttribute as CFString).isEmpty ? axString(element, kAXDescriptionAttribute as CFString) : axString(element, kAXTitleAttribute as CFString),
+        value: String(rawValue.prefix(4000)), description: String(axString(element, kAXHelpAttribute as CFString).prefix(1000)),
+        enabled: axBool(element, kAXEnabledAttribute as CFString, default: true),
+        focused: axBool(element, kAXFocusedAttribute as CFString), selected: axBool(element, kAXSelectedAttribute as CFString),
+        checked: checked, expanded: expanded, bounds: axRect(element), actions: semanticActions(element, role: role, native: native), nativeActions: native
+    )
+}
+
+func listAXElements(options: ElementOptions?) -> (application: String, elements: [ElementInfo]) {
+    let requestedApplication = (options?.application ?? "").lowercased()
+    let app: NSRunningApplication?
+    if requestedApplication.isEmpty {
+        app = NSWorkspace.shared.frontmostApplication
+    } else {
+        app = NSWorkspace.shared.runningApplications.first { candidate in
+            let searchable = "\(candidate.localizedName ?? "") \(candidate.bundleIdentifier ?? "")".lowercased()
+            return searchable.contains(requestedApplication)
+        }
+    }
+    guard let app else { return ("", []) }
+    let pid = app.processIdentifier
+    let root = AXUIElementCreateApplication(pid)
+    let maximum = max(1, min(options?.maxElements ?? 120, 500))
+    let includeStatic = options?.includeStaticText ?? false
+    let roleFilter = (options?.role ?? "").lowercased()
+    let query = (options?.query ?? options?.name ?? "").lowercased()
+    var result: [ElementInfo] = []
+
+    func walk(_ element: AXUIElement, path: [Int], depth: Int) {
+        if depth > 20 || result.count >= maximum { return }
+        let role = axString(element, kAXRoleAttribute as CFString)
+        let interesting = axInteractiveRoles.contains(role) || axBool(element, kAXFocusedAttribute as CFString) || (includeStatic && axStaticRoles.contains(role))
+        if depth > 0 && interesting {
+            let info = axElementInfo(element, pid: pid, path: path)
+            let searchable = "\(info.name) \(info.description) \(info.value)".lowercased()
+            if (roleFilter.isEmpty || info.role.lowercased() == roleFilter) && (query.isEmpty || searchable.contains(query)) { result.append(info) }
+        }
+        for (index, child) in axChildren(element).prefix(500).enumerated() {
+            if result.count >= maximum { break }
+            walk(child, path: path + [index], depth: depth + 1)
+        }
+    }
+    walk(root, path: [], depth: 0)
+    return (app.localizedName ?? app.bundleIdentifier ?? "", result)
+}
+
+func performAXElementAction(_ request: ElementActionRequest) -> ElementActionResult {
+    guard let decoded = axDecodeElementId(request.elementId), let element = axResolve(pid: decoded.pid, path: decoded.path) else { fail("The macOS accessibility snapshot is stale; refresh computer_elements.") }
+    let action = request.action
+    var error: AXError = .success
+    switch action {
+    case "press", "toggle": error = AXUIElementPerformAction(element, kAXPressAction as CFString)
+    case "focus": error = AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    case "set_value": error = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, (request.value ?? "") as CFTypeRef)
+    case "increment": error = AXUIElementPerformAction(element, kAXIncrementAction as CFString)
+    case "decrement": error = AXUIElementPerformAction(element, kAXDecrementAction as CFString)
+    case "scroll_into_view":
+        error = AXUIElementPerformAction(element, "AXScrollToVisible" as CFString)
+        if error != .success { error = AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) }
+    default: fail("Unsupported macOS element action: \(action)")
+    }
+    if error != .success { fail("macOS accessibility action \(action) failed with AXError \(error.rawValue)") }
+    return ElementActionResult(ok: true, source: "macos-ax", action: action)
 }
 
 let input = FileHandle.standardInput.readDataToEndOfFile()
@@ -244,20 +426,28 @@ let resolutions = mainResolution(apiWidth: apiWidth)
 let shouldPrompt = request.doctor ?? false
 let permissions = Permissions(accessibility: accessibilityAllowed(prompt: shouldPrompt), screenRecording: screenRecordingAllowed(prompt: shouldPrompt))
 
-if !(request.actions ?? []).isEmpty && !permissions.accessibility {
-    fail("Accessibility permission is required. Enable this app/helper in System Settings > Privacy & Security > Accessibility.")
+if (!(request.actions ?? []).isEmpty || request.includeElements == true || request.elementAction != nil) && !permissions.accessibility {
+    fail("Accessibility permission is required. Enable this helper in System Settings > Privacy & Security > Accessibility.")
 }
-for action in request.actions ?? [] {
-    perform(action, display: resolutions.display, api: resolutions.api)
+var elementActionResult: ElementActionResult? = nil
+if let elementAction = request.elementAction { elementActionResult = performAXElementAction(elementAction) }
+for action in request.actions ?? [] { perform(action, display: resolutions.display, api: resolutions.api) }
+if !(request.actions ?? []).isEmpty || request.elementAction != nil { usleep(180_000) }
+
+var elementApplication: String? = nil
+var elements: [ElementInfo]? = nil
+if request.includeElements == true {
+    let listed = listAXElements(options: request.elementOptions)
+    elementApplication = listed.application
+    elements = listed.elements
 }
-if !(request.actions ?? []).isEmpty { usleep(180_000) }
+
 let cursor = apiPoint(CGEvent(source: nil)?.location ?? .zero, display: resolutions.display, api: resolutions.api)
 let capture = request.includeScreenshot ?? true
 let screenshot = capture ? screenshotBase64() : nil
 if capture && screenshot == nil { fail("Screen Recording permission is required to capture the desktop.") }
-let response = Response(
+emit(Response(
     ok: true,
-    error: nil,
     displayResolution: resolutions.display,
     apiResolution: resolutions.api,
     cursorPosition: cursor,
@@ -265,7 +455,10 @@ let response = Response(
     windows: (request.includeWindows ?? false) ? visibleWindows() : [],
     screenshotMimeType: screenshot == nil ? nil : "image/png",
     screenshotBase64: screenshot,
-    permissions: permissions
-)
-let data = try! JSONEncoder().encode(response)
-FileHandle.standardOutput.write(data)
+    permissions: permissions,
+    elementSource: request.includeElements == true ? "macos-ax" : nil,
+    elementApplication: elementApplication,
+    elements: elements,
+    elementMessage: elements == nil ? nil : "Returned \(elements!.count) macOS accessibility elements.",
+    elementActionResult: elementActionResult
+))

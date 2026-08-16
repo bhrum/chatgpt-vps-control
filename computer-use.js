@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import {
   nativeComputerBackendName,
@@ -7,6 +8,7 @@ import {
   nativeComputerState,
   nativeComputerUse,
 } from "./lib/native-computer-backend.js";
+import { listSemanticElements, semanticElementAction } from "./lib/semantic-computer.js";
 
 const API_WIDTH = 1280;
 const DEFAULT_SETTLE_MS = clampNumber(Number(process.env.COMPUTER_SCREENSHOT_SETTLE_MS ?? 2000), 0, 5000, 2000);
@@ -19,6 +21,10 @@ const MAX_TEXT_CHARS = 20_000;
 const MAX_WINDOWS = 30;
 const MAX_STDERR_BYTES = 256 * 1024;
 const MAX_SCREENSHOT_BYTES = 12 * 1024 * 1024;
+const ELEMENT_SNAPSHOT_TTL_MS = 90_000;
+const MAX_ELEMENT_SNAPSHOTS = 24;
+const ELEMENT_ACTIONS = ["press", "focus", "set_value", "toggle", "increment", "decrement", "scroll_into_view"];
+const ELEMENT_SNAPSHOTS = new Map();
 
 const BUTTONS = {
   left: "1",
@@ -88,6 +94,47 @@ const environmentShape = {
   message: z.string(),
 };
 
+const elementBoundsShape = z.object({ x: z.number().int(), y: z.number().int(), width: z.number().int(), height: z.number().int() });
+const elementShape = z.object({
+  index: z.number().int(),
+  source: z.string(),
+  role: z.string(),
+  name: z.string(),
+  value: z.string(),
+  description: z.string(),
+  enabled: z.boolean(),
+  focused: z.boolean(),
+  selected: z.boolean(),
+  checked: z.boolean().nullable(),
+  expanded: z.boolean().nullable(),
+  bounds: elementBoundsShape.nullable(),
+  actions: z.array(z.string()),
+});
+const elementsResultShape = {
+  snapshotId: z.string(),
+  expiresInMs: z.number().int(),
+  source: z.string(),
+  providers: z.array(z.string()),
+  target: z.object({ id: z.string(), title: z.string(), url: z.string(), endpoint: z.string() }).nullable(),
+  targets: z.array(z.object({ id: z.string(), title: z.string(), url: z.string(), endpoint: z.string() })),
+  application: z.string().nullable(),
+  applications: z.array(z.object({ index: z.number().int(), name: z.string() })),
+  elements: z.array(elementShape),
+  warnings: z.array(z.string()),
+  message: z.string(),
+};
+const elementActionResultShape = {
+  snapshotId: z.string(),
+  elementIndex: z.number().int(),
+  source: z.string(),
+  action: z.string(),
+  durationMs: z.number().int(),
+  activeWindow: z.object({ id: z.string(), name: z.string() }).nullable(),
+  screenshotIncluded: z.boolean(),
+  screenshotMimeType: z.string().nullable(),
+  message: z.string(),
+};
+
 const useResultShape = {
   display: z.string(),
   displayResolution: z.object({ width: z.number().int(), height: z.number().int() }),
@@ -132,6 +179,47 @@ const environmentJsonSchema = {
     message: { type: "string" },
   },
   required: ["platform", "backend", "ready", "display", "displayResolution", "apiResolution", "permissions", "details", "message"],
+  additionalProperties: false,
+};
+
+const elementBoundsJsonSchema = {
+  type: "object",
+  properties: { x: { type: "integer" }, y: { type: "integer" }, width: { type: "integer" }, height: { type: "integer" } },
+  required: ["x", "y", "width", "height"],
+  additionalProperties: false,
+};
+const elementJsonSchema = {
+  type: "object",
+  properties: {
+    index: { type: "integer" }, source: { type: "string" }, role: { type: "string" }, name: { type: "string" },
+    value: { type: "string" }, description: { type: "string" }, enabled: { type: "boolean" }, focused: { type: "boolean" },
+    selected: { type: "boolean" }, checked: { type: ["boolean", "null"] }, expanded: { type: ["boolean", "null"] },
+    bounds: { anyOf: [elementBoundsJsonSchema, { type: "null" }] }, actions: { type: "array", items: { type: "string" } },
+  },
+  required: ["index", "source", "role", "name", "value", "description", "enabled", "focused", "selected", "checked", "expanded", "bounds", "actions"],
+  additionalProperties: false,
+};
+const elementsResultJsonSchema = {
+  type: "object",
+  properties: {
+    snapshotId: { type: "string" }, expiresInMs: { type: "integer" }, source: { type: "string" },
+    providers: { type: "array", items: { type: "string" } },
+    target: { anyOf: [{ type: "object", properties: { id: { type: "string" }, title: { type: "string" }, url: { type: "string" }, endpoint: { type: "string" } }, required: ["id", "title", "url", "endpoint"], additionalProperties: false }, { type: "null" }] },
+    targets: { type: "array", items: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, url: { type: "string" }, endpoint: { type: "string" } }, required: ["id", "title", "url", "endpoint"], additionalProperties: false } },
+    application: { type: ["string", "null"] },
+    applications: { type: "array", items: { type: "object", properties: { index: { type: "integer" }, name: { type: "string" } }, required: ["index", "name"], additionalProperties: false } },
+    elements: { type: "array", items: elementJsonSchema }, warnings: { type: "array", items: { type: "string" } }, message: { type: "string" },
+  },
+  required: ["snapshotId", "expiresInMs", "source", "providers", "target", "targets", "application", "applications", "elements", "warnings", "message"],
+  additionalProperties: false,
+};
+const elementActionResultJsonSchema = {
+  type: "object",
+  properties: {
+    snapshotId: { type: "string" }, elementIndex: { type: "integer" }, source: { type: "string" }, action: { type: "string" }, durationMs: { type: "integer" },
+    activeWindow: windowOrNullJsonSchema(), screenshotIncluded: { type: "boolean" }, screenshotMimeType: { type: ["string", "null"] }, message: { type: "string" },
+  },
+  required: ["snapshotId", "elementIndex", "source", "action", "durationMs", "activeWindow", "screenshotIncluded", "screenshotMimeType", "message"],
   additionalProperties: false,
 };
 
@@ -691,6 +779,64 @@ function summarizeAction(action) {
   }
 }
 
+function cleanupElementSnapshots() {
+  const now = Date.now();
+  for (const [id, snapshot] of ELEMENT_SNAPSHOTS.entries()) {
+    if (snapshot.expiresAt <= now) ELEMENT_SNAPSHOTS.delete(id);
+  }
+  while (ELEMENT_SNAPSHOTS.size >= MAX_ELEMENT_SNAPSHOTS) {
+    const oldest = ELEMENT_SNAPSHOTS.keys().next().value;
+    if (!oldest) break;
+    ELEMENT_SNAPSHOTS.delete(oldest);
+  }
+}
+
+function storeElementSnapshot(result, options) {
+  cleanupElementSnapshots();
+  const snapshotId = randomBytes(18).toString("base64url");
+  const createdAt = Date.now();
+  const privateElements = (result.elements ?? []).map((element) => ({ ...element }));
+  ELEMENT_SNAPSHOTS.set(snapshotId, { createdAt, expiresAt: createdAt + ELEMENT_SNAPSHOT_TTL_MS, elements: privateElements, options });
+  const elements = privateElements.map((element, index) => ({
+    index,
+    source: String(element.source ?? result.source ?? "unknown"),
+    role: String(element.role ?? ""),
+    name: String(element.name ?? ""),
+    value: String(element.value ?? ""),
+    description: String(element.description ?? ""),
+    enabled: element.enabled !== false,
+    focused: Boolean(element.focused),
+    selected: Boolean(element.selected),
+    checked: typeof element.checked === "boolean" ? element.checked : null,
+    expanded: typeof element.expanded === "boolean" ? element.expanded : null,
+    bounds: element.bounds && [element.bounds.x, element.bounds.y, element.bounds.width, element.bounds.height].every(Number.isFinite)
+      ? { x: Math.trunc(element.bounds.x), y: Math.trunc(element.bounds.y), width: Math.max(0, Math.trunc(element.bounds.width)), height: Math.max(0, Math.trunc(element.bounds.height)) }
+      : null,
+    actions: Array.isArray(element.actions) ? element.actions.map(String) : [],
+  }));
+  return { snapshotId, expiresInMs: ELEMENT_SNAPSHOT_TTL_MS, elements };
+}
+
+function getSnapshotElement(snapshotId, elementIndex) {
+  cleanupElementSnapshots();
+  const snapshot = ELEMENT_SNAPSHOTS.get(snapshotId);
+  if (!snapshot) throw new Error("Element snapshot is missing or expired. Call computer_elements again.");
+  const element = snapshot.elements[elementIndex];
+  if (!element) throw new Error(`Element index ${elementIndex} does not exist in snapshot ${snapshotId}.`);
+  return { snapshot, element };
+}
+
+async function captureComputerAfterSemanticAction(display) {
+  if (nativeComputerBackendSupported()) {
+    const state = await nativeComputerState({ includeScreenshot: true, includeWindows: false });
+    return { display: nativeComputerBackendName(), resolution: state.resolution, screenshot: state.screenshot, active: state.active };
+  }
+  const resolvedDisplay = await resolveDisplay(display);
+  const resolution = await detectResolution(resolvedDisplay);
+  const [screenshot, active] = await Promise.all([captureScreenshot(resolvedDisplay, resolution), activeWindow(resolvedDisplay)]);
+  return { display: resolvedDisplay, resolution, screenshot, active };
+}
+
 async function collectState(display, resolution, includeScreenshot = true, includeWindows = true) {
   const [cursor, active, windows, screenshot] = await Promise.all([
     cursorPosition(display, resolution),
@@ -718,6 +864,52 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       securitySchemes: readSecuritySchemes,
       _meta: toolMeta("Checking computer environment", "Computer environment ready", readSecuritySchemes),
+    },
+    {
+      name: "computer_elements",
+      title: "Computer elements",
+      description: "Read the current semantic accessibility tree and return a short-lived indexed snapshot. Prefer this over screen coordinates when a named button, link, field, menu item, checkbox, tab, or other control is available.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          source: { type: "string", enum: ["auto", "desktop", "browser"], default: "auto" },
+          targetId: { type: "string", description: "Optional Chrome/Electron CDP target id returned by a prior call." },
+          title: { type: "string", description: "Optional browser page title substring." },
+          url: { type: "string", description: "Optional browser page URL substring." },
+          application: { type: "string", description: "Optional native application name substring." },
+          query: { type: "string", description: "Filter element name, description, or value." },
+          role: { type: "string", description: "Filter by accessibility role." },
+          maxElements: { type: "integer", minimum: 1, maximum: 500, default: 120 },
+          includeStaticText: { type: "boolean", default: false },
+        },
+        additionalProperties: false,
+      },
+      outputSchema: elementsResultJsonSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: false },
+      securitySchemes: readSecuritySchemes,
+      _meta: toolMeta("Reading computer elements", "Computer elements ready", readSecuritySchemes),
+    },
+    {
+      name: "computer_element_action",
+      title: "Computer element action",
+      description: "Operate one element from a recent computer_elements snapshot by index, then return a fresh screenshot. Element snapshots are short-lived; refresh after every UI-changing action.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          snapshotId: { type: "string", minLength: 8 },
+          elementIndex: { type: "integer", minimum: 0 },
+          action: { type: "string", enum: ELEMENT_ACTIONS },
+          value: { type: "string", maxLength: MAX_TEXT_CHARS, description: "Required only for set_value." },
+          display: { type: "string", maxLength: 64, description: "Optional Linux X11 display used for the post-action screenshot." },
+          description: { type: "string", maxLength: 500, description: "Concise purpose for the action; value text is not stored in audit history." },
+        },
+        required: ["snapshotId", "elementIndex", "action"],
+        additionalProperties: false,
+      },
+      outputSchema: elementActionResultJsonSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Operating computer element", "Computer element action finished", writeSecuritySchemes),
     },
     {
       name: "computer_state",
@@ -840,6 +1032,129 @@ export function registerComputerUseTools(server, options) {
           message: `Computer environment is not ready: ${message}`,
         };
         return { isError: true, structuredContent, content: [{ type: "text", text: structuredContent.message }] };
+      }
+    }
+  );
+
+  server.registerTool(
+    "computer_elements",
+    {
+      title: "Computer elements",
+      description: "Read a semantic accessibility tree and return a short-lived indexed snapshot for reliable element-based interaction.",
+      inputSchema: {
+        source: z.enum(["auto", "desktop", "browser"]).default("auto").optional(),
+        targetId: z.string().max(200).optional(),
+        title: z.string().max(500).optional(),
+        url: z.string().max(2000).optional(),
+        application: z.string().max(500).optional(),
+        query: z.string().max(1000).optional(),
+        role: z.string().max(200).optional(),
+        maxElements: z.number().int().min(1).max(500).default(120).optional(),
+        includeStaticText: z.boolean().default(false).optional(),
+      },
+      outputSchema: elementsResultShape,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: false },
+      securitySchemes: readSecuritySchemes,
+      _meta: toolMeta("Reading computer elements", "Computer elements ready", readSecuritySchemes),
+    },
+    async (args) => {
+      if (!hasReadScope()) return toolAuthError(readAuthChallenge);
+      try {
+        const options = { ...args };
+        const result = await listSemanticElements(options);
+        const snapshot = storeElementSnapshot(result, options);
+        const structuredContent = {
+          snapshotId: snapshot.snapshotId,
+          expiresInMs: snapshot.expiresInMs,
+          source: String(result.source ?? "unknown"),
+          providers: Array.isArray(result.providers) ? result.providers.map(String) : [String(result.source ?? "unknown")],
+          target: result.target ? {
+            id: String(result.target.id ?? ""), title: String(result.target.title ?? ""),
+            url: String(result.target.url ?? ""), endpoint: String(result.target.endpoint ?? ""),
+          } : null,
+          targets: (result.targets ?? []).map((target) => ({
+            id: String(target.id ?? ""), title: String(target.title ?? ""),
+            url: String(target.url ?? ""), endpoint: String(target.endpoint ?? ""),
+          })),
+          application: result.application == null ? null : String(result.application),
+          applications: (result.applications ?? []).map((application, index) => ({
+            index: Number.isInteger(application.index) ? application.index : index,
+            name: String(application.name ?? ""),
+          })),
+          elements: snapshot.elements,
+          warnings: (result.warnings ?? []).map(String),
+          message: `${result.message} Snapshot ${snapshot.snapshotId} expires in ${Math.round(snapshot.expiresInMs / 1000)} seconds.`,
+        };
+        return { structuredContent, content: [{ type: "text", text: structuredContent.message }] };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { isError: true, content: [{ type: "text", text: `Computer elements failed: ${message}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
+    "computer_element_action",
+    {
+      title: "Computer element action",
+      description: "Operate one element from a recent computer_elements snapshot by index and return the resulting screenshot.",
+      inputSchema: {
+        snapshotId: z.string().min(8),
+        elementIndex: z.number().int().min(0),
+        action: z.enum(ELEMENT_ACTIONS),
+        value: z.string().max(MAX_TEXT_CHARS).optional(),
+        display: z.string().min(1).max(64).optional(),
+        description: z.string().max(500).optional(),
+      },
+      outputSchema: elementActionResultShape,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Operating computer element", "Computer element action finished", writeSecuritySchemes),
+    },
+    async ({ snapshotId, elementIndex, action, value, display }) => {
+      if (!hasWriteScope()) return toolAuthError(writeAuthChallenge);
+      const started = Date.now();
+      let source = "unknown";
+      const auditValue = action === "set_value" ? `(${String(value ?? "").length} chars)` : "";
+      try {
+        const { element } = getSnapshotElement(snapshotId, elementIndex);
+        source = String(element.source ?? "unknown");
+        if (Array.isArray(element.actions) && !element.actions.includes(action)) {
+          throw new Error(`Element ${elementIndex} does not advertise action ${action}. Available: ${element.actions.join(", ") || "none"}.`);
+        }
+        if (action === "set_value" && value === undefined) throw new Error("set_value requires value.");
+        await semanticElementAction({ elementId: element.id, action, value: value ?? "" });
+        ELEMENT_SNAPSHOTS.delete(snapshotId);
+        if (DEFAULT_SETTLE_MS > 0) await sleep(DEFAULT_SETTLE_MS);
+        const state = await captureComputerAfterSemanticAction(display);
+        if (!state.screenshot) throw new Error("Post-action screenshot was not available.");
+        const durationMs = Date.now() - started;
+        const structuredContent = {
+          snapshotId, elementIndex, source, action, durationMs, activeWindow: state.active ?? null,
+          screenshotIncluded: true, screenshotMimeType: state.screenshot.mimeType,
+          message: `Executed ${action} on ${source} element ${elementIndex}; refresh computer_elements before the next UI-dependent action.`,
+        };
+        await audit?.({
+          command: `computer_element_action ${source}[${elementIndex}].${action}${auditValue}`,
+          cwd: state.display, status: "completed", exitCode: 0, signal: null, durationMs,
+          stdout: structuredContent.message, stderr: "", truncated: false,
+        });
+        return {
+          structuredContent,
+          content: [
+            { type: "text", text: structuredContent.message },
+            { type: "image", data: state.screenshot.data, mimeType: state.screenshot.mimeType },
+          ],
+        };
+      } catch (error) {
+        const durationMs = Date.now() - started;
+        const message = error instanceof Error ? error.message : String(error);
+        await audit?.({
+          command: `computer_element_action ${source}[${elementIndex}].${action}${auditValue}`,
+          cwd: display ?? "computer", status: "failed", exitCode: 1, signal: null, durationMs,
+          stdout: "", stderr: message, truncated: false,
+        }).catch(() => {});
+        return { isError: true, content: [{ type: "text", text: `Computer element action failed: ${message}` }] };
       }
     }
   );

@@ -14,7 +14,7 @@ await client.connect(transport);
 try {
   const tools = await client.listTools();
   const names = new Set(tools.tools.map((tool) => tool.name));
-  for (const name of ["computer_environment", "computer_state", "computer_use", "run_shell_command", "file_info"]) {
+  for (const name of ["computer_environment", "computer_elements", "computer_element_action", "computer_state", "computer_use", "run_shell_command", "file_info"]) {
     assert.ok(names.has(name), `missing MCP tool: ${name}`);
   }
 

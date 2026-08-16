@@ -20,10 +20,14 @@ All backends expose the same normalized 1280-wide API coordinate system so the M
 ## Computer tools
 
 - `computer_environment` — reports the selected platform backend, display readiness, resolution, and native permission state.
+- `computer_elements` — returns a short-lived indexed accessibility snapshot from Linux AT-SPI, macOS AXUIElement, Windows UI Automation, or Chrome/Electron CDP.
+- `computer_element_action` — performs `press`, `focus`, `set_value`, `toggle`, `increment`, `decrement`, or `scroll_into_view` against an element index and returns a fresh screenshot.
 - `computer_state` — returns display/API resolution, cursor position, active/visible windows, and optionally an inline screenshot.
-- `computer_use` — executes `screenshot`, `click`, `move`, `drag`, `type`, `key`, `scroll`, and `wait`, with up to 9 known follow-up actions in one call and one final screenshot.
+- `computer_use` — executes coordinate-level `screenshot`, `click`, `move`, `drag`, `type`, `key`, `scroll`, and `wait`, with up to 9 known follow-up actions in one call and one final screenshot.
 
-`computer_use` keeps the useful behavior recovered from Grok Bot 0.16.0: normalized coordinates, UI settle time before screenshots, batched known actions, and robust Unicode handling on X11. macOS and Windows use native OS input APIs instead of trying to run X11 tools there.
+Use semantic control first: call `computer_elements`, select a named role/control, call `computer_element_action`, then refresh the element snapshot after any UI-changing action. Snapshots expire after 90 seconds and expose only indexes; native handles and CDP node identifiers remain private inside the MCP process. Use `computer_use` as the visual/coordinate fallback when an application does not expose a usable accessibility element.
+
+The coordinate fallback keeps the useful behavior recovered from Grok Bot 0.16.0: normalized coordinates, UI settle time before screenshots, batched known actions, and robust Unicode handling on X11. macOS and Windows use native OS input APIs instead of trying to run X11 tools there.
 
 ## Other MCP tools
 
@@ -56,6 +60,7 @@ On apt-based Linux, `setup` can automatically install:
 
 ```text
 xdotool ffmpeg x11-utils x11-xserver-utils xvfb x11vnc xfwm4
+dbus-x11 at-spi2-core python3-pyatspi gir1.2-atspi-2.0 libglib2.0-bin
 ```
 
 On macOS, the native helper requires Xcode Command Line Tools. If they are missing, run:
@@ -116,9 +121,12 @@ COMPUTER_X11_SCREEN=1280x800x24
 When the service starts it launches and owns:
 
 ```text
+D-Bus session + AT-SPI accessibility bus
 Xvfb :99 -screen 0 1280x800x24 ...
 xfwm4 --compositor=off
 ```
+
+Applications launched by the service inherit `NO_AT_BRIDGE=0` and `GTK_MODULES=gail:atk-bridge`, allowing accessible GTK/X11 applications to appear in `computer_elements`. Chrome or Electron applications that expose a loopback DevTools endpoint are additionally available through the CDP provider.
 
 The X server is stopped with the MCP process. Optional VNC observation is disabled by default. If explicitly enabled with `COMPUTER_ENABLE_VNC=1`, `x11vnc` binds to localhost only.
 
@@ -132,6 +140,7 @@ The Swift helper uses:
 - Unicode keyboard events for text input.
 - AppKit/CoreGraphics for frontmost-window information and screenshots.
 - Accessibility trust as the authorization boundary for synthetic input.
+- AXUIElement traversal and actions for semantic controls.
 - Screen Recording permission for screen capture/window metadata.
 
 The helper is built into `~/.chatgpt-computer-control/bin/chatgpt-computer-helper` by setup. `doctor` reports whether both required permissions are granted.
@@ -143,6 +152,7 @@ The Windows helper uses native User32/GDI APIs:
 - `SendInput` for keyboard, Unicode text, buttons, and wheel events.
 - `SetCursorPos` for pointer movement/drag paths.
 - foreground/visible-window APIs for window state.
+- Windows UI Automation patterns for semantic controls.
 - GDI `CopyFromScreen` for screenshots.
 
 Normal control requires an unlocked interactive user session. Windows intentionally isolates the lock screen and UAC secure desktop; this project does not attempt to bypass those OS security boundaries. A non-elevated process also cannot reliably inject input into a higher-integrity application.
@@ -178,17 +188,21 @@ npm run check
 npm test
 ```
 
-The cross-platform GitHub Actions workflow validates Node code on Linux/macOS/Windows, compiles and probes the macOS Swift helper, probes the Windows native helper, and runs an end-to-end managed-X11 MCP smoke test on Linux.
+The cross-platform GitHub Actions workflow validates Node code and dependency audit status on Linux/macOS/Windows, typechecks and probes the macOS Swift helper, runs a real WinForms/UI Automation interaction on Windows, and runs an end-to-end managed-X11 semantic MCP test on Linux.
 
 The Linux integration test proves the full chain:
 
 ```text
 setup with no DISPLAY
-→ managed Xvfb/xfwm4 starts
+→ managed D-Bus + AT-SPI + Xvfb/xfwm4 starts
 → MCP tools/list
 → computer_environment
 → computer_state + inline PNG
 → computer_use cursor movement + inline PNG
+→ start Chrome on the managed display
+→ computer_elements(browser) → set_value → press → verify updated semantic tree + PNG
+→ start GTK test app
+→ computer_elements(desktop) → set_value → press → verify updated AT-SPI tree + PNG
 ```
 
 ## Key configuration
@@ -202,4 +216,7 @@ COMPUTER_X11_SCREEN=1280x800x24
 COMPUTER_ENABLE_VNC=0           # optional local-only observer
 COMPUTER_VNC_PORT=5909
 CHATGPT_COMPUTER_NATIVE_HELPER= # macOS/Windows setup writes this
+COMPUTER_CDP_ENDPOINTS=http://127.0.0.1:9222 # optional Chrome/Electron semantic endpoints
+NO_AT_BRIDGE=0                # Linux semantic accessibility
+GTK_MODULES=gail:atk-bridge   # Linux GTK accessibility bridge
 ```
