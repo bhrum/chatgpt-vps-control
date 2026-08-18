@@ -44,7 +44,7 @@ struct Request: Codable {
     let listApplications: Bool?
     let targetApplication: String?
 }
-struct Permissions: Codable { let accessibility: Bool; let screenRecording: Bool }
+struct Permissions: Codable, Sendable { let accessibility: Bool; let screenRecording: Bool }
 struct ApplicationInfo: Codable {
     let id: String
     let displayName: String
@@ -130,6 +130,22 @@ func accessibilityAllowed(prompt: Bool = false) -> Bool {
     if !prompt { return AXIsProcessTrusted() }
     let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
     return AXIsProcessTrustedWithOptions(options)
+}
+
+@MainActor
+func permissionSnapshot(prompt: Bool) -> Permissions {
+    if prompt {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        application.activate(ignoringOtherApps: true)
+    }
+    let accessibility = accessibilityAllowed(prompt: prompt)
+    // Request one protected capability per doctor run. This prevents two
+    // system dialogs from racing while the first permission is still pending.
+    let screenRecording = accessibility
+        ? screenRecordingAllowed(prompt: prompt)
+        : screenRecordingAllowed(prompt: false)
+    return Permissions(accessibility: accessibility, screenRecording: screenRecording)
 }
 
 func mainResolution(apiWidth: Int) -> (display: Resolution, api: Resolution) {
@@ -574,7 +590,7 @@ func runHelper() async {
     let apiWidth = max(320, request.apiWidth ?? 1280)
     let resolutions = mainResolution(apiWidth: apiWidth)
     let shouldPrompt = request.doctor ?? false
-    let permissions = Permissions(accessibility: accessibilityAllowed(prompt: shouldPrompt), screenRecording: screenRecordingAllowed(prompt: shouldPrompt))
+    let permissions = await permissionSnapshot(prompt: shouldPrompt)
 
     if let target = request.targetApplication, !target.isEmpty { activateApplication(target) }
 
