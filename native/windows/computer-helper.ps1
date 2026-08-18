@@ -173,11 +173,16 @@ function Encode-ElementId([long]$hwnd, [int[]]$path, $element) {
   $controlType = ''
   $name = ''
   $nativeHwnd = 0
+  $bounds = $null
   try { $automationId = [string]$element.Current.AutomationId } catch {}
   try { $controlType = [string]$element.Current.ControlType.ProgrammaticName } catch {}
   try { $name = [string]$element.Current.Name } catch {}
   try { $nativeHwnd = [long]$element.Current.NativeWindowHandle } catch {}
-  $json = @{ source='windows-uia'; hwnd=$hwnd; path=@($path); automationId=$automationId; controlType=$controlType; name=$name; nativeHwnd=$nativeHwnd } | ConvertTo-Json -Compress
+  try {
+    $rect = $element.Current.BoundingRectangle
+    if (-not $rect.IsEmpty) { $bounds = @{ x=[int]$rect.X; y=[int]$rect.Y; width=[int]$rect.Width; height=[int]$rect.Height } }
+  } catch {}
+  $json = @{ source='windows-uia'; hwnd=$hwnd; path=@($path); automationId=$automationId; controlType=$controlType; name=$name; nativeHwnd=$nativeHwnd; bounds=$bounds } | ConvertTo-Json -Compress
   return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+','-').Replace('/','_')
 }
 function Decode-ElementId([string]$value) {
@@ -379,12 +384,31 @@ function Get-UIAElements($options) {
 }
 function Invoke-UIAElementAction($request) {
   $payload = Decode-ElementId ([string]$request.elementId)
-  $element = Resolve-UIAElement $payload
   $action = [string]$request.action
+  try { $element = Resolve-UIAElement $payload }
+  catch {
+    $bounds = $payload.bounds
+    $canClick = $null -ne $bounds -and [int]$bounds.width -gt 0 -and [int]$bounds.height -gt 0
+    $isPress = $action -eq 'press' -or $action -eq 'native:Invoke'
+    $isSetValue = $action -eq 'set_value' -or $action -eq 'native:SetValue'
+    if (-not $canClick -or (-not $isPress -and -not $isSetValue)) { throw }
+    $hwnd = [IntPtr][long]$payload.hwnd
+    [NativeComputer]::BringWindowToTop($hwnd) | Out-Null
+    [NativeComputer]::SetForegroundWindow($hwnd) | Out-Null
+    [NativeComputer]::SetCursorPos([int]$bounds.x + [int]([int]$bounds.width/2), [int]$bounds.y + [int]([int]$bounds.height/2)) | Out-Null
+    [NativeComputer]::Mouse([NativeComputer]::MOUSEEVENTF_LEFTDOWN,0); [NativeComputer]::Mouse([NativeComputer]::MOUSEEVENTF_LEFTUP,0)
+    if ($isSetValue) {
+      Start-Sleep -Milliseconds 80
+      Send-KeyChord 'ctrl+a'
+      Start-Sleep -Milliseconds 30
+      [NativeComputer]::UnicodeText([string]$request.value)
+    }
+    return @{ ok=$true; source='windows-uia-bounds-fallback'; action=$action }
+  }
   if ($action.StartsWith('native:')) {
     $nativeAction = $action.Substring(7)
     switch ($nativeAction) {
-      'Invoke' { $pattern=Try-Pattern $element ([System.Windows.Automation.InvokePattern]::Pattern); if ($null -eq $pattern) { throw 'Invoke is no longer available.' }; $pattern.Invoke() }
+      'Invoke' { $pattern=Try-Pattern $element ([System.Windows.Automation.InvokePattern]::Pattern); if ($null -eq $pattern) { $request.action='press'; return Invoke-UIAElementAction $request }; $pattern.Invoke() }
       'Select' { $pattern=Try-Pattern $element ([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($null -eq $pattern) { throw 'Select is no longer available.' }; $pattern.Select() }
       'AddToSelection' { $pattern=Try-Pattern $element ([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($null -eq $pattern) { throw 'AddToSelection is no longer available.' }; $pattern.AddToSelection() }
       'RemoveFromSelection' { $pattern=Try-Pattern $element ([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($null -eq $pattern) { throw 'RemoveFromSelection is no longer available.' }; $pattern.RemoveFromSelection() }
