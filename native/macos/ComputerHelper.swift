@@ -590,7 +590,20 @@ func runHelper() async {
     let apiWidth = max(320, request.apiWidth ?? 1280)
     let resolutions = mainResolution(apiWidth: apiWidth)
     let shouldPrompt = request.doctor ?? false
-    let permissions = await permissionSnapshot(prompt: shouldPrompt)
+    var permissions = await permissionSnapshot(prompt: shouldPrompt)
+    if shouldPrompt && permissions.accessibility && !permissions.screenRecording {
+        // CGRequestScreenCaptureAccess schedules system UI asynchronously.
+        // Keep the named app alive while the user opens System Settings and
+        // toggles the permission, otherwise macOS can discard the pending UI.
+        for _ in 0..<120 {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            let granted = await MainActor.run { screenRecordingAllowed(prompt: false) }
+            if granted {
+                permissions = Permissions(accessibility: true, screenRecording: true)
+                break
+            }
+        }
+    }
 
     if let target = request.targetApplication, !target.isEmpty { activateApplication(target) }
 
