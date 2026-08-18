@@ -23,7 +23,7 @@ async function setup(args) {
   console.log(`Home: ${result.home}`);
   console.log(`MCP URL (local): ${result.mcpUrl}`);
   if (platform() === "darwin") {
-    console.log("macOS requires Accessibility and Screen Recording permission for the installed helper/Node host. Run doctor after granting permissions.");
+    console.log("macOS requires Accessibility and Screen Recording permission for the installed ChatGPT Computer Control app. Run doctor, then grant that named app in System Settings.");
   }
   if (platform() === "win32") {
     console.log("Windows control runs in the signed-in interactive desktop. UAC secure desktop and locked sessions are intentionally outside normal automation.");

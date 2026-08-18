@@ -130,10 +130,23 @@ async function elementAction(snapshot, element, action, value) {
   return result;
 }
 
+async function secondaryAction(snapshot, element, nativeAction) {
+  const result = await client.callTool({
+    name: "computer_element_secondary_action",
+    arguments: { snapshotId: snapshot.snapshotId, elementIndex: element.index, nativeAction, description: "semantic smoke native action" },
+  });
+  assert.equal(result.isError, undefined, result.content?.[0]?.text);
+  assert.ok(result.content.some((item) => item.type === "image"), "secondary action should return a screenshot");
+  return result;
+}
+
 try {
   const tools = await client.listTools();
   const names = new Set(tools.tools.map((tool) => tool.name));
-  for (const name of ["computer_elements", "computer_element_action"]) assert.ok(names.has(name), `missing ${name}`);
+  for (const name of ["computer_applications", "computer_app_state", "computer_elements", "computer_element_action", "computer_element_secondary_action"]) assert.ok(names.has(name), `missing ${name}`);
+  const applications = await client.callTool({ name: "computer_applications", arguments: {} });
+  assert.equal(applications.isError, undefined, applications.content?.[0]?.text);
+  assert.ok(Array.isArray(applications.structuredContent.applications));
 
   const fixture = await createBrowserFixture();
   try {
@@ -146,6 +159,8 @@ try {
     const button = snapshot.elements.find((element) => element.role === "button" && element.name.includes("Run semantic test"));
     assert.ok(field, "browser semantic textbox not found");
     assert.ok(button, "browser semantic button not found");
+    assert.equal(field.identifier, "name");
+    assert.ok(Number.isInteger(field.depth));
     await elementAction(snapshot, field, "set_value", "semantic-browser-ok");
 
     snapshot = await elements({ source: "browser", targetId: fixture.target.id, includeStaticText: true, maxElements: 40 });
@@ -183,12 +198,16 @@ try {
       const button = snapshot.elements.find((element) => element.role === "button" && element.name.includes("Apply semantic value"));
       assert.ok(field, `AT-SPI semantic entry not found: ${JSON.stringify(snapshot.applications)}`);
       assert.ok(button, "AT-SPI semantic button not found");
+      assert.equal(snapshot.applicationId, "atspi:chatgpt-computer-semantic-test");
+      assert.ok(Number.isInteger(button.depth));
       await elementAction(snapshot, field, "set_value", "semantic-atspi-ok");
 
       snapshot = await elements({ source: "desktop", application: "chatgpt-computer-semantic-test", includeStaticText: true, maxElements: 80 });
       const refreshedButton = snapshot.elements.find((element) => element.role === "button" && element.name.includes("Apply semantic value"));
       assert.ok(refreshedButton);
-      await elementAction(snapshot, refreshedButton, "press");
+      const nativeAction = refreshedButton.nativeActions.find((name) => /click|press|activate/i.test(name));
+      assert.ok(nativeAction, `AT-SPI button did not advertise a native action: ${JSON.stringify(refreshedButton.nativeActions)}`);
+      await secondaryAction(snapshot, refreshedButton, nativeAction);
 
       snapshot = await elements({ source: "desktop", application: "chatgpt-computer-semantic-test", includeStaticText: true, maxElements: 80 });
       assert.ok(snapshot.elements.some((element) => `${element.name} ${element.value}`.includes("clicked:semantic-atspi-ok")), "AT-SPI semantic action result not observed");

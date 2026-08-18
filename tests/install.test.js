@@ -7,6 +7,13 @@ import { spawnSync } from "node:child_process";
 
 const cli = resolve("bin/chatgpt-computer-control.js");
 
+test("macOS helper has a stable named app-bundle identity", async () => {
+  const plist = await readFile(resolve("native/macos/Info.plist"), "utf8");
+  assert.match(plist, /<key>CFBundleDisplayName<\/key><string>ChatGPT Computer Control<\/string>/);
+  assert.match(plist, /<key>CFBundleIdentifier<\/key><string>com\.bhrum\.computer-control<\/string>/);
+  assert.match(plist, /<key>CFBundleExecutable<\/key><string>ChatGPTComputerControl<\/string>/);
+});
+
 test("setup creates a private reusable local configuration without installing dependencies", async () => {
   const home = await mkdtemp(join(tmpdir(), "chatgpt-computer-control-test-"));
   try {

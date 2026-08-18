@@ -10,9 +10,12 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { buildComputerToolDescriptors, registerComputerUseTools } from "./computer-use.js";
+import { startDeviceAgent } from "./lib/device-agent.js";
+import { attachDeviceGateway, buildDeviceToolDescriptors, registerDeviceTools } from "./lib/device-gateway.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "127.0.0.1";
+const DEVICE_GATEWAY_ENABLED = process.env.DEVICE_GATEWAY_LISTEN === "1";
 const MCP_PREFIX = process.env.MCP_PATH_PREFIX ?? "/mcp";
 const TOKEN = process.env.VPS_APP_TOKEN ?? "";
 const HISTORY_PATH = process.env.HISTORY_PATH ?? resolve(process.cwd(), "history.jsonl");
@@ -710,6 +713,10 @@ function toolMeta(invoking, invoked, securitySchemes = NO_AUTH_SECURITY_SCHEMES)
   };
 }
 
+const DEVICE_TOOL_DESCRIPTORS = DEVICE_GATEWAY_ENABLED
+  ? buildDeviceToolDescriptors({ readSecuritySchemes: READ_SECURITY_SCHEMES, writeSecuritySchemes: WRITE_SECURITY_SCHEMES })
+  : [];
+
 const TOOL_DESCRIPTORS = [
   {
     name: "vps_status",
@@ -953,6 +960,7 @@ const TOOL_DESCRIPTORS = [
     writeSecuritySchemes: WRITE_SECURITY_SCHEMES,
     toolMeta,
   }),
+  ...DEVICE_TOOL_DESCRIPTORS,
 ];
 
 function commandEnv() {
@@ -1619,6 +1627,17 @@ ${url}` }],
     audit: writeHistory,
   });
 
+  if (DEVICE_GATEWAY_ENABLED) {
+    registerDeviceTools(server, {
+      canRead: () => hasScope(authContext, "vps.read"),
+      canWrite: () => hasScope(authContext, "vps.write"),
+      readAuthError: () => toolAuthError(readAuthChallenge),
+      writeAuthError: () => toolAuthError(writeAuthChallenge),
+      readSecuritySchemes: READ_SECURITY_SCHEMES,
+      writeSecuritySchemes: WRITE_SECURITY_SCHEMES,
+    });
+  }
+
   server.server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: TOOL_DESCRIPTORS,
   }));
@@ -1948,6 +1967,13 @@ const httpServer = createServer(async (req, res) => {
 
 await loadOAuthTokenStore();
 
+if (DEVICE_GATEWAY_ENABLED) {
+  attachDeviceGateway(httpServer, {
+    centralCapabilities: TOOL_DESCRIPTORS.filter((tool) => !["list_devices", "device_call"].includes(tool.name)).map((tool) => tool.name),
+  });
+}
+
 httpServer.listen(PORT, HOST, () => {
   console.log(`ChatGPT Computer Control MCP server listening on http://${HOST}:${PORT}${MCP_PREFIX}/<token>`);
+  startDeviceAgent();
 });

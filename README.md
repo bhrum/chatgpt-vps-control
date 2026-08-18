@@ -12,7 +12,7 @@ The project started as `chatgpt-vps-control`. It now keeps the original VPS/file
 | --- | --- | --- |
 | Linux with X11 | `xdotool` + `xrandr/xdpyinfo` + `ffmpeg x11grab` | Uses the signed-in X11 desktop. |
 | Headless Linux/VPS | managed X11 (`Xvfb` + `xfwm4`) | If no X11 desktop is reachable, setup configures a persistent 1280×800 virtual desktop that the MCP service starts automatically. |
-| macOS | native Swift helper using CoreGraphics/AppKit/Accessibility | Compiles a local helper and asks for Accessibility + Screen Recording permission during `doctor`. |
+| macOS | signed app-bundled Swift helper using CoreGraphics/AppKit/Accessibility | Installs `ChatGPT Computer Control.app` with a stable Bundle ID so macOS permission panels show the product name instead of `node`. |
 | Windows | native PowerShell/C# helper using User32 `SendInput` + GDI capture | Uses the signed-in interactive Windows desktop; no third-party input driver is required. |
 
 All backends expose the same normalized 1280-wide API coordinate system so the MCP client does not need platform-specific click coordinates.
@@ -20,12 +20,17 @@ All backends expose the same normalized 1280-wide API coordinate system so the M
 ## Computer tools
 
 - `computer_environment` — reports the selected platform backend, display readiness, resolution, and native permission state.
+- `computer_applications` — lists installed/running desktop apps with stable platform identifiers (`com.google.Chrome`, `win32:notepad`, `startapp:…`, `atspi:…`, or `desktop:…`), avoiding guesses based on whichever window happens to be visible.
+- `computer_app_state` — returns a rich app-scoped accessibility tree, then compact element diffs on later calls unless a fresh full tree is requested.
 - `computer_elements` — returns a short-lived indexed accessibility snapshot from Linux AT-SPI, macOS AXUIElement, Windows UI Automation, or Chrome/Electron CDP.
 - `computer_element_action` — performs `press`, `focus`, `set_value`, `toggle`, `increment`, `decrement`, or `scroll_into_view` against an element index and returns a fresh screenshot.
+- `computer_element_secondary_action` — performs an exact native accessibility action advertised by the selected element; guessed action names are rejected.
 - `computer_state` — returns display/API resolution, cursor position, active/visible windows, and optionally an inline screenshot.
 - `computer_use` — executes coordinate-level `screenshot`, `click`, `move`, `drag`, `type`, `key`, `scroll`, and `wait`, with up to 9 known follow-up actions in one call and one final screenshot.
 
-Use semantic control first: call `computer_elements`, select a named role/control, call `computer_element_action`, then refresh the element snapshot after any UI-changing action. Snapshots expire after 90 seconds and expose only indexes; native handles and CDP node identifiers remain private inside the MCP process. Use `computer_use` as the visual/coordinate fallback when an application does not expose a usable accessibility element.
+Use semantic control first: call `computer_applications`, select the stable app id, then call `computer_app_state` or `computer_elements` with that id. Select a named role/control, call `computer_element_action`, then refresh the element snapshot after any UI-changing action. `computer_app_state` uses an app-scoped session: its first response is a full tree and later responses contain only additions, changes, and removals. Snapshots expire after 90 seconds and expose only indexes; native handles and CDP node identifiers remain private inside the MCP process. All semantic providers normalize hierarchy depth, subrole/class, stable element identifier, placeholder, URL, state, bounds, semantic actions, and exact native actions where the platform exposes them. Use `computer_use` as the visual/coordinate fallback when an application does not expose a usable accessibility element; on macOS and Windows its optional `application` field launches or activates the selected app before sending input.
+
+The implementation is independent and platform-native: macOS uses AXUIElement, Windows uses UI Automation patterns, Linux uses AT-SPI plus freedesktop application entries, and Chrome/Electron uses CDP. See [docs/clean-room-computer-use.md](docs/clean-room-computer-use.md) for the reconstructed behavior contract and the deliberate improvements made here.
 
 The coordinate fallback keeps the useful behavior recovered from Grok Bot 0.16.0: normalized coordinates, UI settle time before screenshots, batched known actions, and robust Unicode handling on X11. macOS and Windows use native OS input APIs instead of trying to run X11 tools there.
 
@@ -69,7 +74,9 @@ On macOS, the native helper requires Xcode Command Line Tools. If they are missi
 xcode-select --install
 ```
 
-Then rerun setup. `doctor` triggers the normal macOS Accessibility and Screen Recording permission prompts; those permissions still require the signed-in user to approve them in System Settings.
+Then rerun setup. `doctor` triggers the normal macOS Accessibility and Screen Recording permission prompts for **ChatGPT Computer Control**; those permissions still require the signed-in user to approve them in System Settings. Older installations that showed `node` must rerun `setup` to migrate from the bare helper executable to the named app bundle.
+
+After migration, macOS may retain the old `node` row as historical TCC state. Enable **ChatGPT Computer Control** and disable/remove the old `node` entry manually if it is no longer used; setup deliberately does not reset all Node permissions because that could affect unrelated development tools.
 
 ### Windows
 
@@ -143,7 +150,11 @@ The Swift helper uses:
 - AXUIElement traversal and actions for semantic controls.
 - Screen Recording permission for screen capture/window metadata.
 
-The helper is built into `~/.chatgpt-computer-control/bin/chatgpt-computer-helper` by setup. `doctor` reports whether both required permissions are granted.
+The helper is installed at `~/.chatgpt-computer-control/Applications/ChatGPT Computer Control.app` with Bundle ID `com.bhrum.computer-control`. The executable inside the bundle—not Node—calls the protected macOS APIs. `doctor` reports whether both required permissions are granted. Development installs are ad-hoc signed; set `CHATGPT_COMPUTER_CODESIGN_IDENTITY` to an Apple Development or Developer ID identity for stable production signing across rebuilds.
+
+For repeatable signing, configure the certificate SHA-1 fingerprint rather than its display name. Setup persists that identity, refuses to silently fall back to ad-hoc signing, and verifies that the resulting designated requirement contains the fixed Bundle ID, an Apple signing anchor, and a Team ID. Normal source updates signed by the same team and identity therefore continue to satisfy the authorization recorded by macOS.
+
+Set `CHATGPT_COMPUTER_TEAM_ID` as well to generate an explicit team-based designated requirement. This prevents certificate renewal from turning the same product into a new TCC identity as long as the Apple Team and Bundle ID remain unchanged.
 
 ## Windows behavior
 
@@ -168,6 +179,32 @@ http://127.0.0.1:8787/mcp/<random-private-token>
 Keep the token private. It grants powerful local capabilities, including shell execution and computer input.
 
 If the MCP client is not on the same machine, do **not** simply open port 8787 to the Internet. Put the loopback service behind an authenticated HTTPS tunnel, private network, VPN, or another transport you trust. The repository's existing OAuth flow can be used by ChatGPT-compatible clients; write/computer actions require `vps.write`, and read/screenshot/file inspection requires `vps.read` or the private static token.
+
+## Dynamic multi-device gateway
+
+One public MCP can act as the central registry for computers that connect later. Enable the gateway only on the central server:
+
+```text
+DEVICE_GATEWAY_LISTEN=1
+DEVICE_GATEWAY_TOKEN=<shared random token of at least 32 characters>
+DEVICE_CENTRAL_ID=central-vps
+DEVICE_CENTRAL_NAME=Central VPS
+```
+
+On each computer that should appear dynamically, configure the outbound agent:
+
+```text
+DEVICE_GATEWAY_URL=wss://control.example.com/agent
+DEVICE_GATEWAY_TOKEN=<same shared token>
+DEVICE_ID=my-computer
+DEVICE_NAME=My Computer
+```
+
+If a local network advertises unusable IPv6 connectivity to `workers.dev`, set
+`DEVICE_GATEWAY_IP_FAMILY=4` on that device. This changes only the outbound
+gateway connection and does not expose an inbound port.
+
+The central MCP adds two stable tools: `list_devices` returns the live registry, and `device_call` forwards a named MCP tool plus JSON arguments to a connected device. Adding another computer does not change the central tool list or require installing another ChatGPT plugin. Agents make outbound WebSocket connections, so individual computers do not need public inbound ports.
 
 ## Security properties
 

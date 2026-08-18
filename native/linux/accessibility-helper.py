@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 import base64
+import configparser
 import json
 import os
+import shutil
+import subprocess
 import sys
+import time
 import traceback
 
 try:
@@ -17,6 +21,7 @@ INTERACTIVE_ROLES = {
     "table cell", "text", "toggle button", "tree item",
 }
 STATIC_ROLES = {"heading", "image", "label", "paragraph", "static", "status bar"}
+CONTAINER_ROLES = {"application", "dialog", "document frame", "frame", "grouping", "menu", "panel", "section", "tool bar", "window"}
 MAX_DEPTH = 18
 
 
@@ -85,6 +90,43 @@ def action_names(obj):
     return names, iface
 
 
+def attribute_map(obj):
+    result = {}
+    for raw in safe(lambda: obj.getAttributes(), []) or []:
+        key, separator, value = str(raw).partition(":")
+        if separator:
+            result[key.strip().lower()] = value.strip()
+    return result
+
+
+def desktop_application_entries():
+    entries = []
+    roots = ["/usr/share/applications", "/usr/local/share/applications"]
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    roots.insert(0, os.path.join(data_home, "applications"))
+    seen = set()
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for filename in sorted(os.listdir(root)):
+            if not filename.endswith(".desktop") or filename in seen:
+                continue
+            path = os.path.join(root, filename)
+            parser = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                parser.read(path, encoding="utf-8")
+                entry = parser["Desktop Entry"]
+                if entry.getboolean("NoDisplay", fallback=False) or entry.get("Type", "Application") != "Application":
+                    continue
+                seen.add(filename)
+                entries.append({"id": f"desktop:{filename[:-8]}", "desktopId": filename[:-8], "displayName": entry.get("Name", filename[:-8]).strip(), "path": path})
+            except Exception:
+                continue
+            if len(entries) >= 400:
+                return entries
+    return entries
+
+
 def text_value(obj):
     editable = safe(lambda: obj.queryEditableText(), None)
     text = safe(lambda: obj.queryText(), None)
@@ -135,11 +177,12 @@ def semantic_actions(obj, role, native_actions, editable, has_value):
     return list(dict.fromkeys(actions))
 
 
-def element_info(obj, path):
+def element_info(obj, path, depth):
     role = canonical_role(safe(lambda: obj.getRoleName(), "unknown"))
     native_actions, _ = action_names(obj)
     value, editable = text_value(obj)
     numeric = value_info(obj)
+    attributes = attribute_map(obj)
     return {
         "id": encode_id(path),
         "role": role,
@@ -154,16 +197,24 @@ def element_info(obj, path):
         "bounds": bounds_info(obj),
         "actions": semantic_actions(obj, role, native_actions, editable, numeric is not None),
         "nativeActions": native_actions,
+        "subrole": attributes.get("class", attributes.get("xml-roles", "")),
+        "identifier": attributes.get("id", attributes.get("automation-id", attributes.get("accessible-id", ""))),
+        "placeholder": attributes.get("placeholder-text", attributes.get("placeholder", "")),
+        "url": attributes.get("url", attributes.get("uri", ""))[:4000],
+        "depth": depth,
+        "toolkit": attributes.get("toolkit", ""),
     }
 
 
-def interesting(obj, include_static):
+def interesting(obj, include_static, include_containers=False):
     role = canonical_role(safe(lambda: obj.getRoleName(), ""))
     if role in INTERACTIVE_ROLES:
         return True
     if state_has(obj, pyatspi.STATE_FOCUSABLE):
         return True
     if include_static and role in STATIC_ROLES:
+        return True
+    if include_containers and role in CONTAINER_ROLES and str(safe(lambda: obj.name, "") or "").strip():
         return True
     return False
 
@@ -172,16 +223,44 @@ def list_elements(request):
     desktop = pyatspi.Registry.getDesktop(0)
     max_elements = max(1, min(int(request.get("maxElements", 120)), 500))
     include_static = bool(request.get("includeStaticText", False))
+    include_containers = bool(request.get("includeContainers", False))
     role_filter = canonical_role(request.get("role", "")) if request.get("role", "") else ""
     query = str(request.get("query", request.get("name", "")) or "").strip().lower()
-    application = str(request.get("application", "") or "").strip().lower()
+    application_id = str(request.get("application", "") or "").strip()
+    application = application_id.lower()
+    requested_desktop_id = ""
+    if application.startswith("desktop:"):
+        requested_desktop_id = application[8:]
+        entry = next((item for item in desktop_application_entries() if item["desktopId"].lower() == requested_desktop_id), None)
+        application = entry["displayName"].lower() if entry else requested_desktop_id
+    if application.startswith("atspi:"):
+        application = application[6:]
     result = []
+    selected_application = ""
+    selected_application_id = ""
+
+    def has_application():
+        count = int(safe(lambda: desktop.childCount, 0) or 0)
+        for index in range(min(count, 100)):
+            candidate = child_at(desktop, index)
+            candidate_name = str(safe(lambda: candidate.name, "") or "").strip().lower()
+            if candidate_name and (candidate_name == application or application in candidate_name):
+                return True
+        return False
+
+    if request.get("launchIfNeeded") and requested_desktop_id and application and not has_application() and shutil.which("gtk-launch"):
+        subprocess.Popen(["gtk-launch", requested_desktop_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(20):
+            time.sleep(0.1)
+            desktop = pyatspi.Registry.getDesktop(0)
+            if has_application():
+                break
 
     def walk(obj, path, depth):
         if obj is None or depth > MAX_DEPTH or len(result) >= max_elements:
             return
-        if depth > 0 and interesting(obj, include_static):
-            info = element_info(obj, path)
+        if depth > 0 and interesting(obj, include_static, include_containers):
+            info = element_info(obj, path, depth)
             searchable = f"{info['name']} {info['description']} {info['value']}".lower()
             if (not role_filter or info["role"] == role_filter) and (not query or query in searchable):
                 result.append(info)
@@ -201,14 +280,20 @@ def list_elements(request):
             continue
         app_name = str(safe(lambda: app.name, "") or "")
         applications.append({"index": app_index, "name": app_name})
-        if application and application not in app_name.lower():
+        normalized_name = app_name.strip().lower()
+        if application and application != normalized_name and application not in normalized_name:
             continue
+        if application and not selected_application:
+            selected_application = app_name
+            selected_application_id = application_id if application_id else f"atspi:{normalized_name}"
         walk(app, [app_index], 0)
 
     return {
         "ok": True,
         "source": "linux-atspi",
         "applications": applications,
+        "application": selected_application or None,
+        "applicationId": selected_application_id or None,
         "elements": result,
         "message": f"Returned {len(result)} AT-SPI accessibility elements.",
     }
@@ -230,6 +315,14 @@ def perform_action(request):
     value = str(request.get("value", "") or "")
     names, action_iface = action_names(obj)
     component = safe(lambda: obj.queryComponent(), None)
+
+    if action.startswith("native:"):
+        requested = action[7:]
+        if action_iface is None or requested not in names:
+            raise RuntimeError(f"AT-SPI action is no longer available: {requested}")
+        if not action_iface.doAction(names.index(requested)):
+            raise RuntimeError("AT-SPI native action returned false")
+        return {"ok": True, "source": "linux-atspi", "action": action}
 
     if action in {"press", "toggle"}:
         index = choose_native_action(names)
@@ -272,6 +365,28 @@ def perform_action(request):
     return {"ok": True, "source": "linux-atspi", "action": action}
 
 
+def list_applications():
+    desktop = pyatspi.Registry.getDesktop(0)
+    by_id = {}
+    count = int(safe(lambda: desktop.childCount, 0) or 0)
+    for index in range(min(count, 100)):
+        app = child_at(desktop, index)
+        name = str(safe(lambda: app.name, "") or "").strip()
+        if not name:
+            continue
+        app_id = f"atspi:{name.lower()}"
+        by_id[app_id] = {"id": app_id, "displayName": name, "path": "", "isRunning": True, "pid": None}
+
+    for entry in desktop_application_entries():
+        app_id = entry["id"]
+        running_match = next((item for item in by_id.values() if item["displayName"].lower() == entry["displayName"].lower()), None)
+        by_id[app_id] = {
+            "id": app_id, "displayName": entry["displayName"], "path": entry["path"],
+            "isRunning": bool(running_match), "pid": None,
+        }
+    return sorted(by_id.values(), key=lambda item: (not item["isRunning"], item["displayName"].lower()))
+
+
 def main():
     request = json.loads(sys.stdin.read() or "{}")
     mode = request.get("mode", "list")
@@ -280,6 +395,8 @@ def main():
         emit({"ok": True, "source": "linux-atspi", "applications": int(safe(lambda: desktop.childCount, 0) or 0)})
     elif mode == "list":
         emit(list_elements(request))
+    elif mode == "applications":
+        emit({"ok": True, "source": "linux-atspi", "applications": list_applications()})
     elif mode == "action":
         emit(perform_action(request))
     else:

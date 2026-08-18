@@ -8,7 +8,7 @@ import {
   nativeComputerState,
   nativeComputerUse,
 } from "./lib/native-computer-backend.js";
-import { listSemanticElements, semanticElementAction } from "./lib/semantic-computer.js";
+import { listSemanticApplications, listSemanticElements, semanticElementAction } from "./lib/semantic-computer.js";
 
 const API_WIDTH = 1280;
 const DEFAULT_SETTLE_MS = clampNumber(Number(process.env.COMPUTER_SCREENSHOT_SETTLE_MS ?? 2000), 0, 5000, 2000);
@@ -18,6 +18,7 @@ const KEYMAP_SETTLE_MS = 300;
 const MAX_WAIT_MS = 30_000;
 const MAX_FOLLOW_UP_ACTIONS = 9;
 const MAX_TEXT_CHARS = 20_000;
+const MAX_NATIVE_ACTION_CHARS = 200;
 const MAX_WINDOWS = 30;
 const MAX_STDERR_BYTES = 256 * 1024;
 const MAX_SCREENSHOT_BYTES = 12 * 1024 * 1024;
@@ -25,6 +26,7 @@ const ELEMENT_SNAPSHOT_TTL_MS = 90_000;
 const MAX_ELEMENT_SNAPSHOTS = 24;
 const ELEMENT_ACTIONS = ["press", "focus", "set_value", "toggle", "increment", "decrement", "scroll_into_view"];
 const ELEMENT_SNAPSHOTS = new Map();
+const APP_STATE_CACHE = new Map();
 
 const BUTTONS = {
   left: "1",
@@ -66,6 +68,7 @@ const actionSchema = z.object({
 
 const computerUseArgsSchema = actionSchema.extend({
   display: z.string().min(1).max(64).optional(),
+  application: z.string().min(1).max(500).optional(),
   description: z.string().max(500).optional(),
   then: z.array(actionSchema).min(1).max(MAX_FOLLOW_UP_ACTIONS).optional(),
 });
@@ -102,6 +105,11 @@ const elementShape = z.object({
   name: z.string(),
   value: z.string(),
   description: z.string(),
+  subrole: z.string(),
+  identifier: z.string(),
+  placeholder: z.string(),
+  url: z.string(),
+  depth: z.number().int(),
   enabled: z.boolean(),
   focused: z.boolean(),
   selected: z.boolean(),
@@ -109,7 +117,28 @@ const elementShape = z.object({
   expanded: z.boolean().nullable(),
   bounds: elementBoundsShape.nullable(),
   actions: z.array(z.string()),
+  nativeActions: z.array(z.string()),
 });
+const applicationShape = z.object({
+  id: z.string(),
+  displayName: z.string(),
+  path: z.string(),
+  isRunning: z.boolean(),
+  pid: z.number().int().nullable(),
+});
+const applicationsResultShape = {
+  applications: z.array(applicationShape),
+  message: z.string(),
+};
+const appStateResultShape = {
+  snapshotId: z.string(),
+  expiresInMs: z.number().int(),
+  application: z.string().nullable(),
+  applicationId: z.string().nullable(),
+  isDiff: z.boolean(),
+  text: z.string(),
+  message: z.string(),
+};
 const elementsResultShape = {
   snapshotId: z.string(),
   expiresInMs: z.number().int(),
@@ -118,6 +147,7 @@ const elementsResultShape = {
   target: z.object({ id: z.string(), title: z.string(), url: z.string(), endpoint: z.string() }).nullable(),
   targets: z.array(z.object({ id: z.string(), title: z.string(), url: z.string(), endpoint: z.string() })),
   application: z.string().nullable(),
+  applicationId: z.string().nullable(),
   applications: z.array(z.object({ index: z.number().int(), name: z.string() })),
   elements: z.array(elementShape),
   warnings: z.array(z.string()),
@@ -193,10 +223,37 @@ const elementJsonSchema = {
   properties: {
     index: { type: "integer" }, source: { type: "string" }, role: { type: "string" }, name: { type: "string" },
     value: { type: "string" }, description: { type: "string" }, enabled: { type: "boolean" }, focused: { type: "boolean" },
+    subrole: { type: "string" }, identifier: { type: "string" }, placeholder: { type: "string" }, url: { type: "string" },
+    depth: { type: "integer" }, nativeActions: { type: "array", items: { type: "string" } },
     selected: { type: "boolean" }, checked: { type: ["boolean", "null"] }, expanded: { type: ["boolean", "null"] },
     bounds: { anyOf: [elementBoundsJsonSchema, { type: "null" }] }, actions: { type: "array", items: { type: "string" } },
   },
-  required: ["index", "source", "role", "name", "value", "description", "enabled", "focused", "selected", "checked", "expanded", "bounds", "actions"],
+  required: ["index", "source", "role", "name", "value", "description", "subrole", "identifier", "placeholder", "url", "depth", "enabled", "focused", "selected", "checked", "expanded", "bounds", "actions", "nativeActions"],
+  additionalProperties: false,
+};
+const applicationJsonSchema = {
+  type: "object",
+  properties: {
+    id: { type: "string" }, displayName: { type: "string" }, path: { type: "string" },
+    isRunning: { type: "boolean" }, pid: { type: ["integer", "null"] },
+  },
+  required: ["id", "displayName", "path", "isRunning", "pid"],
+  additionalProperties: false,
+};
+const applicationsResultJsonSchema = {
+  type: "object",
+  properties: { applications: { type: "array", items: applicationJsonSchema }, message: { type: "string" } },
+  required: ["applications", "message"],
+  additionalProperties: false,
+};
+const appStateResultJsonSchema = {
+  type: "object",
+  properties: {
+    snapshotId: { type: "string" }, expiresInMs: { type: "integer" },
+    application: { type: ["string", "null"] }, applicationId: { type: ["string", "null"] },
+    isDiff: { type: "boolean" }, text: { type: "string" }, message: { type: "string" },
+  },
+  required: ["snapshotId", "expiresInMs", "application", "applicationId", "isDiff", "text", "message"],
   additionalProperties: false,
 };
 const elementsResultJsonSchema = {
@@ -207,10 +264,11 @@ const elementsResultJsonSchema = {
     target: { anyOf: [{ type: "object", properties: { id: { type: "string" }, title: { type: "string" }, url: { type: "string" }, endpoint: { type: "string" } }, required: ["id", "title", "url", "endpoint"], additionalProperties: false }, { type: "null" }] },
     targets: { type: "array", items: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, url: { type: "string" }, endpoint: { type: "string" } }, required: ["id", "title", "url", "endpoint"], additionalProperties: false } },
     application: { type: ["string", "null"] },
+    applicationId: { type: ["string", "null"] },
     applications: { type: "array", items: { type: "object", properties: { index: { type: "integer" }, name: { type: "string" } }, required: ["index", "name"], additionalProperties: false } },
     elements: { type: "array", items: elementJsonSchema }, warnings: { type: "array", items: { type: "string" } }, message: { type: "string" },
   },
-  required: ["snapshotId", "expiresInMs", "source", "providers", "target", "targets", "application", "applications", "elements", "warnings", "message"],
+  required: ["snapshotId", "expiresInMs", "source", "providers", "target", "targets", "application", "applicationId", "applications", "elements", "warnings", "message"],
   additionalProperties: false,
 };
 const elementActionResultJsonSchema = {
@@ -804,6 +862,11 @@ function storeElementSnapshot(result, options) {
     name: String(element.name ?? ""),
     value: String(element.value ?? ""),
     description: String(element.description ?? ""),
+    subrole: String(element.subrole ?? ""),
+    identifier: String(element.identifier ?? ""),
+    placeholder: String(element.placeholder ?? ""),
+    url: String(element.url ?? ""),
+    depth: Number.isInteger(element.depth) ? element.depth : 0,
     enabled: element.enabled !== false,
     focused: Boolean(element.focused),
     selected: Boolean(element.selected),
@@ -813,8 +876,58 @@ function storeElementSnapshot(result, options) {
       ? { x: Math.trunc(element.bounds.x), y: Math.trunc(element.bounds.y), width: Math.max(0, Math.trunc(element.bounds.width)), height: Math.max(0, Math.trunc(element.bounds.height)) }
       : null,
     actions: Array.isArray(element.actions) ? element.actions.map(String) : [],
+    nativeActions: Array.isArray(element.nativeActions) ? element.nativeActions.map(String) : [],
   }));
   return { snapshotId, expiresInMs: ELEMENT_SNAPSHOT_TTL_MS, elements };
+}
+
+function appStateIdentity(element) {
+  const bounds = element.bounds ? `${element.bounds.x},${element.bounds.y},${element.bounds.width},${element.bounds.height}` : "";
+  return [element.source, element.role, element.identifier || element.name, element.depth, bounds].join("|");
+}
+
+function appStateLine(element) {
+  const indent = "  ".repeat(Math.max(0, Math.min(12, element.depth ?? 0)));
+  const details = [];
+  if (element.name) details.push(element.name);
+  if (element.value) details.push(`Value: ${element.value}`);
+  if (element.placeholder) details.push(`Placeholder: ${element.placeholder}`);
+  if (element.url) details.push(`URL: ${element.url}`);
+  if (element.focused) details.push("focused");
+  if (element.selected) details.push("selected");
+  if (!element.enabled) details.push("disabled");
+  if (element.actions.length) details.push(`Actions: ${element.actions.join(",")}`);
+  if (element.nativeActions.length) details.push(`Native: ${element.nativeActions.join(",")}`);
+  return `${indent}${element.index} ${element.role}${details.length ? ` ${details.join(" | ")}` : ""}`;
+}
+
+function buildAppStateText({ application, applicationId, elements, disableDiff }) {
+  const cacheKey = applicationId || application || "frontmost";
+  const current = new Map(elements.map((element) => [appStateIdentity(element), element]));
+  const previous = APP_STATE_CACHE.get(cacheKey);
+  APP_STATE_CACHE.set(cacheKey, current);
+  while (APP_STATE_CACHE.size > 12) APP_STATE_CACHE.delete(APP_STATE_CACHE.keys().next().value);
+
+  const heading = `Application: ${application || "unknown"}${applicationId ? ` (${applicationId})` : ""}`;
+  if (disableDiff || !previous) return { isDiff: false, text: [heading, ...elements.map(appStateLine)].join("\n") };
+
+  const added = [];
+  const changed = [];
+  const removed = [];
+  for (const [identity, element] of current) {
+    const old = previous.get(identity);
+    if (!old) added.push(appStateLine(element));
+    else if (JSON.stringify(old) !== JSON.stringify(element)) changed.push(appStateLine(element));
+  }
+  for (const [identity, element] of previous) {
+    if (!current.has(identity)) removed.push(appStateLine(element));
+  }
+  const sections = [heading, "Accessibility changes since the previous state:"];
+  if (added.length) sections.push("Added:", ...added);
+  if (changed.length) sections.push("Changed:", ...changed);
+  if (removed.length) sections.push("Removed (indexes are stale; do not act on them):", ...removed);
+  if (!added.length && !changed.length && !removed.length) sections.push("No accessibility changes.");
+  return { isDiff: true, text: sections.join("\n") };
 }
 
 function getSnapshotElement(snapshotId, elementIndex) {
@@ -866,6 +979,35 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
       _meta: toolMeta("Checking computer environment", "Computer environment ready", readSecuritySchemes),
     },
     {
+      name: "computer_applications",
+      title: "Computer applications",
+      description: "List installed and running desktop applications with stable platform identifiers. Use this before targeting a specific app.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: applicationsResultJsonSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+      securitySchemes: readSecuritySchemes,
+      _meta: toolMeta("Listing computer applications", "Computer applications ready", readSecuritySchemes),
+    },
+    {
+      name: "computer_app_state",
+      title: "Computer application state",
+      description: "Launch or activate one application when needed, then read its rich accessibility tree by stable app id. Later calls return a compact diff by default.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          app: { type: "string", minLength: 1, maxLength: 500 },
+          disableDiff: { type: "boolean", default: false },
+          maxElements: { type: "integer", minimum: 1, maximum: 500, default: 240 },
+        },
+        required: ["app"],
+        additionalProperties: false,
+      },
+      outputSchema: appStateResultJsonSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Opening and reading application state", "Application state ready", writeSecuritySchemes),
+    },
+    {
       name: "computer_elements",
       title: "Computer elements",
       description: "Read the current semantic accessibility tree and return a short-lived indexed snapshot. Prefer this over screen coordinates when a named button, link, field, menu item, checkbox, tab, or other control is available.",
@@ -881,6 +1023,7 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
           role: { type: "string", description: "Filter by accessibility role." },
           maxElements: { type: "integer", minimum: 1, maximum: 500, default: 120 },
           includeStaticText: { type: "boolean", default: false },
+          includeContainers: { type: "boolean", default: false, description: "Include named container/group elements to preserve more of the accessibility hierarchy." },
         },
         additionalProperties: false,
       },
@@ -912,6 +1055,27 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
       _meta: toolMeta("Operating computer element", "Computer element action finished", writeSecuritySchemes),
     },
     {
+      name: "computer_element_secondary_action",
+      title: "Computer element secondary action",
+      description: "Perform one exact native accessibility action advertised by a recent computer_elements snapshot. Never guess an action name.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          snapshotId: { type: "string", minLength: 8 },
+          elementIndex: { type: "integer", minimum: 0 },
+          nativeAction: { type: "string", minLength: 1, maxLength: MAX_NATIVE_ACTION_CHARS },
+          display: { type: "string", maxLength: 64 },
+          description: { type: "string", maxLength: 500 },
+        },
+        required: ["snapshotId", "elementIndex", "nativeAction"],
+        additionalProperties: false,
+      },
+      outputSchema: elementActionResultJsonSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Performing native accessibility action", "Native accessibility action finished", writeSecuritySchemes),
+    },
+    {
       name: "computer_state",
       title: "Computer state",
       description:
@@ -939,6 +1103,7 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
         type: "object",
         properties: {
           display: { type: "string", maxLength: 64, description: "Optional X11 display such as :3. Defaults to the connector process DISPLAY." },
+          application: { type: "string", maxLength: 500, description: "Optional macOS/Windows application name or bundle identifier to launch/activate before sending actions." },
           description: { type: "string", maxLength: 500, description: "Optional concise purpose for the action; typed text is never copied into connector command history." },
           ...actionPropertiesJsonSchema(),
           then: {
@@ -1037,6 +1202,81 @@ export function registerComputerUseTools(server, options) {
   );
 
   server.registerTool(
+    "computer_applications",
+    {
+      title: "Computer applications",
+      description: "List installed and running desktop applications with stable identifiers for precise app targeting.",
+      inputSchema: {},
+      outputSchema: applicationsResultShape,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+      securitySchemes: readSecuritySchemes,
+      _meta: toolMeta("Listing computer applications", "Computer applications ready", readSecuritySchemes),
+    },
+    async () => {
+      if (!hasReadScope()) return toolAuthError(readAuthChallenge);
+      try {
+        const applications = await listSemanticApplications();
+        const structuredContent = {
+          applications,
+          message: `Found ${applications.length} installed or running desktop applications. Prefer the stable id when selecting an application.`,
+        };
+        return { structuredContent, content: [{ type: "text", text: structuredContent.message }] };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { isError: true, content: [{ type: "text", text: `Computer applications failed: ${message}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
+    "computer_app_state",
+    {
+      title: "Computer application state",
+      description: "Launch or activate one application when needed, then read its rich accessibility tree by stable app id; later calls return a compact diff.",
+      inputSchema: {
+        app: z.string().min(1).max(500),
+        disableDiff: z.boolean().default(false).optional(),
+        maxElements: z.number().int().min(1).max(500).default(240).optional(),
+      },
+      outputSchema: appStateResultShape,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Opening and reading application state", "Application state ready", writeSecuritySchemes),
+    },
+    async ({ app, disableDiff, maxElements }) => {
+      if (!hasWriteScope()) return toolAuthError(writeAuthChallenge);
+      try {
+        const options = {
+          source: "desktop",
+          application: app,
+          maxElements: maxElements ?? 240,
+          includeStaticText: true,
+          includeContainers: true,
+          launchIfNeeded: true,
+        };
+        const result = await listSemanticElements(options);
+        const snapshot = storeElementSnapshot(result, options);
+        const application = result.application == null ? null : String(result.application);
+        const applicationId = result.applicationId == null ? null : String(result.applicationId);
+        const rendered = buildAppStateText({ application, applicationId, elements: snapshot.elements, disableDiff: disableDiff === true });
+        const structuredContent = {
+          snapshotId: snapshot.snapshotId,
+          expiresInMs: snapshot.expiresInMs,
+          application,
+          applicationId,
+          isDiff: rendered.isDiff,
+          text: rendered.text,
+          message: `${rendered.isDiff ? "Returned accessibility changes" : "Returned the full accessibility tree"} for ${applicationId || application || app}. Snapshot ${snapshot.snapshotId} expires in ${Math.round(snapshot.expiresInMs / 1000)} seconds.`,
+        };
+        return { structuredContent, content: [{ type: "text", text: `${structuredContent.message}\n${structuredContent.text}` }] };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { isError: true, content: [{ type: "text", text: `Computer application state failed: ${message}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
     "computer_elements",
     {
       title: "Computer elements",
@@ -1051,6 +1291,7 @@ export function registerComputerUseTools(server, options) {
         role: z.string().max(200).optional(),
         maxElements: z.number().int().min(1).max(500).default(120).optional(),
         includeStaticText: z.boolean().default(false).optional(),
+        includeContainers: z.boolean().default(false).optional(),
       },
       outputSchema: elementsResultShape,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: false },
@@ -1077,6 +1318,7 @@ export function registerComputerUseTools(server, options) {
             url: String(target.url ?? ""), endpoint: String(target.endpoint ?? ""),
           })),
           application: result.application == null ? null : String(result.application),
+          applicationId: result.applicationId == null ? null : String(result.applicationId),
           applications: (result.applications ?? []).map((application, index) => ({
             index: Number.isInteger(application.index) ? application.index : index,
             name: String(application.name ?? ""),
@@ -1160,6 +1402,67 @@ export function registerComputerUseTools(server, options) {
   );
 
   server.registerTool(
+    "computer_element_secondary_action",
+    {
+      title: "Computer element secondary action",
+      description: "Perform one exact native accessibility action advertised by a recent computer_elements snapshot.",
+      inputSchema: {
+        snapshotId: z.string().min(8),
+        elementIndex: z.number().int().min(0),
+        nativeAction: z.string().min(1).max(MAX_NATIVE_ACTION_CHARS),
+        display: z.string().min(1).max(64).optional(),
+        description: z.string().max(500).optional(),
+      },
+      outputSchema: elementActionResultShape,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Performing native accessibility action", "Native accessibility action finished", writeSecuritySchemes),
+    },
+    async ({ snapshotId, elementIndex, nativeAction, display }) => {
+      if (!hasWriteScope()) return toolAuthError(writeAuthChallenge);
+      const started = Date.now();
+      let source = "unknown";
+      try {
+        const { element } = getSnapshotElement(snapshotId, elementIndex);
+        source = String(element.source ?? "unknown");
+        const advertised = Array.isArray(element.nativeActions) ? element.nativeActions.map(String) : [];
+        if (!advertised.includes(nativeAction)) {
+          throw new Error(`Element ${elementIndex} does not advertise native action ${nativeAction}. Available: ${advertised.join(", ") || "none"}.`);
+        }
+        await semanticElementAction({ elementId: element.id, action: `native:${nativeAction}` });
+        ELEMENT_SNAPSHOTS.delete(snapshotId);
+        if (DEFAULT_SETTLE_MS > 0) await sleep(DEFAULT_SETTLE_MS);
+        const state = await captureComputerAfterSemanticAction(display);
+        if (!state.screenshot) throw new Error("Post-action screenshot was not available.");
+        const durationMs = Date.now() - started;
+        const structuredContent = {
+          snapshotId, elementIndex, source, action: `native:${nativeAction}`, durationMs, activeWindow: state.active ?? null,
+          screenshotIncluded: true, screenshotMimeType: state.screenshot.mimeType,
+          message: `Executed native accessibility action ${nativeAction} on ${source} element ${elementIndex}; refresh computer_elements before the next UI-dependent action.`,
+        };
+        await audit?.({
+          command: `computer_element_secondary_action ${source}[${elementIndex}].${nativeAction}`,
+          cwd: state.display, status: "completed", exitCode: 0, signal: null, durationMs,
+          stdout: structuredContent.message, stderr: "", truncated: false,
+        });
+        return {
+          structuredContent,
+          content: [{ type: "text", text: structuredContent.message }, { type: "image", data: state.screenshot.data, mimeType: state.screenshot.mimeType }],
+        };
+      } catch (error) {
+        const durationMs = Date.now() - started;
+        const message = error instanceof Error ? error.message : String(error);
+        await audit?.({
+          command: `computer_element_secondary_action ${source}[${elementIndex}].${nativeAction}`,
+          cwd: display ?? "computer", status: "failed", exitCode: 1, signal: null, durationMs,
+          stdout: "", stderr: message, truncated: false,
+        }).catch(() => {});
+        return { isError: true, content: [{ type: "text", text: `Computer secondary action failed: ${message}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
     "computer_state",
     {
       title: "Computer state",
@@ -1217,6 +1520,7 @@ export function registerComputerUseTools(server, options) {
         `Control the local computer using Grok Bot-style actions and one final screenshot. Up to ${MAX_FOLLOW_UP_ACTIONS} follow-up actions may be batched in then.`,
       inputSchema: {
         display: z.string().min(1).max(64).optional(),
+        application: z.string().min(1).max(500).optional(),
         description: z.string().max(500).optional(),
         ...actionSchema.shape,
         then: z.array(actionSchema).min(1).max(MAX_FOLLOW_UP_ACTIONS).optional(),
@@ -1238,7 +1542,7 @@ export function registerComputerUseTools(server, options) {
         };
       }
 
-      const { display, description: _description, then = [], ...primary } = parsed.data;
+      const { display, application, description: _description, then = [], ...primary } = parsed.data;
       const actions = [primary, ...then];
       const auditSummary = actions.map(summarizeAction).join(" -> ");
 
@@ -1250,7 +1554,7 @@ export function registerComputerUseTools(server, options) {
         let active;
         if (native) {
           resolvedDisplay = nativeComputerBackendName();
-          const state = await nativeComputerUse(actions);
+          const state = await nativeComputerUse(actions, { application });
           resolution = state.resolution;
           screenshot = state.screenshot;
           cursor = state.cursor;

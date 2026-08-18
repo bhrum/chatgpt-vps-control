@@ -13,10 +13,12 @@ $form.Text = 'ChatGPT Computer Semantic Test'
 $form.StartPosition = 'CenterScreen'
 $form.Size = New-Object System.Drawing.Size(520,260)
 $entry = New-Object System.Windows.Forms.TextBox
+$entry.Name = 'semanticEntry'
 $entry.Location = New-Object System.Drawing.Point(30,30)
 $entry.Size = New-Object System.Drawing.Size(430,30)
 $entry.AccessibleName = 'Semantic entry'
 $button = New-Object System.Windows.Forms.Button
+$button.Name = 'applySemanticValue'
 $button.Location = New-Object System.Drawing.Point(30,80)
 $button.Size = New-Object System.Drawing.Size(220,35)
 $button.Text = 'Apply semantic value'
@@ -50,16 +52,21 @@ function Wait-Elements {
 }
 
 try {
+  $applications = Invoke-Helper @{ apiWidth=1280; actions=@(); includeScreenshot=$false; includeWindows=$false; listApplications=$true }
+  if (@($applications.applications).Count -lt 1) { throw 'Windows application inventory was empty.' }
   $snapshot = Wait-Elements
   $entry = @($snapshot.elements) | Where-Object { $_.role -eq 'edit' -and $_.name -like '*Semantic entry*' } | Select-Object -First 1
   $button = @($snapshot.elements) | Where-Object { $_.role -eq 'button' -and $_.name -like '*Apply semantic value*' } | Select-Object -First 1
   if ($null -eq $entry) { throw "Semantic entry not found: $($snapshot.elements | ConvertTo-Json -Depth 8 -Compress)" }
   if ($null -eq $button) { throw 'Semantic button not found.' }
+  if (-not $snapshot.elementApplicationId.StartsWith('win32:')) { throw "Missing stable Windows application id: $($snapshot.elementApplicationId)" }
+  if (-not $entry.identifier -or $entry.depth -lt 1) { throw 'Windows UIA metadata was incomplete.' }
+  if (@($button.nativeActions) -notcontains 'Invoke') { throw "Windows button did not advertise Invoke: $($button.nativeActions -join ', ')" }
 
   Invoke-Helper @{ apiWidth=1280; actions=@(); includeScreenshot=$false; includeWindows=$false; elementAction=@{ elementId=$entry.id; action='set_value'; value='semantic-windows-ok' } } | Out-Null
   $snapshot = Wait-Elements
   $button = @($snapshot.elements) | Where-Object { $_.role -eq 'button' -and $_.name -like '*Apply semantic value*' } | Select-Object -First 1
-  Invoke-Helper @{ apiWidth=1280; actions=@(); includeScreenshot=$false; includeWindows=$false; elementAction=@{ elementId=$button.id; action='press'; value='' } } | Out-Null
+  Invoke-Helper @{ apiWidth=1280; actions=@(); includeScreenshot=$false; includeWindows=$false; elementAction=@{ elementId=$button.id; action='native:Invoke'; value='' } } | Out-Null
   Start-Sleep -Milliseconds 300
   $snapshot = Wait-Elements
   $status = @($snapshot.elements) | Where-Object { "$($_.name) $($_.value)" -like '*clicked:semantic-windows-ok*' } | Select-Object -First 1

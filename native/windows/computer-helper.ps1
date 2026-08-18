@@ -106,6 +106,31 @@ function Get-VisibleWindows {
   [NativeComputer]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
   return @($items)
 }
+function Get-Applications {
+  $byId = @{}
+  foreach ($process in @(Get-Process | Where-Object { $_.MainWindowHandle -ne 0 })) {
+    $processName = [string]$process.ProcessName
+    $id = "win32:$($processName.ToLowerInvariant())"
+    $path = ''
+    try { $path = [string]$process.Path } catch {}
+    $byId[$id] = @{
+      id=$id; displayName=$(if ($process.MainWindowTitle) { [string]$process.MainWindowTitle } else { $processName })
+      path=$path; isRunning=$true; pid=[int]$process.Id
+    }
+  }
+  if (Get-Command Get-StartApps -ErrorAction SilentlyContinue) {
+    foreach ($app in @(Get-StartApps)) {
+      $appId = [string]$app.AppID
+      if (-not $appId) { continue }
+      $id = "startapp:$appId"
+      if (-not $byId.ContainsKey($id)) {
+        $byId[$id] = @{ id=$id; displayName=[string]$app.Name; path=$appId; isRunning=$false; pid=$null }
+      }
+      if ($byId.Count -ge 400) { break }
+    }
+  }
+  return @($byId.Values | Sort-Object @{Expression='isRunning';Descending=$true}, @{Expression='displayName';Ascending=$true})
+}
 function Capture-Screenshot($res) {
   $bmp = New-Object System.Drawing.Bitmap($res.display.width, $res.display.height, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
   $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -141,6 +166,7 @@ function Send-KeyChord($raw) {
 $ControlWalker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
 $InteractiveTypes = @('Button','CheckBox','ComboBox','Edit','Hyperlink','ListItem','MenuItem','RadioButton','ScrollBar','Slider','Spinner','TabItem','TreeItem')
 $StaticTypes = @('Header','Image','Text')
+$ContainerTypes = @('Custom','DataGrid','Group','List','Menu','Pane','Tab','Table','ToolBar','Tree','Window')
 
 function Encode-ElementId([long]$hwnd, [int[]]$path) {
   $json = @{ source='windows-uia'; hwnd=$hwnd; path=@($path) } | ConvertTo-Json -Compress
@@ -188,7 +214,7 @@ function Get-UIABounds($element) {
   if ($rect.IsEmpty -or [double]::IsInfinity($rect.X) -or [double]::IsNaN($rect.X)) { return $null }
   return @{ x=[int][Math]::Round($rect.X); y=[int][Math]::Round($rect.Y); width=[Math]::Max(0,[int][Math]::Round($rect.Width)); height=[Math]::Max(0,[int][Math]::Round($rect.Height)) }
 }
-function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path) {
+function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path, [int]$depth) {
   $type = Get-ControlTypeName $element
   $invoke = Try-Pattern $element ([System.Windows.Automation.InvokePattern]::Pattern)
   $valuePattern = Try-Pattern $element ([System.Windows.Automation.ValuePattern]::Pattern)
@@ -198,6 +224,17 @@ function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path) {
   $range = Try-Pattern $element ([System.Windows.Automation.RangeValuePattern]::Pattern)
   $scrollItem = Try-Pattern $element ([System.Windows.Automation.ScrollItemPattern]::Pattern)
   $actions = New-Object System.Collections.ArrayList
+  $nativeActions = New-Object System.Collections.ArrayList
+  if ($null -ne $invoke) { [void]$nativeActions.Add('Invoke') }
+  if ($null -ne $selection) {
+    [void]$nativeActions.Add('Select'); [void]$nativeActions.Add('AddToSelection'); [void]$nativeActions.Add('RemoveFromSelection')
+  }
+  if ($null -ne $toggle) { [void]$nativeActions.Add('Toggle') }
+  if ($null -ne $expand) { [void]$nativeActions.Add('Expand'); [void]$nativeActions.Add('Collapse') }
+  if ($null -ne $range -and -not $range.Current.IsReadOnly) { [void]$nativeActions.Add('Increment'); [void]$nativeActions.Add('Decrement') }
+  if ($null -ne $scrollItem) { [void]$nativeActions.Add('ScrollIntoView') }
+  if ($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) { [void]$nativeActions.Add('SetValue') }
+  if ($element.Current.IsKeyboardFocusable) { [void]$nativeActions.Add('SetFocus') }
   if ($null -ne $invoke -or $null -ne $selection -or $null -ne $toggle -or $null -ne $expand) { [void]$actions.Add('press') }
   if ($element.Current.IsKeyboardFocusable) { [void]$actions.Add('focus') }
   if (($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) -or $type -eq 'Edit') { [void]$actions.Add('set_value') }
@@ -213,11 +250,20 @@ function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path) {
     id = Encode-ElementId $hwnd $path; source='windows-uia'; role=$type.ToLowerInvariant(); name=[string]$element.Current.Name
     value=$value; description=[string]$element.Current.HelpText; enabled=[bool]$element.Current.IsEnabled
     focused=[bool]$element.Current.HasKeyboardFocus; selected=if ($null -ne $selection) { [bool]$selection.Current.IsSelected } else { $false }
-    checked=$checked; expanded=$expanded; bounds=Get-UIABounds $element; actions=@($actions); nativeActions=@()
+    checked=$checked; expanded=$expanded; bounds=Get-UIABounds $element; actions=@($actions); nativeActions=@($nativeActions)
+    subrole=[string]$element.Current.ClassName; identifier=[string]$element.Current.AutomationId
+    placeholder=[string]$element.Current.ItemStatus; url=''; depth=$depth; framework=[string]$element.Current.FrameworkId
   }
 }
 function Get-UIAApplicationRoot($options) {
-  $requested = ([string]$options.application).ToLowerInvariant()
+  $requestedRaw = ([string]$options.application).ToLowerInvariant()
+  $requested = $requestedRaw
+  if ($requested.StartsWith('win32:')) { $requested = $requested.Substring(6) }
+  if ($requested.StartsWith('startapp:')) { $requested = $requested.Substring(9) }
+  if ($requestedRaw.StartsWith('startapp:')) {
+    $hwnd = [NativeComputer]::GetForegroundWindow().ToInt64()
+    return @{ hwnd=$hwnd; element=Get-RootElement $hwnd; applicationId=$requestedRaw }
+  }
   if (-not $requested) {
     $hwnd = [NativeComputer]::GetForegroundWindow().ToInt64()
     return @{ hwnd=$hwnd; element=Get-RootElement $hwnd }
@@ -227,9 +273,9 @@ function Get-UIAApplicationRoot($options) {
     $name = ([string]$candidate.Current.Name).ToLowerInvariant()
     $processName = ''
     try { $processName = ([Diagnostics.Process]::GetProcessById($candidate.Current.ProcessId).ProcessName).ToLowerInvariant() } catch {}
-    if ($name.Contains($requested) -or $processName.Contains($requested)) {
+    if ($name -eq $requested -or $processName -eq $requested -or $name.Contains($requested) -or $processName.Contains($requested)) {
       $hwnd = [long]$candidate.Current.NativeWindowHandle
-      return @{ hwnd=$hwnd; element=$candidate }
+      return @{ hwnd=$hwnd; element=$candidate; applicationId="win32:$processName" }
     }
   }
   throw "No Windows UI Automation application matches '$requested'."
@@ -240,15 +286,16 @@ function Get-UIAElements($options) {
   $root = $selected.element
   $max = if ($options.maxElements) { [Math]::Max(1,[Math]::Min(500,[int]$options.maxElements)) } else { 120 }
   $includeStatic = [bool]$options.includeStaticText
+  $includeContainers = [bool]$options.includeContainers
   $roleFilter = ([string]$options.role).ToLowerInvariant()
   $query = ([string]$(if ($options.query) { $options.query } else { $options.name })).ToLowerInvariant()
   $items = New-Object System.Collections.ArrayList
   function Walk-UIA($element, [int[]]$path, [int]$depth) {
     if ($depth -gt 20 -or $items.Count -ge $max) { return }
     $type = Get-ControlTypeName $element
-    $interesting = $InteractiveTypes -contains $type -or $element.Current.IsKeyboardFocusable -or ($includeStatic -and $StaticTypes -contains $type)
+    $interesting = $InteractiveTypes -contains $type -or $element.Current.IsKeyboardFocusable -or ($includeStatic -and $StaticTypes -contains $type) -or ($includeContainers -and $ContainerTypes -contains $type -and [string]$element.Current.Name)
     if ($depth -gt 0 -and $interesting) {
-      $info = Get-UIAElementInfo $element $hwnd $path
+      $info = Get-UIAElementInfo $element $hwnd $path $depth
       $searchable = "$($info.name) $($info.description) $($info.value)".ToLowerInvariant()
       if ((-not $roleFilter -or $info.role -eq $roleFilter) -and (-not $query -or $searchable.Contains($query))) { [void]$items.Add($info) }
     }
@@ -256,12 +303,33 @@ function Get-UIAElements($options) {
     for ($i=0; $i -lt $children.Count -and $items.Count -lt $max; $i++) { Walk-UIA $children[$i] @($path + $i) ($depth + 1) }
   }
   Walk-UIA $root @() 0
-  return @{ hwnd=$hwnd; application=[string]$root.Current.Name; elements=@($items) }
+  $processName = ''
+  try { $processName = ([Diagnostics.Process]::GetProcessById($root.Current.ProcessId).ProcessName).ToLowerInvariant() } catch {}
+  return @{ hwnd=$hwnd; application=[string]$root.Current.Name; applicationId=$(if ($processName) { "win32:$processName" } else { [string]$selected.applicationId }); elements=@($items) }
 }
 function Invoke-UIAElementAction($request) {
   $payload = Decode-ElementId ([string]$request.elementId)
   $element = Resolve-UIAElement $payload
   $action = [string]$request.action
+  if ($action.StartsWith('native:')) {
+    $nativeAction = $action.Substring(7)
+    switch ($nativeAction) {
+      'Invoke' { $pattern=Try-Pattern $element ([System.Windows.Automation.InvokePattern]::Pattern); if ($null -eq $pattern) { throw 'Invoke is no longer available.' }; $pattern.Invoke() }
+      'Select' { $pattern=Try-Pattern $element ([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($null -eq $pattern) { throw 'Select is no longer available.' }; $pattern.Select() }
+      'AddToSelection' { $pattern=Try-Pattern $element ([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($null -eq $pattern) { throw 'AddToSelection is no longer available.' }; $pattern.AddToSelection() }
+      'RemoveFromSelection' { $pattern=Try-Pattern $element ([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($null -eq $pattern) { throw 'RemoveFromSelection is no longer available.' }; $pattern.RemoveFromSelection() }
+      'Toggle' { $pattern=Try-Pattern $element ([System.Windows.Automation.TogglePattern]::Pattern); if ($null -eq $pattern) { throw 'Toggle is no longer available.' }; $pattern.Toggle() }
+      'Expand' { $pattern=Try-Pattern $element ([System.Windows.Automation.ExpandCollapsePattern]::Pattern); if ($null -eq $pattern) { throw 'Expand is no longer available.' }; $pattern.Expand() }
+      'Collapse' { $pattern=Try-Pattern $element ([System.Windows.Automation.ExpandCollapsePattern]::Pattern); if ($null -eq $pattern) { throw 'Collapse is no longer available.' }; $pattern.Collapse() }
+      'Increment' { $request.action='increment'; return Invoke-UIAElementAction $request }
+      'Decrement' { $request.action='decrement'; return Invoke-UIAElementAction $request }
+      'ScrollIntoView' { $request.action='scroll_into_view'; return Invoke-UIAElementAction $request }
+      'SetFocus' { $element.SetFocus() }
+      'SetValue' { $request.action='set_value'; return Invoke-UIAElementAction $request }
+      default { throw "Unsupported Windows UIA native action: $nativeAction" }
+    }
+    return @{ ok=$true; source='windows-uia'; action=$action }
+  }
   switch ($action) {
     'focus' { $element.SetFocus() }
     'set_value' {
@@ -341,6 +409,18 @@ try {
   $res = Get-Resolution $apiWidth
   $elementActionResult = $null
   if ($null -ne $request.elementAction) { $elementActionResult = Invoke-UIAElementAction $request.elementAction }
+  if ($request.targetApplication) {
+    $target = [string]$request.targetApplication
+    $needle = $target.ToLowerInvariant().Replace('win32:','')
+    $candidate = @(Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and ($_.ProcessName.ToLowerInvariant() -eq $needle -or $_.MainWindowTitle.ToLowerInvariant().Contains($needle)) } | Select-Object -First 1)
+    if ($candidate.Count -gt 0) {
+      [NativeComputer]::BringWindowToTop([IntPtr]$candidate[0].MainWindowHandle) | Out-Null
+      [NativeComputer]::SetForegroundWindow([IntPtr]$candidate[0].MainWindowHandle) | Out-Null
+    } elseif ($target.StartsWith('startapp:')) {
+      Start-Process explorer.exe "shell:AppsFolder\$($target.Substring(9))"
+      Start-Sleep -Milliseconds 600
+    } else { Start-Process $target; Start-Sleep -Milliseconds 600 }
+  }
   foreach ($a in @($request.actions)) {
     switch ([string]$a.action) {
       'screenshot' { }
@@ -380,6 +460,7 @@ try {
   if (@($request.actions).Count -gt 0 -or $null -ne $request.elementAction) { Start-Sleep -Milliseconds 180 }
   $listed = $null
   if ($request.includeElements) { $listed = Get-UIAElements $(if ($null -ne $request.elementOptions) { $request.elementOptions } else { [pscustomobject]@{} }) }
+  $applications = if ($request.listApplications) { @(Get-Applications) } else { $null }
   $point = New-Object NativeComputer+POINT; [NativeComputer]::GetCursorPos([ref]$point) | Out-Null
   $active = [NativeComputer]::GetForegroundWindow(); $activeTitle = if ($active -ne [IntPtr]::Zero) { Get-WindowTitle $active } else { '' }
   $shot = if ($request.includeScreenshot) { Capture-Screenshot $res } else { $null }
@@ -391,9 +472,11 @@ try {
     permissions=@{ interactiveDesktop=$true; elevated=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
     elementSource=if ($null -ne $listed) { 'windows-uia' } else { $null }
     elementApplication=if ($null -ne $listed) { $listed.application } else { $null }
+    elementApplicationId=if ($null -ne $listed) { $listed.applicationId } else { $null }
     elements=if ($null -ne $listed) { @($listed.elements) } else { $null }
     elementMessage=if ($null -ne $listed) { "Returned $(@($listed.elements).Count) Windows UI Automation elements." } else { $null }
     elementActionResult=$elementActionResult
+    applications=$applications
   }
   $response | ConvertTo-Json -Depth 12 -Compress
 } catch { Fail $_.Exception.Message }
