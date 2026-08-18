@@ -8,7 +8,7 @@
     "check": "node scripts/check.mjs",
     "doctor": "node bin/chatgpt-computer-control.js doctor",
     "setup": "node bin/chatgpt-computer-control.js setup",
-    "test": "node --test tests/install.test.js tests/tool-descriptors.test.js"
+    "test": "node --test tests/install.test.js tests/tool-descriptors.test.js tests/secure-input.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.2",
