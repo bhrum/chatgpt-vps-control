@@ -168,8 +168,21 @@ $InteractiveTypes = @('Button','CheckBox','ComboBox','Edit','Hyperlink','ListIte
 $StaticTypes = @('Header','Image','Text')
 $ContainerTypes = @('Custom','DataGrid','Group','List','Menu','Pane','Tab','Table','ToolBar','Tree','Window')
 
-function Encode-ElementId([long]$hwnd, [int[]]$path) {
-  $json = @{ source='windows-uia'; hwnd=$hwnd; path=@($path) } | ConvertTo-Json -Compress
+function Encode-ElementId([long]$hwnd, [int[]]$path, $element) {
+  $automationId = ''
+  $controlType = ''
+  $name = ''
+  $nativeHwnd = 0
+  $bounds = $null
+  try { $automationId = [string]$element.Current.AutomationId } catch {}
+  try { $controlType = [string]$element.Current.ControlType.ProgrammaticName } catch {}
+  try { $name = [string]$element.Current.Name } catch {}
+  try { $nativeHwnd = [long]$element.Current.NativeWindowHandle } catch {}
+  try {
+    $rect = $element.Current.BoundingRectangle
+    if (-not $rect.IsEmpty) { $bounds = @{ x=[int]$rect.X; y=[int]$rect.Y; width=[int]$rect.Width; height=[int]$rect.Height } }
+  } catch {}
+  $json = @{ source='windows-uia'; hwnd=$hwnd; path=@($path); automationId=$automationId; controlType=$controlType; name=$name; nativeHwnd=$nativeHwnd; bounds=$bounds } | ConvertTo-Json -Compress
   return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+','-').Replace('/','_')
 }
 function Decode-ElementId([string]$value) {
@@ -192,13 +205,75 @@ function Get-UIAChildren($element) {
   return @($items)
 }
 function Resolve-UIAElement($payload) {
-  $element = Get-RootElement ([long]$payload.hwnd)
-  foreach ($index in @($payload.path)) {
-    $children = @(Get-UIAChildren $element)
-    if ([int]$index -lt 0 -or [int]$index -ge $children.Count) { throw 'The Windows accessibility snapshot is stale; refresh computer_elements.' }
-    $element = $children[[int]$index]
+  $root = Get-RootElement ([long]$payload.hwnd)
+  $element = $root
+  $pathResolved = $true
+  try {
+    foreach ($index in @($payload.path)) {
+      $children = @(Get-UIAChildren $element)
+      if ([int]$index -lt 0 -or [int]$index -ge $children.Count) { $pathResolved = $false; break }
+      $element = $children[[int]$index]
+    }
+  } catch { $pathResolved = $false }
+
+  $automationId = [string]$payload.automationId
+  $controlType = [string]$payload.controlType
+  $name = [string]$payload.name
+  $nativeHwnd = [long]$payload.nativeHwnd
+  if ($nativeHwnd -ne 0) {
+    try {
+      $nativeElement = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$nativeHwnd)
+      if ($null -ne $nativeElement) {
+        $nativeMatches = $true
+        if ($automationId -and [string]$nativeElement.Current.AutomationId -ne $automationId) { $nativeMatches = $false }
+        if ($controlType -and [string]$nativeElement.Current.ControlType.ProgrammaticName -ne $controlType) { $nativeMatches = $false }
+        if ($name -and [string]$nativeElement.Current.Name -ne $name) { $nativeMatches = $false }
+        if ($nativeMatches) { return $nativeElement }
+      }
+    } catch {}
   }
-  return $element
+  if ($pathResolved) {
+    $identityMatches = $true
+    try {
+      if ($automationId -and [string]$element.Current.AutomationId -ne $automationId) { $identityMatches = $false }
+      if ($controlType -and [string]$element.Current.ControlType.ProgrammaticName -ne $controlType) { $identityMatches = $false }
+      if ($name -and [string]$element.Current.Name -ne $name) { $identityMatches = $false }
+    } catch { $identityMatches = $false }
+    if ($identityMatches) { return $element }
+  }
+
+  # Control-view paths can move between short-lived helper processes. When the
+  # provider exposes a stable AutomationId, recover the same semantic element
+  # inside the original window instead of acting on whatever now occupies the
+  # stale path.
+  if ($automationId) {
+    $idCondition = New-Object System.Windows.Automation.PropertyCondition(
+      [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+      $automationId
+    )
+    $matches = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $idCondition)
+    for ($i=0; $i -lt $matches.Count; $i++) {
+      $candidate = $matches.Item($i)
+      try {
+        if ((-not $controlType -or [string]$candidate.Current.ControlType.ProgrammaticName -eq $controlType) -and
+            (-not $name -or [string]$candidate.Current.Name -eq $name)) { return $candidate }
+      } catch {}
+    }
+  }
+  if ($name) {
+    $nameCondition = New-Object System.Windows.Automation.PropertyCondition(
+      [System.Windows.Automation.AutomationElement]::NameProperty,
+      $name
+    )
+    $matches = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $nameCondition)
+    for ($i=0; $i -lt $matches.Count; $i++) {
+      $candidate = $matches.Item($i)
+      try {
+        if (-not $controlType -or [string]$candidate.Current.ControlType.ProgrammaticName -eq $controlType) { return $candidate }
+      } catch {}
+    }
+  }
+  throw 'The Windows accessibility snapshot is stale; refresh computer_elements.'
 }
 function Get-ControlTypeName($element) {
   $programmatic = $element.Current.ControlType.ProgrammaticName
@@ -247,7 +322,7 @@ function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path, [int]$depth) {
   $checked = if ($null -ne $toggle) { $toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On } else { $null }
   $expanded = if ($null -ne $expand) { $expand.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Expanded } else { $null }
   return @{
-    id = Encode-ElementId $hwnd $path; source='windows-uia'; role=$type.ToLowerInvariant(); name=[string]$element.Current.Name
+    id = Encode-ElementId $hwnd $path $element; source='windows-uia'; role=$type.ToLowerInvariant(); name=[string]$element.Current.Name
     value=$value; description=[string]$element.Current.HelpText; enabled=[bool]$element.Current.IsEnabled
     focused=[bool]$element.Current.HasKeyboardFocus; selected=if ($null -ne $selection) { [bool]$selection.Current.IsSelected } else { $false }
     checked=$checked; expanded=$expanded; bounds=Get-UIABounds $element; actions=@($actions); nativeActions=@($nativeActions)
@@ -309,12 +384,31 @@ function Get-UIAElements($options) {
 }
 function Invoke-UIAElementAction($request) {
   $payload = Decode-ElementId ([string]$request.elementId)
-  $element = Resolve-UIAElement $payload
   $action = [string]$request.action
+  try { $element = Resolve-UIAElement $payload }
+  catch {
+    $bounds = $payload.bounds
+    $canClick = $null -ne $bounds -and [int]$bounds.width -gt 0 -and [int]$bounds.height -gt 0
+    $isPress = $action -eq 'press' -or $action -eq 'native:Invoke'
+    $isSetValue = $action -eq 'set_value' -or $action -eq 'native:SetValue'
+    if (-not $canClick -or (-not $isPress -and -not $isSetValue)) { throw }
+    $hwnd = [IntPtr][long]$payload.hwnd
+    [NativeComputer]::BringWindowToTop($hwnd) | Out-Null
+    [NativeComputer]::SetForegroundWindow($hwnd) | Out-Null
+    [NativeComputer]::SetCursorPos([int]$bounds.x + [int]([int]$bounds.width/2), [int]$bounds.y + [int]([int]$bounds.height/2)) | Out-Null
+    [NativeComputer]::Mouse([NativeComputer]::MOUSEEVENTF_LEFTDOWN,0); [NativeComputer]::Mouse([NativeComputer]::MOUSEEVENTF_LEFTUP,0)
+    if ($isSetValue) {
+      Start-Sleep -Milliseconds 80
+      Send-KeyChord 'ctrl+a'
+      Start-Sleep -Milliseconds 30
+      [NativeComputer]::UnicodeText([string]$request.value)
+    }
+    return @{ ok=$true; source='windows-uia-bounds-fallback'; action=$action }
+  }
   if ($action.StartsWith('native:')) {
     $nativeAction = $action.Substring(7)
     switch ($nativeAction) {
-      'Invoke' { $pattern=Try-Pattern $element ([System.Windows.Automation.InvokePattern]::Pattern); if ($null -eq $pattern) { throw 'Invoke is no longer available.' }; $pattern.Invoke() }
+      'Invoke' { $pattern=Try-Pattern $element ([System.Windows.Automation.InvokePattern]::Pattern); if ($null -eq $pattern) { $request.action='press'; return Invoke-UIAElementAction $request }; $pattern.Invoke() }
       'Select' { $pattern=Try-Pattern $element ([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($null -eq $pattern) { throw 'Select is no longer available.' }; $pattern.Select() }
       'AddToSelection' { $pattern=Try-Pattern $element ([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($null -eq $pattern) { throw 'AddToSelection is no longer available.' }; $pattern.AddToSelection() }
       'RemoveFromSelection' { $pattern=Try-Pattern $element ([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($null -eq $pattern) { throw 'RemoveFromSelection is no longer available.' }; $pattern.RemoveFromSelection() }

@@ -4,11 +4,24 @@
   "main": "src/index.js",
   "compatibility_date": "2026-08-18",
   "workers_dev": true,
+  "vars": {
+    "PUBLIC_ORIGIN": "https://chatgpt-mcp.371080.xyz"
+  },
+  "routes": [
+    {
+      "pattern": "chatgpt-mcp.371080.xyz",
+      "custom_domain": true
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
         "name": "DEVICE_REGISTRY",
         "class_name": "DeviceRegistry"
+      },
+      {
+        "name": "AUTH_STORE",
+        "class_name": "AuthStore"
       }
     ]
   },
@@ -16,6 +29,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["DeviceRegistry"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["AuthStore"]
     }
   ]
 }

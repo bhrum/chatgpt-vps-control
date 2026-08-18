@@ -285,7 +285,11 @@ def list_elements(request):
             continue
         if application and not selected_application:
             selected_application = app_name
-            selected_application_id = application_id if application_id else f"atspi:{normalized_name}"
+            selected_application_id = (
+                application_id
+                if application_id.startswith(("atspi:", "desktop:"))
+                else f"atspi:{normalized_name}"
+            )
         walk(app, [app_index], 0)
 
     return {

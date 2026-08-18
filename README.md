@@ -178,6 +178,16 @@ http://127.0.0.1:8787/mcp/<random-private-token>
 
 Keep the token private. It grants powerful local capabilities, including shell execution and computer input.
 
+### Sensitive input handoff
+
+The Cloudflare MCP can pause a remote computer task and render a private MCP Apps
+card in ChatGPT for passwords, OTPs, secrets, personal details, account choices,
+and explicit confirmations. Values are encrypted in the card to the selected
+device agent with ephemeral P-256 ECDH and AES-256-GCM. The central Worker and
+ChatGPT receive ciphertext and completion status only. Device steps use exact
+`{{fieldId}}` placeholders, challenges expire after five minutes, and every
+challenge is single-use.
+
 If the MCP client is not on the same machine, do **not** simply open port 8787 to the Internet. Put the loopback service behind an authenticated HTTPS tunnel, private network, VPN, or another transport you trust. The repository's existing OAuth flow can be used by ChatGPT-compatible clients; write/computer actions require `vps.write`, and read/screenshot/file inspection requires `vps.read` or the private static token.
 
 ## Dynamic multi-device gateway

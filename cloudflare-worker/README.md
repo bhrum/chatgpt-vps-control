@@ -5,13 +5,16 @@ Durable Object holds hibernatable outbound WebSockets from every computer.
 
 Required Wrangler secrets:
 
-- `MCP_PATH_TOKEN`: random private path segment used by the ChatGPT MCP URL.
+- `OAUTH_SETUP_TOKEN`: one-time bootstrap token for the password setup page.
+- `OAUTH_PASSWORD_PEPPER`: random server-side secret used to protect the stored password verifier.
 - `DEVICE_GATEWAY_TOKEN`: separate bearer token used only by device agents.
+- `MCP_PATH_TOKEN`: legacy private path segment kept temporarily during OAuth migration.
 
 Deploy from this directory:
 
 ```bash
-npx wrangler secret put MCP_PATH_TOKEN
+npx wrangler secret put OAUTH_SETUP_TOKEN
+npx wrangler secret put OAUTH_PASSWORD_PEPPER
 npx wrangler secret put DEVICE_GATEWAY_TOKEN
 npx wrangler deploy
 ```
@@ -19,8 +22,34 @@ npx wrangler deploy
 The resulting endpoints are:
 
 ```text
-https://chatgpt-device-control.<account>.workers.dev/mcp/<MCP_PATH_TOKEN>
+https://chatgpt-mcp.371080.xyz/mcp
 wss://chatgpt-device-control.<account>.workers.dev/agent
 ```
 
-Do not use the MCP path token as the agent token, and do not commit either.
+Open `https://chatgpt-mcp.371080.xyz/setup#token=<OAUTH_SETUP_TOKEN>` once to
+choose the control password. The fragment is not sent in HTTP requests; browser
+JavaScript sends it only in the setup request header. The password is stored as
+a salted HMAC-SHA256 verifier protected by a separate Worker secret. ChatGPT authorization uses OAuth 2.1 authorization
+code + PKCE, one-hour access tokens, and rotating 180-day refresh tokens.
+
+Use `https://chatgpt-mcp.371080.xyz/manage` to revoke all active access and
+refresh tokens. Do not commit any secret.
+
+## Private user input
+
+The MCP exposes an MCP Apps card for passwords, OTPs, API keys, personal data,
+account selections, consent, and other sensitive values:
+
+1. The model calls `render_sensitive_input` with non-sensitive field labels and
+   device steps containing exact `{{fieldId}}` placeholders.
+2. The user enters or selects values inside the ChatGPT card.
+3. The card encrypts the complete value map with an ephemeral P-256 ECDH key and
+   AES-256-GCM, bound to the one-time challenge ID.
+4. Only the selected device agent has the private key. It decrypts, substitutes
+   exact placeholders, runs the pre-registered steps, and returns status only.
+5. The card clears its controls and sends a value-free follow-up message so the
+   model continues from the new device state.
+
+Challenges expire after five minutes and are deleted before execution. Plaintext
+values are never returned in MCP content, structured content, logs, Durable
+Object storage, or conversation state.
