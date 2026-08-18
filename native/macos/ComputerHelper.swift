@@ -592,6 +592,14 @@ func runHelper() async {
     let shouldPrompt = request.doctor ?? false
     var permissions = await permissionSnapshot(prompt: shouldPrompt)
     if shouldPrompt && permissions.accessibility && !permissions.screenRecording {
+        // On current macOS releases SCScreenshotManager can be usable even
+        // while the legacy CoreGraphics preflight flag remains false. Probe
+        // the exact capture path this helper uses before reporting failure.
+        if await screenshotBase64() != nil {
+            permissions = Permissions(accessibility: true, screenRecording: true)
+        }
+    }
+    if shouldPrompt && permissions.accessibility && !permissions.screenRecording {
         // CGRequestScreenCaptureAccess schedules system UI asynchronously.
         // Keep the named app alive while the user opens System Settings and
         // toggles the permission, otherwise macOS can discard the pending UI.
