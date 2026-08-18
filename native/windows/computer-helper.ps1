@@ -172,10 +172,12 @@ function Encode-ElementId([long]$hwnd, [int[]]$path, $element) {
   $automationId = ''
   $controlType = ''
   $name = ''
+  $nativeHwnd = 0
   try { $automationId = [string]$element.Current.AutomationId } catch {}
   try { $controlType = [string]$element.Current.ControlType.ProgrammaticName } catch {}
   try { $name = [string]$element.Current.Name } catch {}
-  $json = @{ source='windows-uia'; hwnd=$hwnd; path=@($path); automationId=$automationId; controlType=$controlType; name=$name } | ConvertTo-Json -Compress
+  try { $nativeHwnd = [long]$element.Current.NativeWindowHandle } catch {}
+  $json = @{ source='windows-uia'; hwnd=$hwnd; path=@($path); automationId=$automationId; controlType=$controlType; name=$name; nativeHwnd=$nativeHwnd } | ConvertTo-Json -Compress
   return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+','-').Replace('/','_')
 }
 function Decode-ElementId([string]$value) {
@@ -212,6 +214,19 @@ function Resolve-UIAElement($payload) {
   $automationId = [string]$payload.automationId
   $controlType = [string]$payload.controlType
   $name = [string]$payload.name
+  $nativeHwnd = [long]$payload.nativeHwnd
+  if ($nativeHwnd -ne 0) {
+    try {
+      $nativeElement = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$nativeHwnd)
+      if ($null -ne $nativeElement) {
+        $nativeMatches = $true
+        if ($automationId -and [string]$nativeElement.Current.AutomationId -ne $automationId) { $nativeMatches = $false }
+        if ($controlType -and [string]$nativeElement.Current.ControlType.ProgrammaticName -ne $controlType) { $nativeMatches = $false }
+        if ($name -and [string]$nativeElement.Current.Name -ne $name) { $nativeMatches = $false }
+        if ($nativeMatches) { return $nativeElement }
+      }
+    } catch {}
+  }
   if ($pathResolved) {
     $identityMatches = $true
     try {
