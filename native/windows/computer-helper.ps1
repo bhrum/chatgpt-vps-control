@@ -227,7 +227,9 @@ function Resolve-UIAElement($payload) {
       [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
       $automationId
     )
-    foreach ($candidate in @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $idCondition))) {
+    $matches = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $idCondition)
+    for ($i=0; $i -lt $matches.Count; $i++) {
+      $candidate = $matches.Item($i)
       try {
         if (-not $controlType -or [string]$candidate.Current.ControlType.ProgrammaticName -eq $controlType) { return $candidate }
       } catch {}
