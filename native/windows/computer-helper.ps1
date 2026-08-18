@@ -171,9 +171,11 @@ $ContainerTypes = @('Custom','DataGrid','Group','List','Menu','Pane','Tab','Tabl
 function Encode-ElementId([long]$hwnd, [int[]]$path, $element) {
   $automationId = ''
   $controlType = ''
+  $name = ''
   try { $automationId = [string]$element.Current.AutomationId } catch {}
   try { $controlType = [string]$element.Current.ControlType.ProgrammaticName } catch {}
-  $json = @{ source='windows-uia'; hwnd=$hwnd; path=@($path); automationId=$automationId; controlType=$controlType } | ConvertTo-Json -Compress
+  try { $name = [string]$element.Current.Name } catch {}
+  $json = @{ source='windows-uia'; hwnd=$hwnd; path=@($path); automationId=$automationId; controlType=$controlType; name=$name } | ConvertTo-Json -Compress
   return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+','-').Replace('/','_')
 }
 function Decode-ElementId([string]$value) {
@@ -209,11 +211,13 @@ function Resolve-UIAElement($payload) {
 
   $automationId = [string]$payload.automationId
   $controlType = [string]$payload.controlType
+  $name = [string]$payload.name
   if ($pathResolved) {
     $identityMatches = $true
     try {
       if ($automationId -and [string]$element.Current.AutomationId -ne $automationId) { $identityMatches = $false }
       if ($controlType -and [string]$element.Current.ControlType.ProgrammaticName -ne $controlType) { $identityMatches = $false }
+      if ($name -and [string]$element.Current.Name -ne $name) { $identityMatches = $false }
     } catch { $identityMatches = $false }
     if ($identityMatches) { return $element }
   }
@@ -228,6 +232,20 @@ function Resolve-UIAElement($payload) {
       $automationId
     )
     $matches = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $idCondition)
+    for ($i=0; $i -lt $matches.Count; $i++) {
+      $candidate = $matches.Item($i)
+      try {
+        if ((-not $controlType -or [string]$candidate.Current.ControlType.ProgrammaticName -eq $controlType) -and
+            (-not $name -or [string]$candidate.Current.Name -eq $name)) { return $candidate }
+      } catch {}
+    }
+  }
+  if ($name) {
+    $nameCondition = New-Object System.Windows.Automation.PropertyCondition(
+      [System.Windows.Automation.AutomationElement]::NameProperty,
+      $name
+    )
+    $matches = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $nameCondition)
     for ($i=0; $i -lt $matches.Count; $i++) {
       $candidate = $matches.Item($i)
       try {
