@@ -17,7 +17,7 @@ printf '%s' '{"apiWidth":1280,"actions":[],"includeScreenshot":false,"includeWin
 /usr/bin/open -n -W "$APP_ROOT" --args --request-file "$REQUEST_FILE" --response-file "$RESPONSE_FILE"
 python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); assert data["ok"] is True; assert "permissions" in data' "$RESPONSE_FILE"
 APPLICATIONS=$(printf '%s' '{"apiWidth":1280,"actions":[],"includeScreenshot":false,"includeWindows":false,"listApplications":true}' | "$EXECUTABLE")
-python3 -c 'import json,sys; data=json.load(sys.stdin); apps=data.get("applications", []); assert data["ok"] is True; assert apps; assert all({"id", "displayName", "path", "isRunning", "pid"} <= set(app) for app in apps)' <<<"$APPLICATIONS"
+python3 -c 'import json,sys; data=json.load(sys.stdin); apps=data.get("applications", []); assert data["ok"] is True; assert isinstance(apps, list); assert all({"id", "displayName", "path", "isRunning", "pid"} <= set(app) for app in apps)' <<<"$APPLICATIONS"
 SEMANTIC=$(printf '%s' '{"apiWidth":1280,"actions":[],"includeScreenshot":false,"includeWindows":false,"includeElements":true,"elementOptions":{"maxElements":20}}' | "$EXECUTABLE")
 python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True or "Accessibility permission" in data.get("error", "")' <<<"$SEMANTIC"
 echo 'macOS named app bundle/signature/LaunchServices/protocol/permission-boundary smoke passed.'
