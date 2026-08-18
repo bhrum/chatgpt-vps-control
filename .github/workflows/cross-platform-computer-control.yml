@@ -29,7 +29,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Compile and probe macOS native helper
-        run: bash scripts/macos-helper-smoke.sh
+        run: bash scripts/macos-app-smoke.sh
+      - name: Upload macOS app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt-computer-control-macos
+          path: ${{ runner.temp }}/ChatGPT Computer Control.app
+          if-no-files-found: error
+          retention-days: 3
 
   windows-native-helper:
     runs-on: windows-latest

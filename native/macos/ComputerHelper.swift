@@ -29,6 +29,7 @@ struct ElementOptions: Codable {
     let query: String?
     let name: String?
     let application: String?
+    let includeContainers: Bool?
 }
 struct ElementActionRequest: Codable { let elementId: String; let action: String; let value: String? }
 struct Request: Codable {
@@ -40,8 +41,18 @@ struct Request: Codable {
     let includeElements: Bool?
     let elementOptions: ElementOptions?
     let elementAction: ElementActionRequest?
+    let listApplications: Bool?
+    let targetApplication: String?
 }
 struct Permissions: Codable { let accessibility: Bool; let screenRecording: Bool }
+struct ApplicationInfo: Codable {
+    let id: String
+    let displayName: String
+    let path: String
+    let isRunning: Bool
+    let pid: Int?
+}
+final class ApplicationLaunchResult: @unchecked Sendable { var error: Error? }
 struct ElementInfo: Codable {
     let id: String
     let source: String
@@ -49,6 +60,11 @@ struct ElementInfo: Codable {
     let name: String
     let value: String
     let description: String
+    let subrole: String
+    let identifier: String
+    let placeholder: String
+    let url: String
+    let depth: Int
     let enabled: Bool
     let focused: Bool
     let selected: Bool
@@ -72,16 +88,30 @@ struct Response: Codable {
     var permissions: Permissions? = nil
     var elementSource: String? = nil
     var elementApplication: String? = nil
+    var elementApplicationId: String? = nil
     var elements: [ElementInfo]? = nil
     var elementMessage: String? = nil
     var elementActionResult: ElementActionResult? = nil
+    var applications: [ApplicationInfo]? = nil
 }
+
+let processArguments = CommandLine.arguments
+func argumentValue(_ name: String) -> String? {
+    guard let index = processArguments.firstIndex(of: name), index + 1 < processArguments.count else { return nil }
+    return processArguments[index + 1]
+}
+let responseFile = argumentValue("--response-file")
 
 func emit(_ response: Response) -> Never {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.withoutEscapingSlashes]
     let data = try! encoder.encode(response)
-    FileHandle.standardOutput.write(data)
+    if let responseFile {
+        do { try data.write(to: URL(fileURLWithPath: responseFile), options: .atomic) }
+        catch { FileHandle.standardError.write(Data("could not write response: \(error)".utf8)); exit(1) }
+    } else {
+        FileHandle.standardOutput.write(data)
+    }
     exit(0)
 }
 
@@ -251,6 +281,76 @@ func activeWindow() -> WindowInfo? {
     return WindowInfo(id: String(app.processIdentifier), name: app.localizedName ?? app.bundleIdentifier ?? "")
 }
 
+func installedApplications() -> [ApplicationInfo] {
+    var byIdentifier: [String: ApplicationInfo] = [:]
+    for app in NSWorkspace.shared.runningApplications {
+        let identifier = app.bundleIdentifier ?? "pid:\(app.processIdentifier)"
+        byIdentifier[identifier] = ApplicationInfo(
+            id: identifier,
+            displayName: app.localizedName ?? identifier,
+            path: app.bundleURL?.path ?? "",
+            isRunning: true,
+            pid: Int(app.processIdentifier)
+        )
+    }
+
+    let roots = ["/Applications", "/System/Applications", FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path]
+    for root in roots {
+        guard let enumerator = FileManager.default.enumerator(at: URL(fileURLWithPath: root), includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { continue }
+        for case let url as URL in enumerator {
+            guard url.pathExtension.lowercased() == "app", let bundle = Bundle(url: url) else { continue }
+            let identifier = bundle.bundleIdentifier ?? url.deletingPathExtension().lastPathComponent
+            if byIdentifier[identifier] == nil {
+                let displayName = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+                    ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
+                    ?? url.deletingPathExtension().lastPathComponent
+                byIdentifier[identifier] = ApplicationInfo(id: identifier, displayName: displayName, path: url.path, isRunning: false, pid: nil)
+            }
+            enumerator.skipDescendants()
+            if byIdentifier.count >= 300 { break }
+        }
+    }
+    return byIdentifier.values.sorted {
+        if $0.isRunning != $1.isRunning { return $0.isRunning && !$1.isRunning }
+        return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+    }
+}
+
+func resolveRunningApplication(_ requested: String) -> NSRunningApplication? {
+    let needle = requested.lowercased()
+    let candidates = NSWorkspace.shared.runningApplications
+    if let exact = candidates.first(where: { ($0.bundleIdentifier ?? "").lowercased() == needle }) { return exact }
+    if let exact = candidates.first(where: { ($0.localizedName ?? "").lowercased() == needle }) { return exact }
+    return candidates.first {
+        "\($0.localizedName ?? "") \($0.bundleIdentifier ?? "")".lowercased().contains(needle)
+    }
+}
+
+func activateApplication(_ requested: String) {
+    if let running = resolveRunningApplication(requested) {
+        running.activate(options: [])
+        return
+    }
+    let known = installedApplications().first {
+        $0.id.caseInsensitiveCompare(requested) == .orderedSame || $0.displayName.caseInsensitiveCompare(requested) == .orderedSame
+    }
+    let url: URL?
+    if let known, !known.path.isEmpty { url = URL(fileURLWithPath: known.path) }
+    else { url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: requested) }
+    guard let url else { fail("Application not found: \(requested)") }
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.activates = true
+    let semaphore = DispatchSemaphore(value: 0)
+    let result = ApplicationLaunchResult()
+    NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
+        result.error = error
+        semaphore.signal()
+    }
+    _ = semaphore.wait(timeout: .now() + 10)
+    if let launchError = result.error { fail("Unable to launch \(requested): \(launchError.localizedDescription)") }
+    usleep(500_000)
+}
+
 func perform(_ action: Action, display: Resolution, api: Resolution) {
     switch action.action {
     case "screenshot": return
@@ -382,7 +482,7 @@ func semanticActions(_ element: AXUIElement, role: String, native: [String]) -> 
     return Array(NSOrderedSet(array: result)) as? [String] ?? result
 }
 
-func axElementInfo(_ element: AXUIElement, pid: pid_t, path: [Int]) -> ElementInfo {
+func axElementInfo(_ element: AXUIElement, pid: pid_t, path: [Int], depth: Int) -> ElementInfo {
     let role = axString(element, kAXRoleAttribute as CFString)
     let native = axActions(element)
     let rawValue = axString(element, kAXValueAttribute as CFString)
@@ -392,28 +492,30 @@ func axElementInfo(_ element: AXUIElement, pid: pid_t, path: [Int]) -> ElementIn
         id: axEncodeElementId(pid: pid, path: path), source: "macos-ax", role: role,
         name: axString(element, kAXTitleAttribute as CFString).isEmpty ? axString(element, kAXDescriptionAttribute as CFString) : axString(element, kAXTitleAttribute as CFString),
         value: String(rawValue.prefix(4000)), description: String(axString(element, kAXHelpAttribute as CFString).prefix(1000)),
+        subrole: axString(element, kAXSubroleAttribute as CFString),
+        identifier: axString(element, kAXIdentifierAttribute as CFString),
+        placeholder: axString(element, kAXPlaceholderValueAttribute as CFString),
+        url: String(axString(element, kAXURLAttribute as CFString).prefix(4000)), depth: depth,
         enabled: axBool(element, kAXEnabledAttribute as CFString, default: true),
         focused: axBool(element, kAXFocusedAttribute as CFString), selected: axBool(element, kAXSelectedAttribute as CFString),
         checked: checked, expanded: expanded, bounds: axRect(element), actions: semanticActions(element, role: role, native: native), nativeActions: native
     )
 }
 
-func listAXElements(options: ElementOptions?) -> (application: String, elements: [ElementInfo]) {
+func listAXElements(options: ElementOptions?) -> (application: String, applicationId: String, elements: [ElementInfo]) {
     let requestedApplication = (options?.application ?? "").lowercased()
     let app: NSRunningApplication?
     if requestedApplication.isEmpty {
         app = NSWorkspace.shared.frontmostApplication
     } else {
-        app = NSWorkspace.shared.runningApplications.first { candidate in
-            let searchable = "\(candidate.localizedName ?? "") \(candidate.bundleIdentifier ?? "")".lowercased()
-            return searchable.contains(requestedApplication)
-        }
+        app = resolveRunningApplication(requestedApplication)
     }
-    guard let app else { return ("", []) }
+    guard let app else { return ("", "", []) }
     let pid = app.processIdentifier
     let root = AXUIElementCreateApplication(pid)
     let maximum = max(1, min(options?.maxElements ?? 120, 500))
     let includeStatic = options?.includeStaticText ?? false
+    let includeContainers = options?.includeContainers ?? false
     let roleFilter = (options?.role ?? "").lowercased()
     let query = (options?.query ?? options?.name ?? "").lowercased()
     var result: [ElementInfo] = []
@@ -421,10 +523,11 @@ func listAXElements(options: ElementOptions?) -> (application: String, elements:
     func walk(_ element: AXUIElement, path: [Int], depth: Int) {
         if depth > 20 || result.count >= maximum { return }
         let role = axString(element, kAXRoleAttribute as CFString)
-        let interesting = axInteractiveRoles.contains(role) || axBool(element, kAXFocusedAttribute as CFString) || (includeStatic && axStaticRoles.contains(role))
+        let hasIdentity = !axString(element, kAXTitleAttribute as CFString).isEmpty || !axString(element, kAXDescriptionAttribute as CFString).isEmpty || !axString(element, kAXIdentifierAttribute as CFString).isEmpty
+        let interesting = axInteractiveRoles.contains(role) || axBool(element, kAXFocusedAttribute as CFString) || (includeStatic && axStaticRoles.contains(role)) || (includeContainers && hasIdentity)
         if depth > 0 && interesting {
-            let info = axElementInfo(element, pid: pid, path: path)
-            let searchable = "\(info.name) \(info.description) \(info.value)".lowercased()
+            let info = axElementInfo(element, pid: pid, path: path, depth: depth)
+            let searchable = "\(info.name) \(info.description) \(info.value) \(info.placeholder) \(info.url) \(info.identifier)".lowercased()
             if (roleFilter.isEmpty || info.role.lowercased() == roleFilter) && (query.isEmpty || searchable.contains(query)) { result.append(info) }
         }
         for (index, child) in axChildren(element).prefix(500).enumerated() {
@@ -433,7 +536,7 @@ func listAXElements(options: ElementOptions?) -> (application: String, elements:
         }
     }
     walk(root, path: [], depth: 0)
-    return (app.localizedName ?? app.bundleIdentifier ?? "", result)
+    return (app.localizedName ?? app.bundleIdentifier ?? "", app.bundleIdentifier ?? "", result)
 }
 
 func performAXElementAction(_ request: ElementActionRequest) -> ElementActionResult {
@@ -449,6 +552,10 @@ func performAXElementAction(_ request: ElementActionRequest) -> ElementActionRes
     case "scroll_into_view":
         error = AXUIElementPerformAction(element, "AXScrollToVisible" as CFString)
         if error != .success { error = AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) }
+    case let native where native.hasPrefix("native:"):
+        let nativeAction = String(native.dropFirst("native:".count))
+        guard axActions(element).contains(nativeAction) else { fail("Element does not expose native accessibility action \(nativeAction)") }
+        error = AXUIElementPerformAction(element, nativeAction as CFString)
     default: fail("Unsupported macOS element action: \(action)")
     }
     if error != .success { fail("macOS accessibility action \(action) failed with AXError \(error.rawValue)") }
@@ -456,12 +563,20 @@ func performAXElementAction(_ request: ElementActionRequest) -> ElementActionRes
 }
 
 func runHelper() async {
-    let input = FileHandle.standardInput.readDataToEndOfFile()
+    let input: Data
+    if let requestFile = argumentValue("--request-file") {
+        do { input = try Data(contentsOf: URL(fileURLWithPath: requestFile)) }
+        catch { fail("could not read request: \(error)") }
+    } else {
+        input = FileHandle.standardInput.readDataToEndOfFile()
+    }
     guard let request = try? JSONDecoder().decode(Request.self, from: input) else { fail("invalid JSON request") }
     let apiWidth = max(320, request.apiWidth ?? 1280)
     let resolutions = mainResolution(apiWidth: apiWidth)
     let shouldPrompt = request.doctor ?? false
     let permissions = Permissions(accessibility: accessibilityAllowed(prompt: shouldPrompt), screenRecording: screenRecordingAllowed(prompt: shouldPrompt))
+
+    if let target = request.targetApplication, !target.isEmpty { activateApplication(target) }
 
     if (!(request.actions ?? []).isEmpty || request.includeElements == true || request.elementAction != nil) && !permissions.accessibility {
         fail("Accessibility permission is required. Enable this helper in System Settings > Privacy & Security > Accessibility.")
@@ -472,10 +587,12 @@ func runHelper() async {
     if !(request.actions ?? []).isEmpty || request.elementAction != nil { usleep(180_000) }
 
     var elementApplication: String? = nil
+    var elementApplicationId: String? = nil
     var elements: [ElementInfo]? = nil
     if request.includeElements == true {
         let listed = listAXElements(options: request.elementOptions)
         elementApplication = listed.application
+        elementApplicationId = listed.applicationId
         elements = listed.elements
     }
 
@@ -495,9 +612,11 @@ func runHelper() async {
         permissions: permissions,
         elementSource: request.includeElements == true ? "macos-ax" : nil,
         elementApplication: elementApplication,
+        elementApplicationId: elementApplicationId,
         elements: elements,
         elementMessage: elements == nil ? nil : "Returned \(elements!.count) macOS accessibility elements.",
-        elementActionResult: elementActionResult
+        elementActionResult: elementActionResult,
+        applications: request.listApplications == true ? installedApplications() : nil
     ))
 }
 
