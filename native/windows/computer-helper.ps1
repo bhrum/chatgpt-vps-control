@@ -31,6 +31,7 @@ public static class NativeComputer {
   [DllImport("user32.dll", SetLastError=true)] public static extern bool MoveWindow(IntPtr hWnd, int x, int y, int width, int height, bool repaint);
   [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode, EntryPoint="SendMessageW")] public static extern IntPtr SendMessageText(IntPtr hWnd, uint message, IntPtr wParam, StringBuilder lParam);
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
@@ -52,6 +53,8 @@ public static class NativeComputer {
   public const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
   public const uint MOUSEEVENTF_WHEEL = 0x0800;
   public const uint MOUSEEVENTF_HWHEEL = 0x01000;
+  public const uint WM_GETTEXT = 0x000D;
+  public const uint WM_GETTEXTLENGTH = 0x000E;
   public const uint EM_SETSEL = 0x00B1;
   public const uint EM_SCROLLCARET = 0x00B7;
 
@@ -183,10 +186,14 @@ function Get-WindowTitle([IntPtr]$hwnd) {
   return $sb.ToString()
 }
 function Get-NativeControlText([IntPtr]$hwnd) {
-  $length = [Math]::Max(0, [NativeComputer]::GetWindowTextLength($hwnd))
-  $capacity = [Math]::Min(1048577, $length + 1)
+  # GetWindowText intentionally does not retrieve child-control text from a
+  # different process. For a previously verified native Edit HWND, use the
+  # standard control messages instead.
+  $length = [int][NativeComputer]::SendMessage($hwnd, [NativeComputer]::WM_GETTEXTLENGTH, [IntPtr]::Zero, [IntPtr]::Zero)
+  $length = [Math]::Max(0, [Math]::Min(1048576, $length))
+  $capacity = $length + 1
   $sb = New-Object System.Text.StringBuilder $capacity
-  [NativeComputer]::GetWindowText($hwnd, $sb, $sb.Capacity) | Out-Null
+  [NativeComputer]::SendMessageText($hwnd, [NativeComputer]::WM_GETTEXT, [IntPtr]$capacity, $sb) | Out-Null
   return $sb.ToString()
 }
 function Get-VisibleWindows {
