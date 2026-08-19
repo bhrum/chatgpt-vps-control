@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { WebSocketServer } from "ws";
 import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CdpClient } from "../lib/browser-accessibility.js";
 import { browserSessionUtility, listBrowserSessions, resolveBrowserUploadFiles, sanitizeBrowserPdfName, startBrowserSession } from "../lib/browser-session.js";
 
 const extensionHomeForTests = await mkdtemp(join(tmpdir(), "browser-extension-empty-"));
@@ -13,6 +15,32 @@ test.after(async () => {
   if (originalExtensionHome === undefined) delete process.env.COMPUTER_BROWSER_EXTENSION_HOME;
   else process.env.COMPUTER_BROWSER_EXTENSION_HOME = originalExtensionHome;
   await rm(extensionHomeForTests, { recursive: true, force: true });
+});
+
+
+test("raw CDP transport routes commands to flattened child sessions", async () => {
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await new Promise((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
+  const received = [];
+  server.on("connection", (socket) => {
+    socket.on("message", (raw) => {
+      const message = JSON.parse(String(raw));
+      received.push(message);
+      socket.send(JSON.stringify({ id: message.id, sessionId: message.sessionId, result: { ok: true } }));
+    });
+  });
+  const address = server.address();
+  const client = new CdpClient(`ws://127.0.0.1:${address.port}/devtools/page/test`);
+  try {
+    assert.deepEqual(await client.sendSession("child-session-1", "Runtime.evaluate", { expression: "1+1" }), { ok: true });
+    assert.equal(received.length, 1);
+    assert.equal(received[0].sessionId, "child-session-1");
+    assert.equal(received[0].method, "Runtime.evaluate");
+    assert.deepEqual(received[0].params, { expression: "1+1" });
+  } finally {
+    client.close();
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("isolated browser sessions reject privileged and script URL schemes before launch", async () => {

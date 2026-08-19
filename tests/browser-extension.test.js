@@ -6,6 +6,7 @@ import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
+  ExtensionCdpClient,
   browserExtensionRequest,
   listBrowserExtensionConnections,
   startBrowserExtensionBridge,
@@ -104,6 +105,15 @@ test("private browser bridge authenticates native hosts and correlates extension
     const request = await waitFor(() => client.messages.find((message) => message.type === "request"));
     client.socket.write(`${JSON.stringify({ type: "response", requestId: request.requestId, ok: true, result: { enabled: true } })}\n`);
     assert.deepEqual(await pending, { enabled: true });
+
+    const extensionCdp = new ExtensionCdpClient("instance-test-123", "7");
+    const childPending = extensionCdp.sendSession("child-session-7", "Runtime.evaluate", { expression: "document.title" });
+    const childRequest = await waitFor(() => client.messages.find((message) => message.type === "request" && message.params?.sessionId === "child-session-7"));
+    assert.equal(childRequest.params.targetId, "7");
+    assert.equal(childRequest.params.method, "Runtime.evaluate");
+    client.socket.write(`${JSON.stringify({ type: "response", requestId: childRequest.requestId, ok: true, result: { result: { value: "child-frame" } } })}\n`);
+    assert.equal((await childPending).result.value, "child-frame");
+
     client.onMessage((message) => {
       if (message.type !== "request") return;
       let result = {};
@@ -174,6 +184,7 @@ test("packaged extension contains no remotely hosted executable code", async () 
   assert.doesNotMatch(background, /eval\s*\(|new Function\s*\(|https?:\/\/.*\.js/i);
   assert.match(background, /claim_tab/);
   assert.match(background, /chrome\.debugger\.sendCommand/);
+  assert.match(background, /sessionId/);
   assert.match(background, /chrome\.storage\.session/);
   assert.match(background, /onCreatedNavigationTarget/);
   assert.match(background, /ensureAutomationGroup/);

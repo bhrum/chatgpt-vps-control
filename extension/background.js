@@ -215,7 +215,7 @@ async function handleCommand(command, params) {
   }
   if (command === "cdp") {
     const { id } = await requireClaimedTab(params.targetId);
-    const target = { tabId: id };
+    const target = { tabId: id, ...(params.sessionId ? { sessionId: String(params.sessionId) } : {}) };
     await ensureDebugger(id);
     return withDebuggerLock(id, () => chrome.debugger.sendCommand(target, String(params.method), params.params || {}));
   }
