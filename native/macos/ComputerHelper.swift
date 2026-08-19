@@ -223,6 +223,21 @@ struct ApplicationInfo: Codable {
     let pid: Int?
     let lastUsedDate: String?
     let useCount: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case id, displayName, path, isRunning, pid, lastUsedDate, useCount
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(displayName, forKey: .displayName)
+        try container.encode(path, forKey: .path)
+        try container.encode(isRunning, forKey: .isRunning)
+        if let pid { try container.encode(pid, forKey: .pid) } else { try container.encodeNil(forKey: .pid) }
+        if let lastUsedDate { try container.encode(lastUsedDate, forKey: .lastUsedDate) } else { try container.encodeNil(forKey: .lastUsedDate) }
+        if let useCount { try container.encode(useCount, forKey: .useCount) } else { try container.encodeNil(forKey: .useCount) }
+    }
 }
 final class ApplicationLaunchResult: @unchecked Sendable { var error: Error? }
 struct ElementInfo: Codable {
