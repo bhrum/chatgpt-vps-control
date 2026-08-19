@@ -140,7 +140,13 @@ public sealed class UIASettleSubscription : IDisposable {
   }
 }
 "@
-Add-Type -TypeDefinition $signature -ReferencedAssemblies @('System.dll','System.Core.dll','UIAutomationClient.dll','UIAutomationTypes.dll')
+$references = @(
+  [System.Uri].Assembly.Location,
+  [System.Linq.Enumerable].Assembly.Location,
+  [System.Windows.Automation.AutomationElement].Assembly.Location,
+  [System.Windows.Automation.AutomationIdentifier].Assembly.Location
+) | Where-Object { $_ } | Sort-Object -Unique
+Add-Type -TypeDefinition $signature -ReferencedAssemblies $references
 [NativeComputer]::SetProcessDPIAware() | Out-Null
 
 function Fail($message) {
