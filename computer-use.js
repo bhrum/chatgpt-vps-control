@@ -1527,7 +1527,7 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
     {
       name: "computer_browser_utility",
       title: "Browser utilities",
-      description: "Use an exact claimed tab in a managed, attached, or extension-connected browser session for live DOM/text/PDF export, clipboard access, buffered developer logs, JavaScript dialogs, and supported download tracking.",
+      description: "Use an exact claimed tab in a managed, attached, or extension-connected browser session for live DOM/text/PDF export, clipboard access (which may activate the claimed tab when browser focus is required), buffered developer logs, JavaScript dialogs, and supported download tracking.",
       inputSchema: {
         type: "object",
         properties: {
