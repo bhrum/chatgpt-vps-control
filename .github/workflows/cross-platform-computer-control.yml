@@ -62,7 +62,7 @@ jobs:
       - name: Install X11, AT-SPI, and GTK test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xdotool ffmpeg x11-utils x11-xserver-utils xvfb x11vnc xfwm4 dbus-x11 at-spi2-core python3-pyatspi gir1.2-atspi-2.0 libglib2.0-bin python3-gi gir1.2-gtk-3.0
+          sudo apt-get install -y xdotool wmctrl ffmpeg x11-utils x11-xserver-utils xvfb x11vnc xfwm4 dbus-x11 at-spi2-core python3-pyatspi gir1.2-atspi-2.0 libglib2.0-bin python3-gi gir1.2-gtk-3.0
           google-chrome --version
       - name: Configure managed headless desktop
         shell: bash
@@ -78,7 +78,7 @@ jobs:
           for i in $(seq 1 120); do curl -fsS http://127.0.0.1:18995/health >/dev/null && break; sleep 0.1; done
           TOKEN=$(awk -F= '$1=="VPS_APP_TOKEN"{print $2}' "$RUNNER_TEMP/computer-control/.env")
           MCP_SMOKE_TOKEN="$TOKEN" MCP_SMOKE_PORT=18995 node scripts/mcp-smoke.mjs
-          MCP_SMOKE_TOKEN="$TOKEN" MCP_SMOKE_PORT=18995 MCP_SMOKE_CDP_ENDPOINT=http://127.0.0.1:9222 MCP_SMOKE_LAUNCH_CHROME=1 MCP_SMOKE_ATSPI=1 node scripts/semantic-mcp-smoke.mjs
+          MCP_SMOKE_TOKEN="$TOKEN" MCP_SMOKE_PORT=18995 MCP_SMOKE_CDP_ENDPOINT=http://127.0.0.1:9222 MCP_SMOKE_LAUNCH_CHROME=1 MCP_SMOKE_ATSPI=1 MCP_SMOKE_BROWSER_SESSION=1 node scripts/semantic-mcp-smoke.mjs
       - if: always()
         shell: bash
         run: |

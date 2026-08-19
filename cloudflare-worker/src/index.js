@@ -6,6 +6,9 @@ const DEFAULT_CALL_TIMEOUT_SECONDS = 120;
 const MAX_MESSAGE_BYTES = 32 * 1024 * 1024;
 const SENSITIVE_INPUT_TTL_SECONDS = 5 * 60;
 const SENSITIVE_INPUT_RESOURCE_URI = "ui://widget/sensitive-input-v1.html";
+const MAX_DEVICE_TOOLS = 100;
+const MAX_TOOL_DESCRIPTOR_BYTES = 64 * 1024;
+const MAX_TOOL_CATALOG_BYTES = 512 * 1024;
 
 function json(value, status = 200, headers = {}) {
   return new Response(JSON.stringify(value), {
@@ -26,6 +29,41 @@ function validDeviceId(value) {
   return typeof value === "string" && /^[a-zA-Z0-9._-]{1,128}$/.test(value);
 }
 
+function publicToolDescriptor(tool) {
+  const name = String(tool?.name || "");
+  if (!/^[a-zA-Z0-9._-]{1,128}$/u.test(name) || name === "secure_input_submit") return null;
+  const descriptor = {
+    name,
+    ...(tool.title ? { title: String(tool.title).slice(0, 300) } : {}),
+    ...(tool.description ? { description: String(tool.description).slice(0, 12_000) } : {}),
+    ...(tool.inputSchema && typeof tool.inputSchema === "object" ? { inputSchema: tool.inputSchema } : {}),
+    ...(tool.outputSchema && typeof tool.outputSchema === "object" ? { outputSchema: tool.outputSchema } : {}),
+    ...(tool.annotations && typeof tool.annotations === "object" ? { annotations: tool.annotations } : {}),
+  };
+  return new TextEncoder().encode(JSON.stringify(descriptor)).byteLength <= MAX_TOOL_DESCRIPTOR_BYTES ? descriptor : null;
+}
+
+function normalizeToolCatalog(tools, capabilities) {
+  const allowed = new Set((Array.isArray(capabilities) ? capabilities : []).map(String));
+  const result = [];
+  let totalBytes = 0;
+  for (const raw of Array.isArray(tools) ? tools.slice(0, MAX_DEVICE_TOOLS) : []) {
+    const descriptor = publicToolDescriptor(raw);
+    if (!descriptor || !allowed.has(descriptor.name)) continue;
+    const bytes = new TextEncoder().encode(JSON.stringify(descriptor)).byteLength;
+    if (totalBytes + bytes > MAX_TOOL_CATALOG_BYTES) break;
+    totalBytes += bytes;
+    result.push(descriptor);
+  }
+  return result;
+}
+
+async function schemaVersion(tools) {
+  if (!tools.length) return "";
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(tools)));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function publicDevice(value) {
   return {
     id: String(value.id),
@@ -34,6 +72,8 @@ function publicDevice(value) {
     status: value.status === "online" ? "online" : "offline",
     lastSeen: String(value.lastSeen || new Date(0).toISOString()),
     capabilities: Array.isArray(value.capabilities) ? value.capabilities.map(String).filter((name) => name !== "secure_input_submit").slice(0, 100) : [],
+    toolSchemaCount: Number.isInteger(value.toolSchemaCount) ? Math.max(0, value.toolSchemaCount) : 0,
+    toolSchemaVersion: typeof value.toolSchemaVersion === "string" ? value.toolSchemaVersion.slice(0, 128) : "",
   };
 }
 
@@ -57,8 +97,10 @@ const TOOLS = [
               status: { type: "string", enum: ["online", "offline"] },
               lastSeen: { type: "string" },
               capabilities: { type: "array", items: { type: "string" } },
+              toolSchemaCount: { type: "integer", minimum: 0 },
+              toolSchemaVersion: { type: "string" },
             },
-            required: ["id", "name", "platform", "status", "lastSeen", "capabilities"],
+            required: ["id", "name", "platform", "status", "lastSeen", "capabilities", "toolSchemaCount", "toolSchemaVersion"],
             additionalProperties: false,
           },
         },
@@ -71,9 +113,56 @@ const TOOLS = [
     _meta: { securitySchemes: [{ type: "oauth2", scopes: ["device.control"] }] },
   },
   {
+    name: "describe_device_tool",
+    title: "Describe a device tool",
+    description: "Return the latest MCP title, description, input schema, output schema, and annotations for one tool advertised by a selected device. Use this after list_devices when a tool is unfamiliar or its arguments may have changed, before calling device_call.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        deviceId: { type: "string", minLength: 1, maxLength: 128 },
+        toolName: { type: "string", minLength: 1, maxLength: 128 },
+      },
+      required: ["deviceId", "toolName"],
+      additionalProperties: false,
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        deviceId: { type: "string" },
+        toolName: { type: "string" },
+        available: { type: "boolean" },
+        schemaVersion: { type: "string" },
+        tool: {
+          anyOf: [
+            {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                title: { type: "string" },
+                description: { type: "string" },
+                inputSchema: { type: "object", additionalProperties: true },
+                outputSchema: { type: "object", additionalProperties: true },
+                annotations: { type: "object", additionalProperties: true },
+              },
+              required: ["name"],
+              additionalProperties: false,
+            },
+            { type: "null" },
+          ],
+        },
+        message: { type: "string" },
+      },
+      required: ["deviceId", "toolName", "available", "schemaVersion", "tool", "message"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    securitySchemes: [{ type: "oauth2", scopes: ["device.control"] }],
+    _meta: { securitySchemes: [{ type: "oauth2", scopes: ["device.control"] }] },
+  },
+  {
     name: "device_call",
     title: "Call a tool on a device",
-    description: "Call one advertised MCP tool on a selected online computer for non-sensitive operations. Obtain deviceId and toolName from list_devices. Pass arguments as an object. Never include passwords, OTPs, API keys, payment data, personal information, private account choices, consent, or other sensitive values; use render_sensitive_input for those.",
+    description: "Call one advertised MCP tool on a selected online computer for non-sensitive operations. Obtain deviceId and toolName from list_devices; call describe_device_tool first when the tool is unfamiliar or its arguments may have changed. Pass arguments as an object. Never include passwords, OTPs, API keys, payment data, personal information, private account choices, consent, or other sensitive values; use render_sensitive_input for those.",
     inputSchema: {
       type: "object",
       properties: {
@@ -207,6 +296,10 @@ export class DeviceRegistry {
       return json({ devices: await this.listDevices() });
     }
 
+    if (url.pathname === "/describe" && request.method === "POST") {
+      return json(await this.describeDeviceTool(await request.json()));
+    }
+
     if (url.pathname === "/call" && request.method === "POST") {
       const body = await request.json();
       return json(await this.callDevice(body));
@@ -238,6 +331,29 @@ export class DeviceRegistry {
       devices.set(attachment.deviceId, publicDevice({ ...attachment, id: attachment.deviceId, status: "online" }));
     }
     return [...devices.values()].sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  async describeDeviceTool(body) {
+    const deviceId = String(body?.deviceId || "");
+    const toolName = String(body?.toolName || "");
+    if (!validDeviceId(deviceId)) throw new Error("Invalid deviceId.");
+    if (!/^[a-zA-Z0-9._-]{1,128}$/u.test(toolName) || toolName === "secure_input_submit") throw new Error("Invalid toolName.");
+    const [record, device] = await Promise.all([
+      this.ctx.storage.get(`tool:${deviceId}:${toolName}`),
+      this.ctx.storage.get(`device:${deviceId}`),
+    ]);
+    const tool = record?.tool && typeof record.tool === "object" ? record.tool : null;
+    const schemaVersion = typeof device?.toolSchemaVersion === "string" ? device.toolSchemaVersion : "";
+    return {
+      deviceId,
+      toolName,
+      available: Boolean(tool),
+      schemaVersion,
+      tool,
+      message: tool
+        ? `Returned the current schema for ${toolName} on ${deviceId}.`
+        : `No schema is registered for ${toolName} on ${deviceId}; refresh or update the device agent before relying on guessed arguments.`,
+    };
   }
 
   socketForDevice(deviceId) {
@@ -293,12 +409,17 @@ export class DeviceRegistry {
         if (existing === socket) continue;
         if (existing.deserializeAttachment()?.deviceId === deviceId) existing.close(4001, "device reconnected");
       }
+      const capabilities = Array.isArray(payload.capabilities) ? [...new Set(payload.capabilities.map(String))].slice(0, 100) : [];
+      const tools = normalizeToolCatalog(payload.tools, capabilities);
+      const toolSchemaVersion = await schemaVersion(tools);
       const attachment = {
         deviceId,
         id: deviceId,
         name,
         platform: String(payload.platform || "unknown").slice(0, 100),
-        capabilities: Array.isArray(payload.capabilities) ? [...new Set(payload.capabilities.map(String))].slice(0, 100) : [],
+        capabilities,
+        toolSchemaCount: tools.length,
+        toolSchemaVersion,
         registered: true,
         lastSeen: new Date().toISOString(),
         secureInputPublicKey: payload.secureInputPublicKey?.kty === "EC" && payload.secureInputPublicKey?.crv === "P-256"
@@ -313,7 +434,12 @@ export class DeviceRegistry {
       };
       socket.serializeAttachment(attachment);
       await this.ctx.storage.put(`device:${deviceId}`, publicDevice({ ...attachment, status: "online" }));
-      socket.send(JSON.stringify({ type: "registered", deviceId }));
+      const previousTools = await this.ctx.storage.list({ prefix: `tool:${deviceId}:` });
+      for (const key of previousTools.keys()) await this.ctx.storage.delete(key);
+      for (const tool of tools) {
+        await this.ctx.storage.put(`tool:${deviceId}:${tool.name}`, { version: toolSchemaVersion, updatedAt: attachment.lastSeen, tool });
+      }
+      socket.send(JSON.stringify({ type: "registered", deviceId, toolSchemaCount: tools.length, toolSchemaVersion }));
       return;
     }
 
@@ -432,6 +558,17 @@ async function handleToolCall(params, env) {
     const response = await stub.fetch("https://registry/devices");
     const result = await response.json();
     return { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result };
+  }
+
+  if (name === "describe_device_tool") {
+    const response = await stub.fetch("https://registry/describe", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ deviceId: args.deviceId, toolName: args.toolName }),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const result = await response.json();
+    return { content: [{ type: "text", text: result.message }], structuredContent: result };
   }
 
   if (name === "device_call") {
@@ -677,8 +814,8 @@ async function handleMcp(request, env) {
       return rpcResult(id, {
         protocolVersion: message.params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: false }, resources: { subscribe: false, listChanged: false } },
-        serverInfo: { name: "ChatGPT Device Control", version: "1.1.0" },
-        instructions: "Call list_devices first, then use device_call for ordinary non-sensitive operations. Whenever a password, OTP, API key, payment detail, personal value, account choice, consent, or other sensitive input/selection is required, never place it in chat or device_call. Call render_sensitive_input so the user supplies it in the encrypted UI card, wait for completion, then continue from the new device state.",
+        serverInfo: { name: "ChatGPT Device Control", version: "1.2.0" },
+        instructions: "Call list_devices first. Before using an unfamiliar device capability or when its arguments may have changed, call describe_device_tool to load that device's latest MCP schema, then use device_call for ordinary non-sensitive operations. Whenever a password, OTP, API key, payment detail, personal value, account choice, consent, or other sensitive input/selection is required, never place it in chat or device_call. Call render_sensitive_input so the user supplies it in the encrypted UI card, wait for completion, then continue from the new device state.",
       });
     }
     if (method === "ping") return rpcResult(id, {});

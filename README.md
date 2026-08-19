@@ -10,7 +10,7 @@ The project started as `chatgpt-vps-control`. It now keeps the original VPS/file
 
 | Platform | Computer backend | Setup behavior |
 | --- | --- | --- |
-| Linux with X11 | `xdotool` + `xrandr/xdpyinfo` + `ffmpeg x11grab` | Uses the signed-in X11 desktop. |
+| Linux with X11 | `xdotool` + `wmctrl` + `xrandr/xdpyinfo` + `ffmpeg x11grab` | Uses the signed-in X11 desktop. |
 | Headless Linux/VPS | managed X11 (`Xvfb` + `xfwm4`) | If no X11 desktop is reachable, setup configures a persistent 1280×800 virtual desktop that the MCP service starts automatically. |
 | macOS | signed app-bundled Swift helper using CoreGraphics/AppKit/Accessibility | Installs `ChatGPT Computer Control.app` with a stable Bundle ID so macOS permission panels show the product name instead of `node`. |
 | Windows | native PowerShell/C# helper using User32 `SendInput` + GDI capture | Uses the signed-in interactive Windows desktop; no third-party input driver is required. |
@@ -20,19 +20,40 @@ All backends expose the same normalized 1280-wide API coordinate system so the M
 ## Computer tools
 
 - `computer_environment` — reports the selected platform backend, display readiness, resolution, and native permission state.
-- `computer_applications` — lists installed/running desktop apps with stable platform identifiers (`com.google.Chrome`, `win32:notepad`, `startapp:…`, `atspi:…`, or `desktop:…`), avoiding guesses based on whichever window happens to be visible.
-- `computer_app_state` — returns a rich app-scoped accessibility tree, then compact element diffs on later calls unless a fresh full tree is requested.
+- `computer_applications` — lists installed/running desktop apps with stable platform identifiers (`com.google.Chrome`, `win32:notepad`, `startapp:…`, `atspi:…`, or `desktop:…`), plus nullable `lastUsedDate` and `useCount` when backed by OS usage evidence. Results prioritize running and recently used apps without inventing history where a platform does not expose it.
+- `computer_app_state` — returns a rich app-scoped accessibility tree plus an application-window-scoped screenshot and its desktop-coordinate bounds, then compact element diffs on later calls unless a fresh full tree is requested. If a platform cannot identify a target window, the result explicitly reports `screenshotScope=desktop` instead of silently presenting a full-screen image as app-scoped.
+- `computer_browser_session` — starts a dedicated Chrome/Chromium profile, discovers an explicitly configured loopback CDP browser, or enumerates ordinary signed-in Chrome tabs through the optional extension. The MCP selects a fresh listed tab by browser generation, ID, title and URL, then atomically claims only that exact target before control. All modes support exact-target navigation, new/activate/close tab, back/forward/reload, and page-only screenshots. Targets expose `owner` and `retained`; tool-created tabs begin as temporary automation tabs. Page changes invalidate the claim, and attached/extension browsers can never be stopped through this tool.
+- `computer_browser_utility` — binds to an exact target for live HTML/text export, private PDF generation, page clipboard read/write, buffered console/exception/developer-log inspection, JavaScript alert/confirm/prompt handling, and browser-level download tracking, waiting, or cancellation. PDFs are validated, capped at 64 MiB, written atomically without overwriting under the session's private `exports` directory, and can be reused by that session's restricted file-upload flow. Downloads remain confined to the private session directory and clipboard writes are never echoed.
+- `computer_browser_locator` — runs up to 20 declarative visible-DOM steps against one exact managed target. It can enter a chain of up to eight same-origin or cross-origin frames through isolated CDP worlds, inspect or wait for CSS/role/name/text locators, click/double-click, hover, focus, fill, append text, check/uncheck, select options, safely set file inputs, drag one located element to another, press keys, scroll, and read attributes, then returns a target-only screenshot. Uploads accept only regular files under the workspace, that session's download or export directory, or explicit `COMPUTER_BROWSER_UPLOAD_ROOTS`; arbitrary JavaScript evaluation is not exposed.
+- `computer_browser_cua` — sends bounded screenshot/click/double-click/move/drag/type/keypress/scroll/media-download/wait batches to one exact claimed browser tab in page CSS-pixel coordinates, with modifier keys, drag paths, raw scroll deltas, clipped or full-page capture, and a target-only screenshot. Its page coordinate space is deliberately separate from desktop `computer_use` coordinates, and stale or mismatched browser claims fail closed.
 - `computer_elements` — returns a short-lived indexed accessibility snapshot from Linux AT-SPI, macOS AXUIElement, Windows UI Automation, or Chrome/Electron CDP.
-- `computer_element_action` — performs `press`, `focus`, `set_value`, `toggle`, `increment`, `decrement`, or `scroll_into_view` against an element index and returns a fresh screenshot.
+- `computer_element_action` — performs `press`, multi-button/multi-click `click`, `focus`, `set_value`, contextual `select_text`, `toggle`, `increment`, `decrement`, `scroll_into_view`, or direction/page-based `scroll` against an element index. A process-lifetime native observer caches events for each target application, records a generation before mutation, and waits for the post-action generation to become quiet. If that service is unavailable, the action-scoped macOS AXObserver, Windows UIA, Linux AT-SPI, browser DOM fingerprint, and semantic polling paths remain fail-safe fallbacks. The result includes settle source/duration/event count, the same application's stabilized window screenshot and bounds (or an explicit desktop fallback), replacement snapshot id, and refreshed state.
 - `computer_element_secondary_action` — performs an exact native accessibility action advertised by the selected element; guessed action names are rejected.
 - `computer_state` — returns display/API resolution, cursor position, active/visible windows, and optionally an inline screenshot.
+- `computer_window` — acts on an exact window id and short-lived identity claim from `computer_state`: activate, close, minimize, maximize, restore, or move/resize in normalized screenshot coordinates. The claim is bound to desktop, id, and title so a recycled native handle fails closed. It returns refreshed visible windows and a post-action screenshot without retrying a successful mutation if capture permission is unavailable.
 - `computer_use` — executes coordinate-level `screenshot`, `click`, `move`, `drag`, `type`, `key`, `scroll`, and `wait`, with up to 9 known follow-up actions in one call and one final screenshot.
 
-Use semantic control first: call `computer_applications`, select the stable app id, then call `computer_app_state` or `computer_elements` with that id. Select a named role/control, call `computer_element_action`, then refresh the element snapshot after any UI-changing action. `computer_app_state` uses an app-scoped session: its first response is a full tree and later responses contain only additions, changes, and removals. Snapshots expire after 90 seconds and expose only indexes; native handles and CDP node identifiers remain private inside the MCP process. All semantic providers normalize hierarchy depth, subrole/class, stable element identifier, placeholder, URL, state, bounds, semantic actions, and exact native actions where the platform exposes them. Use `computer_use` as the visual/coordinate fallback when an application does not expose a usable accessibility element; on macOS and Windows its optional `application` field launches or activates the selected app before sending input.
+Use semantic control first: call `computer_applications`, select the stable app id, then call `computer_app_state` or `computer_elements` with that id. `computer_app_state` ensures the app is running but does not bring an already-running app to the foreground unless `activate=true`; ordinary signed-in Chrome work should use the extension-backed browser session and stays in the background. Select a named role/control and call `computer_element_action`; a successful write invalidates the old snapshot and normally returns `nextSnapshotId` plus refreshed state for the next decision. For a Computer Use-style act-then-observe loop, pass `returnState=false` to make the write action-only, then explicitly read fresh state. `computer_app_state` uses an app-scoped session: its first response is a full tree and later responses contain only additions, changes, and removals. It reads the focused window by default, so an OS file chooser replaces the underlying browser page instead of forcing a scan through both. On large browser-internal pages such as `chrome://extensions`, pass `query` (for example, the localized Load unpacked label) and a small `maxElements`; native AX/UIA traversal is bounded by `maxDepth` and `maxVisitedNodes`. This desktop path can operate browser chrome and native file choosers that page CDP intentionally cannot access. Snapshots expire after 90 seconds and expose only indexes; native handles and CDP node identifiers remain private inside the MCP process. All semantic providers normalize hierarchy depth, subrole/class, stable element identifier, placeholder, URL, state, bounds, semantic actions, and exact native actions where the platform exposes them. `select_text` supports matching context through `prefix`/`suffix` and `text`, `cursor_before`, or `cursor_after` selection modes. Use `computer_use` as the visual/coordinate fallback when an application does not expose a usable accessibility element; its optional `application` field explicitly activates the selected app before sending global keyboard or mouse input on macOS, Windows, and Linux.
 
-The implementation is independent and platform-native: macOS uses AXUIElement, Windows uses UI Automation patterns, Linux uses AT-SPI plus freedesktop application entries, and Chrome/Electron uses CDP. See [docs/clean-room-computer-use.md](docs/clean-room-computer-use.md) for the reconstructed behavior contract and the deliberate improvements made here.
+Before any input, the native backends verify that the normal interactive user desktop is available. macOS rejects locked or non-console CGSessions, Windows rejects locked/disconnected input desktops and the UAC secure desktop, and physical Linux sessions honor logind `Active`/`LockedHint`. Managed private Xvfb sessions remain controllable through their isolated display. Read-only state inspection remains available so callers can report why control is paused without guessing or retrying an action.
+
+The implementation is independent and platform-native: macOS uses AXUIElement, Windows uses UI Automation patterns, Linux uses AT-SPI plus freedesktop application entries, and Chrome/Electron uses CDP. See [docs/clean-room-computer-use.md](docs/clean-room-computer-use.md) for the reconstructed behavior contract and [docs/chatgpt-control-parity.md](docs/chatgpt-control-parity.md) for the ChatGPT Computer Use/Browser architecture comparison and parity map.
+
+macOS and Windows native calls normally pass through a restartable process-lifetime broker with bounded JSON-lines requests, isolated per-request action children, and transparent one-shot fallback only for transport failure. On macOS, the signed persistent broker owns the ScreenCaptureKit window catalog and hot screenshot path while actions remain isolated; this avoids a capture-service cold start on every UI action. The app also embeds a separately signed `com.bhrum.computer-control.request-service.xpc` compatibility service with mutual code-signing checks. Set `CHATGPT_COMPUTER_NATIVE_PERSISTENT=0` only for diagnostics when the broker itself must be bypassed.
 
 The coordinate fallback keeps the useful behavior recovered from Grok Bot 0.16.0: normalized coordinates, UI settle time before screenshots, batched known actions, and robust Unicode handling on X11. macOS and Windows use native OS input APIs instead of trying to run X11 tools there.
+
+## Use an already signed-in Chrome browser
+
+Ordinary Chrome does not expose CDP unless it was launched with remote debugging. To control selected tabs in the Chrome instance the user already uses, install the bundled Manifest V3 bridge:
+
+```bash
+chatgpt-computer-control browser-extension install
+```
+
+Then open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the exact path printed by the command. The next `computer_browser_session` `list` call returns an `extension-…` session containing current ordinary `http`/`https` tabs. The MCP chooses one from that fresh list and atomically claims it by ID, title and URL before attaching the debugger; users do not need to share tabs one by one.
+
+The extension uses Chrome Native Messaging; it does not require Chrome to be restarted with a debugging flag. The native host is restricted to this installation's generated extension ID and authenticates to a private user-only socket with a random local secret. A persistent profile instance id and browser-start generation prevent claims from surviving the wrong Chrome lifetime. Enumeration does not attach a debugger; attachment happens only after an exact fresh claim. Debugger commands are serialized, Native Messaging reconnects through heartbeat alarms and bounded backoff, child tabs inherit control only from an already controlled opener, and automation tabs are kept in a named group. The extension never exports the Chrome profile, passwords, cookies, or session storage.
 
 ## Other MCP tools
 
@@ -64,7 +85,7 @@ The installer installs npm dependencies, links the `chatgpt-computer-control` CL
 On apt-based Linux, `setup` can automatically install:
 
 ```text
-xdotool ffmpeg x11-utils x11-xserver-utils xvfb x11vnc xfwm4
+xdotool wmctrl ffmpeg x11-utils x11-xserver-utils xvfb x11vnc xfwm4
 dbus-x11 at-spi2-core python3-pyatspi gir1.2-atspi-2.0 libglib2.0-bin
 ```
 
@@ -214,7 +235,7 @@ If a local network advertises unusable IPv6 connectivity to `workers.dev`, set
 `DEVICE_GATEWAY_IP_FAMILY=4` on that device. This changes only the outbound
 gateway connection and does not expose an inbound port.
 
-The central MCP adds two stable tools: `list_devices` returns the live registry, and `device_call` forwards a named MCP tool plus JSON arguments to a connected device. Adding another computer does not change the central tool list or require installing another ChatGPT plugin. Agents make outbound WebSocket connections, so individual computers do not need public inbound ports.
+The central MCP keeps a stable gateway surface: `list_devices` returns the live registry plus a compact tool-schema count/version, `describe_device_tool` returns the current MCP title/description/input/output schema for one advertised device tool, and `device_call` forwards a named MCP tool plus JSON arguments to a connected device. Device agents upload bounded, sanitized tool descriptors when they register, so ChatGPT can discover newly added local capabilities without hard-coding their arguments or reinstalling the plugin. Adding another computer still does not change the central tool list. Agents make outbound WebSocket connections, so individual computers do not need public inbound ports.
 
 ## Security properties
 
@@ -225,6 +246,7 @@ The central MCP adds two stable tools: `list_devices` returns the live registry,
 - Computer screenshots are returned inline and are not automatically persisted by the control module.
 - macOS Accessibility/Screen Recording and Windows session/UAC boundaries are respected rather than bypassed.
 - VNC, when explicitly enabled for a managed Linux desktop, is localhost-only by default.
+- Browser-extension control is disabled until the separate install command is run. Once enabled, it lists ordinary webpage tab metadata to the authenticated local MCP, but attaches `chrome.debugger` only after an exact generation/ID/title/URL claim.
 
 This MCP is intentionally high privilege. Install it only on machines you own/administer and expose it only to trusted authenticated clients.
 
@@ -263,7 +285,11 @@ COMPUTER_X11_SCREEN=1280x800x24
 COMPUTER_ENABLE_VNC=0           # optional local-only observer
 COMPUTER_VNC_PORT=5909
 CHATGPT_COMPUTER_NATIVE_HELPER= # macOS/Windows setup writes this
-COMPUTER_CDP_ENDPOINTS=http://127.0.0.1:9222 # optional Chrome/Electron semantic endpoints
+COMPUTER_CDP_ENDPOINTS=http://127.0.0.1:9222 # optional explicit opt-in existing Chrome/Electron sessions
+COMPUTER_BROWSER_EXTENSION_HOME= # optional private extension/native-host state root
+COMPUTER_BROWSER_SESSION_DIR= # optional private root for isolated browser profiles
+COMPUTER_BROWSER_UPLOAD_ROOTS= # optional path-delimited allowlist; filesystem root is always ignored
+COMPUTER_CHROME_EXECUTABLE=   # optional explicit Chrome/Chromium binary
 NO_AT_BRIDGE=0                # Linux semantic accessibility
 GTK_MODULES=gail:atk-bridge   # Linux GTK accessibility bridge
 ```

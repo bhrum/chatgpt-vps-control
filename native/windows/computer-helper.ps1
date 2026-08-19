@@ -5,10 +5,15 @@ Add-Type -AssemblyName UIAutomationTypes
 
 $signature = @"
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Text;
+using System.Threading;
 using System.Runtime.InteropServices;
+using System.Windows.Automation;
 public static class NativeComputer {
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
   [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -18,9 +23,19 @@ public static class NativeComputer {
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool MoveWindow(IntPtr hWnd, int x, int y, int width, int height, bool repaint);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+  [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint desiredAccess);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool SwitchDesktop(IntPtr desktop);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool CloseDesktop(IntPtr desktop);
+
+  public const uint DESKTOP_SWITCHDESKTOP = 0x0100;
 
   public const int INPUT_MOUSE = 0;
   public const int INPUT_KEYBOARD = 1;
@@ -68,8 +83,64 @@ public static class NativeComputer {
     SendInput(1, items, Marshal.SizeOf(typeof(INPUT)));
   }
 }
+
+public sealed class UIASettleSubscription : IDisposable {
+  private readonly AutomationElement root;
+  private readonly StructureChangedEventHandler structureHandler;
+  private readonly AutomationPropertyChangedEventHandler propertyHandler;
+  private readonly AutomationEventHandler automationHandler;
+  private readonly List<AutomationEvent> automationEvents = new List<AutomationEvent>();
+  private bool structureRegistered;
+  private bool propertyRegistered;
+  private long lastTicks = Stopwatch.GetTimestamp();
+  private int eventCount;
+
+  public UIASettleSubscription(AutomationElement root) {
+    if (root == null) throw new ArgumentNullException("root");
+    this.root = root;
+    structureHandler = (sender, args) => Record();
+    propertyHandler = (sender, args) => Record();
+    automationHandler = (sender, args) => Record();
+    try { Automation.AddStructureChangedEventHandler(root, TreeScope.Subtree, structureHandler); structureRegistered = true; } catch { }
+    try {
+      Automation.AddAutomationPropertyChangedEventHandler(root, TreeScope.Subtree, propertyHandler,
+        AutomationElement.NameProperty, AutomationElement.IsEnabledProperty, AutomationElement.HasKeyboardFocusProperty,
+        ValuePattern.ValueProperty, TogglePattern.ToggleStateProperty, ExpandCollapsePattern.ExpandCollapseStateProperty,
+        SelectionItemPattern.IsSelectedProperty);
+      propertyRegistered = true;
+    } catch { }
+    foreach (AutomationEvent eventId in new [] { WindowPattern.WindowOpenedEvent, WindowPattern.WindowClosedEvent, InvokePattern.InvokedEvent, SelectionItemPattern.ElementSelectedEvent }) {
+      try { Automation.AddAutomationEventHandler(eventId, root, TreeScope.Subtree, automationHandler); automationEvents.Add(eventId); } catch { }
+    }
+  }
+
+  private void Record() {
+    Interlocked.Increment(ref eventCount);
+    Interlocked.Exchange(ref lastTicks, Stopwatch.GetTimestamp());
+  }
+
+  public int EventCount { get { return Volatile.Read(ref eventCount); } }
+  public bool IsActive { get { return structureRegistered || propertyRegistered || automationEvents.Count > 0; } }
+
+  public int WaitForQuiet(int minimumMs, int quietMs, int maximumMs) {
+    Stopwatch elapsed = Stopwatch.StartNew();
+    while (elapsed.ElapsedMilliseconds < maximumMs) {
+      long last = Interlocked.Read(ref lastTicks);
+      double sinceLastMs = (Stopwatch.GetTimestamp() - last) * 1000.0 / Stopwatch.Frequency;
+      if (elapsed.ElapsedMilliseconds >= minimumMs && sinceLastMs >= quietMs) break;
+      Thread.Sleep(25);
+    }
+    return (int)elapsed.ElapsedMilliseconds;
+  }
+
+  public void Dispose() {
+    if (structureRegistered) { try { Automation.RemoveStructureChangedEventHandler(root, structureHandler); } catch { } }
+    if (propertyRegistered) { try { Automation.RemoveAutomationPropertyChangedEventHandler(root, propertyHandler); } catch { } }
+    foreach (AutomationEvent eventId in automationEvents) { try { Automation.RemoveAutomationEventHandler(eventId, root, automationHandler); } catch { } }
+  }
+}
 "@
-Add-Type -TypeDefinition $signature
+Add-Type -TypeDefinition $signature -ReferencedAssemblies @('System.dll','System.Core.dll','UIAutomationClient.dll','UIAutomationTypes.dll')
 [NativeComputer]::SetProcessDPIAware() | Out-Null
 
 function Fail($message) {
@@ -82,6 +153,12 @@ function Get-Resolution($apiWidth) {
   if ($w -le 0 -or $h -le 0) { throw 'No interactive Windows desktop is available.' }
   $apiHeight = [int][Math]::Round($apiWidth / ($w / [double]$h))
   return @{ display = @{ width = $w; height = $h }; api = @{ width = $apiWidth; height = $apiHeight } }
+}
+function Test-InteractiveDesktop {
+  $desktop = [NativeComputer]::OpenInputDesktop(0, $false, [NativeComputer]::DESKTOP_SWITCHDESKTOP)
+  if ($desktop -eq [IntPtr]::Zero) { return $false }
+  try { return [NativeComputer]::SwitchDesktop($desktop) }
+  finally { [NativeComputer]::CloseDesktop($desktop) | Out-Null }
 }
 function Scale-Point($x, $y, $res) {
   return @{ x = [int][Math]::Round(($x / [double]$res.api.width) * $res.display.width); y = [int][Math]::Round(($y / [double]$res.api.height) * $res.display.height) }
@@ -113,9 +190,11 @@ function Get-Applications {
     $id = "win32:$($processName.ToLowerInvariant())"
     $path = ''
     try { $path = [string]$process.Path } catch {}
+    $lastUsedDate = $null
+    try { $lastUsedDate = $process.StartTime.ToUniversalTime().ToString('o') } catch {}
     $byId[$id] = @{
       id=$id; displayName=$(if ($process.MainWindowTitle) { [string]$process.MainWindowTitle } else { $processName })
-      path=$path; isRunning=$true; pid=[int]$process.Id
+      path=$path; isRunning=$true; pid=[int]$process.Id; lastUsedDate=$lastUsedDate; useCount=$null
     }
   }
   if (Get-Command Get-StartApps -ErrorAction SilentlyContinue) {
@@ -124,18 +203,25 @@ function Get-Applications {
       if (-not $appId) { continue }
       $id = "startapp:$appId"
       if (-not $byId.ContainsKey($id)) {
-        $byId[$id] = @{ id=$id; displayName=[string]$app.Name; path=$appId; isRunning=$false; pid=$null }
+        $byId[$id] = @{ id=$id; displayName=[string]$app.Name; path=$appId; isRunning=$false; pid=$null; lastUsedDate=$null; useCount=$null }
       }
       if ($byId.Count -ge 400) { break }
     }
   }
   return @($byId.Values | Sort-Object @{Expression='isRunning';Descending=$true}, @{Expression='displayName';Ascending=$true})
 }
-function Capture-Screenshot($res) {
-  $bmp = New-Object System.Drawing.Bitmap($res.display.width, $res.display.height, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+function Capture-Screenshot($res, $bounds = $null) {
+  $x = 0; $y = 0; $width = [int]$res.display.width; $height = [int]$res.display.height
+  if ($null -ne $bounds -and [int]$bounds.width -gt 0 -and [int]$bounds.height -gt 0) {
+    $x = [Math]::Max(0, [int]$bounds.x); $y = [Math]::Max(0, [int]$bounds.y)
+    $width = [Math]::Min([int]$bounds.width, [int]$res.display.width - $x)
+    $height = [Math]::Min([int]$bounds.height, [int]$res.display.height - $y)
+  }
+  if ($width -le 0 -or $height -le 0) { return $null }
+  $bmp = New-Object System.Drawing.Bitmap($width, $height, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
   $g = [System.Drawing.Graphics]::FromImage($bmp)
   try {
-    $g.CopyFromScreen(0, 0, 0, 0, $bmp.Size, [System.Drawing.CopyPixelOperation]::SourceCopy)
+    $g.CopyFromScreen($x, $y, 0, 0, $bmp.Size, [System.Drawing.CopyPixelOperation]::SourceCopy)
     $ms = New-Object System.IO.MemoryStream
     try { $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); return [Convert]::ToBase64String($ms.ToArray()) }
     finally { $ms.Dispose() }
@@ -298,6 +384,7 @@ function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path, [int]$depth) {
   $expand = Try-Pattern $element ([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
   $range = Try-Pattern $element ([System.Windows.Automation.RangeValuePattern]::Pattern)
   $scrollItem = Try-Pattern $element ([System.Windows.Automation.ScrollItemPattern]::Pattern)
+  $textPattern = Try-Pattern $element ([System.Windows.Automation.TextPattern]::Pattern)
   $actions = New-Object System.Collections.ArrayList
   $nativeActions = New-Object System.Collections.ArrayList
   if ($null -ne $invoke) { [void]$nativeActions.Add('Invoke') }
@@ -310,12 +397,15 @@ function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path, [int]$depth) {
   if ($null -ne $scrollItem) { [void]$nativeActions.Add('ScrollIntoView') }
   if ($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) { [void]$nativeActions.Add('SetValue') }
   if ($element.Current.IsKeyboardFocusable) { [void]$nativeActions.Add('SetFocus') }
-  if ($null -ne $invoke -or $null -ne $selection -or $null -ne $toggle -or $null -ne $expand) { [void]$actions.Add('press') }
+  if ($null -ne $invoke -or $null -ne $selection -or $null -ne $toggle -or $null -ne $expand) { [void]$actions.Add('press'); [void]$actions.Add('click') }
   if ($element.Current.IsKeyboardFocusable) { [void]$actions.Add('focus') }
   if (($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) -or $type -eq 'Edit') { [void]$actions.Add('set_value') }
+  if ($null -ne $textPattern) { [void]$actions.Add('select_text') }
   if ($null -ne $toggle) { [void]$actions.Add('toggle') }
   if ($null -ne $range -and -not $range.Current.IsReadOnly) { [void]$actions.Add('increment'); [void]$actions.Add('decrement') }
   if ($null -ne $scrollItem) { [void]$actions.Add('scroll_into_view') }
+  $elementBounds = Get-UIABounds $element
+  if ($null -ne $elementBounds) { [void]$actions.Add('scroll'); if (-not $actions.Contains('click')) { [void]$actions.Add('click') } }
   $value = ''
   if ($null -ne $valuePattern) { $value = [string]$valuePattern.Current.Value }
   elseif ($null -ne $range) { $value = [string]$range.Current.Value }
@@ -360,13 +450,17 @@ function Get-UIAElements($options) {
   $hwnd = [long]$selected.hwnd
   $root = $selected.element
   $max = if ($options.maxElements) { [Math]::Max(1,[Math]::Min(500,[int]$options.maxElements)) } else { 120 }
+  $maxDepth = if ($options.maxDepth) { [Math]::Max(1,[Math]::Min(40,[int]$options.maxDepth)) } else { 16 }
+  $maxVisited = if ($options.maxVisitedNodes) { [Math]::Max($max,[Math]::Min(20000,[int]$options.maxVisitedNodes)) } else { [Math]::Max(1500,$max * 12) }
   $includeStatic = [bool]$options.includeStaticText
   $includeContainers = [bool]$options.includeContainers
   $roleFilter = ([string]$options.role).ToLowerInvariant()
   $query = ([string]$(if ($options.query) { $options.query } else { $options.name })).ToLowerInvariant()
   $items = New-Object System.Collections.ArrayList
+  $script:visitedUIANodes = 0
   function Walk-UIA($element, [int[]]$path, [int]$depth) {
-    if ($depth -gt 20 -or $items.Count -ge $max) { return }
+    if ($depth -gt $maxDepth -or $items.Count -ge $max -or $script:visitedUIANodes -ge $maxVisited) { return }
+    $script:visitedUIANodes++
     $type = Get-ControlTypeName $element
     $interesting = $InteractiveTypes -contains $type -or $element.Current.IsKeyboardFocusable -or ($includeStatic -and $StaticTypes -contains $type) -or ($includeContainers -and $ContainerTypes -contains $type -and [string]$element.Current.Name)
     if ($depth -gt 0 -and $interesting) {
@@ -375,12 +469,30 @@ function Get-UIAElements($options) {
       if ((-not $roleFilter -or $info.role -eq $roleFilter) -and (-not $query -or $searchable.Contains($query))) { [void]$items.Add($info) }
     }
     $children = @(Get-UIAChildren $element)
-    for ($i=0; $i -lt $children.Count -and $items.Count -lt $max; $i++) { Walk-UIA $children[$i] @($path + $i) ($depth + 1) }
+    for ($i=0; $i -lt $children.Count -and $items.Count -lt $max -and $script:visitedUIANodes -lt $maxVisited; $i++) { Walk-UIA $children[$i] @($path + $i) ($depth + 1) }
   }
   Walk-UIA $root @() 0
   $processName = ''
   try { $processName = ([Diagnostics.Process]::GetProcessById($root.Current.ProcessId).ProcessName).ToLowerInvariant() } catch {}
-  return @{ hwnd=$hwnd; application=[string]$root.Current.Name; applicationId=$(if ($processName) { "win32:$processName" } else { [string]$selected.applicationId }); elements=@($items) }
+  $applicationBounds = Get-UIABounds $root
+  if ($null -eq $applicationBounds -and $hwnd -ne 0) {
+    $rect = New-Object NativeComputer+RECT
+    if ([NativeComputer]::GetWindowRect([IntPtr]$hwnd, [ref]$rect)) {
+      $applicationBounds = @{ x=$rect.Left; y=$rect.Top; width=$rect.Right-$rect.Left; height=$rect.Bottom-$rect.Top }
+    }
+  }
+  return @{ hwnd=$hwnd; application=[string]$root.Current.Name; applicationId=$(if ($processName) { "win32:$processName" } else { [string]$selected.applicationId }); elements=@($items); screenshotBounds=$applicationBounds }
+}
+function Complete-UIASettle($subscription) {
+  if ($null -eq $subscription -or -not $subscription.IsActive) {
+    if ($null -ne $subscription) { $subscription.Dispose() }
+    Start-Sleep -Milliseconds 180
+    return @{ settleDurationMs=180; settleEventCount=0; settleSource='bounded-fallback' }
+  }
+  try {
+    $duration = $subscription.WaitForQuiet(180, 250, 5000)
+    return @{ settleDurationMs=[int]$duration; settleEventCount=[int]$subscription.EventCount; settleSource='uia-events' }
+  } finally { $subscription.Dispose() }
 }
 function Invoke-UIAElementAction($request) {
   $payload = Decode-ElementId ([string]$request.elementId)
@@ -389,42 +501,70 @@ function Invoke-UIAElementAction($request) {
   catch {
     $bounds = $payload.bounds
     $canClick = $null -ne $bounds -and [int]$bounds.width -gt 0 -and [int]$bounds.height -gt 0
-    $isPress = $action -eq 'press' -or $action -eq 'native:Invoke'
+    $isPress = $action -eq 'press' -or $action -eq 'click' -or $action -eq 'native:Invoke'
     $isSetValue = $action -eq 'set_value' -or $action -eq 'native:SetValue'
     if (-not $canClick -or (-not $isPress -and -not $isSetValue)) { throw }
     $hwnd = [IntPtr][long]$payload.hwnd
     [NativeComputer]::BringWindowToTop($hwnd) | Out-Null
     [NativeComputer]::SetForegroundWindow($hwnd) | Out-Null
     [NativeComputer]::SetCursorPos([int]$bounds.x + [int]([int]$bounds.width/2), [int]$bounds.y + [int]([int]$bounds.height/2)) | Out-Null
-    [NativeComputer]::Mouse([NativeComputer]::MOUSEEVENTF_LEFTDOWN,0); [NativeComputer]::Mouse([NativeComputer]::MOUSEEVENTF_LEFTUP,0)
+    if ($action -eq 'click' -and [string]$request.button -eq 'right') { $down=[NativeComputer]::MOUSEEVENTF_RIGHTDOWN; $up=[NativeComputer]::MOUSEEVENTF_RIGHTUP }
+    elseif ($action -eq 'click' -and [string]$request.button -eq 'middle') { $down=[NativeComputer]::MOUSEEVENTF_MIDDLEDOWN; $up=[NativeComputer]::MOUSEEVENTF_MIDDLEUP }
+    else { $down=[NativeComputer]::MOUSEEVENTF_LEFTDOWN; $up=[NativeComputer]::MOUSEEVENTF_LEFTUP }
+    $clickCount = if ($action -eq 'click' -and $request.count) { [Math]::Max(1,[Math]::Min(3,[int]$request.count)) } else { 1 }
+    for ($i=0; $i -lt $clickCount; $i++) { [NativeComputer]::Mouse($down,0); [NativeComputer]::Mouse($up,0); Start-Sleep -Milliseconds 35 }
     if ($isSetValue) {
       Start-Sleep -Milliseconds 80
       Send-KeyChord 'ctrl+a'
       Start-Sleep -Milliseconds 30
       [NativeComputer]::UnicodeText([string]$request.value)
     }
-    return @{ ok=$true; source='windows-uia-bounds-fallback'; action=$action }
+    Start-Sleep -Milliseconds 180
+    return @{ ok=$true; source='windows-uia-bounds-fallback'; action=$action; settleDurationMs=180; settleEventCount=0; settleSource='bounded-fallback' }
+  }
+  $settleSubscription = $null
+  if (-not $request.eventObserverActive) {
+    try {
+      $observationRoot = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr][long]$payload.hwnd)
+      if ($null -eq $observationRoot) { $observationRoot = $element }
+      $settleSubscription = [UIASettleSubscription]::new($observationRoot)
+    } catch {}
   }
   if ($action.StartsWith('native:')) {
     $nativeAction = $action.Substring(7)
     switch ($nativeAction) {
-      'Invoke' { $pattern=Try-Pattern $element ([System.Windows.Automation.InvokePattern]::Pattern); if ($null -eq $pattern) { $request.action='press'; return Invoke-UIAElementAction $request }; $pattern.Invoke() }
+      'Invoke' { $pattern=Try-Pattern $element ([System.Windows.Automation.InvokePattern]::Pattern); if ($null -eq $pattern) { if ($null -ne $settleSubscription) { $settleSubscription.Dispose() }; $request.action='press'; return Invoke-UIAElementAction $request }; $pattern.Invoke() }
       'Select' { $pattern=Try-Pattern $element ([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($null -eq $pattern) { throw 'Select is no longer available.' }; $pattern.Select() }
       'AddToSelection' { $pattern=Try-Pattern $element ([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($null -eq $pattern) { throw 'AddToSelection is no longer available.' }; $pattern.AddToSelection() }
       'RemoveFromSelection' { $pattern=Try-Pattern $element ([System.Windows.Automation.SelectionItemPattern]::Pattern); if ($null -eq $pattern) { throw 'RemoveFromSelection is no longer available.' }; $pattern.RemoveFromSelection() }
       'Toggle' { $pattern=Try-Pattern $element ([System.Windows.Automation.TogglePattern]::Pattern); if ($null -eq $pattern) { throw 'Toggle is no longer available.' }; $pattern.Toggle() }
       'Expand' { $pattern=Try-Pattern $element ([System.Windows.Automation.ExpandCollapsePattern]::Pattern); if ($null -eq $pattern) { throw 'Expand is no longer available.' }; $pattern.Expand() }
       'Collapse' { $pattern=Try-Pattern $element ([System.Windows.Automation.ExpandCollapsePattern]::Pattern); if ($null -eq $pattern) { throw 'Collapse is no longer available.' }; $pattern.Collapse() }
-      'Increment' { $request.action='increment'; return Invoke-UIAElementAction $request }
-      'Decrement' { $request.action='decrement'; return Invoke-UIAElementAction $request }
-      'ScrollIntoView' { $request.action='scroll_into_view'; return Invoke-UIAElementAction $request }
+      'Increment' { if ($null -ne $settleSubscription) { $settleSubscription.Dispose() }; $request.action='increment'; return Invoke-UIAElementAction $request }
+      'Decrement' { if ($null -ne $settleSubscription) { $settleSubscription.Dispose() }; $request.action='decrement'; return Invoke-UIAElementAction $request }
+      'ScrollIntoView' { if ($null -ne $settleSubscription) { $settleSubscription.Dispose() }; $request.action='scroll_into_view'; return Invoke-UIAElementAction $request }
       'SetFocus' { $element.SetFocus() }
-      'SetValue' { $request.action='set_value'; return Invoke-UIAElementAction $request }
+      'SetValue' { if ($null -ne $settleSubscription) { $settleSubscription.Dispose() }; $request.action='set_value'; return Invoke-UIAElementAction $request }
       default { throw "Unsupported Windows UIA native action: $nativeAction" }
     }
-    return @{ ok=$true; source='windows-uia'; action=$action }
+    $settled = if ($request.eventObserverActive) { @{ settleDurationMs=0; settleEventCount=0; settleSource='external-observer-pending' } } else { Complete-UIASettle $settleSubscription }
+    return @{ ok=$true; source='windows-uia'; action=$action; settleDurationMs=$settled.settleDurationMs; settleEventCount=$settled.settleEventCount; settleSource=$settled.settleSource }
   }
   switch ($action) {
+    'click' {
+      $bounds = Get-UIABounds $element
+      if ($null -eq $bounds -or $bounds.width -le 0 -or $bounds.height -le 0) { throw 'Element has no visible click bounds.' }
+      $hwnd = [IntPtr][long]$payload.hwnd
+      [NativeComputer]::BringWindowToTop($hwnd) | Out-Null
+      [NativeComputer]::SetForegroundWindow($hwnd) | Out-Null
+      [NativeComputer]::SetCursorPos($bounds.x + [int]($bounds.width / 2), $bounds.y + [int]($bounds.height / 2)) | Out-Null
+      $button = [string]$request.button
+      if ($button -eq 'right') { $down=[NativeComputer]::MOUSEEVENTF_RIGHTDOWN; $up=[NativeComputer]::MOUSEEVENTF_RIGHTUP }
+      elseif ($button -eq 'middle') { $down=[NativeComputer]::MOUSEEVENTF_MIDDLEDOWN; $up=[NativeComputer]::MOUSEEVENTF_MIDDLEUP }
+      else { $down=[NativeComputer]::MOUSEEVENTF_LEFTDOWN; $up=[NativeComputer]::MOUSEEVENTF_LEFTUP }
+      $count = [Math]::Max(1,[Math]::Min(3,[int]$(if ($request.count) { $request.count } else { 1 })))
+      for ($i=0; $i -lt $count; $i++) { [NativeComputer]::Mouse($down,0); [NativeComputer]::Mouse($up,0); Start-Sleep -Milliseconds 35 }
+    }
     'focus' { $element.SetFocus() }
     'set_value' {
       $pattern = Try-Pattern $element ([System.Windows.Automation.ValuePattern]::Pattern)
@@ -471,6 +611,42 @@ function Invoke-UIAElementAction($request) {
       $pattern = Try-Pattern $element ([System.Windows.Automation.ScrollItemPattern]::Pattern)
       if ($null -ne $pattern) { $pattern.ScrollIntoView() } else { $element.SetFocus() }
     }
+    'scroll' {
+      $bounds = Get-UIABounds $element
+      if ($null -eq $bounds -or $bounds.width -le 0 -or $bounds.height -le 0) { throw 'Element has no visible scroll bounds.' }
+      $hwnd = [IntPtr][long]$payload.hwnd
+      [NativeComputer]::BringWindowToTop($hwnd) | Out-Null
+      [NativeComputer]::SetForegroundWindow($hwnd) | Out-Null
+      [NativeComputer]::SetCursorPos($bounds.x + [int]($bounds.width / 2), $bounds.y + [int]($bounds.height / 2)) | Out-Null
+      $direction = [string]$request.direction
+      $pages = [Math]::Max(1,[Math]::Min(100,[int]$(if ($request.pages) { $request.pages } else { 1 })))
+      $horizontal = $direction -eq 'left' -or $direction -eq 'right'
+      $sign = if ($direction -eq 'up' -or $direction -eq 'left') { 1 } else { -1 }
+      [NativeComputer]::Mouse($(if ($horizontal) { [NativeComputer]::MOUSEEVENTF_HWHEEL } else { [NativeComputer]::MOUSEEVENTF_WHEEL }), $sign * 120 * $pages)
+    }
+    'select_text' {
+      $needle = [string]$request.text
+      if (-not $needle) { throw 'select_text requires non-empty text.' }
+      $pattern = Try-Pattern $element ([System.Windows.Automation.TextPattern]::Pattern)
+      if ($null -eq $pattern) { throw 'Element does not support UI Automation text selection.' }
+      $document = $pattern.DocumentRange
+      $remaining = $document.Clone()
+      $match = $null
+      while ($null -ne $remaining) {
+        $candidate = $remaining.FindText($needle, $false, $false)
+        if ($null -eq $candidate) { break }
+        $before = $document.Clone(); $before.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::End, $candidate, [System.Windows.Automation.TextPatternRangeEndpoint]::Start) | Out-Null
+        $after = $document.Clone(); $after.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::Start, $candidate, [System.Windows.Automation.TextPatternRangeEndpoint]::End) | Out-Null
+        $prefix = [string]$request.prefix; $suffix = [string]$request.suffix
+        if ((-not $prefix -or $before.GetText(-1).EndsWith($prefix)) -and (-not $suffix -or $after.GetText(-1).StartsWith($suffix))) { $match = $candidate; break }
+        $remaining = $document.Clone()
+        $remaining.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::Start, $candidate, [System.Windows.Automation.TextPatternRangeEndpoint]::End) | Out-Null
+      }
+      if ($null -eq $match) { throw 'Text was not found in the Windows UI Automation element.' }
+      if ([string]$request.selectionType -eq 'cursor_before') { $match.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::End, $match, [System.Windows.Automation.TextPatternRangeEndpoint]::Start) | Out-Null }
+      elseif ([string]$request.selectionType -eq 'cursor_after') { $match.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::Start, $match, [System.Windows.Automation.TextPatternRangeEndpoint]::End) | Out-Null }
+      $match.Select()
+    }
     'press' {
       $pattern = Try-Pattern $element ([System.Windows.Automation.InvokePattern]::Pattern)
       if ($null -ne $pattern) { $pattern.Invoke(); break }
@@ -493,23 +669,154 @@ function Invoke-UIAElementAction($request) {
     }
     default { throw "Unsupported Windows UIA action: $action" }
   }
-  return @{ ok=$true; source='windows-uia'; action=$action }
+  $settled = if ($request.eventObserverActive) { @{ settleDurationMs=0; settleEventCount=0; settleSource='external-observer-pending' } } else { Complete-UIASettle $settleSubscription }
+  return @{ ok=$true; source='windows-uia'; action=$action; settleDurationMs=$settled.settleDurationMs; settleEventCount=$settled.settleEventCount; settleSource=$settled.settleSource }
+}
+
+function Invoke-WindowAction($request, $res) {
+  $windowId = [string]$request.windowId
+  $hwnd = [IntPtr][long]$windowId
+  if ($hwnd -eq [IntPtr]::Zero -or -not [NativeComputer]::IsWindow($hwnd)) { throw 'The Windows window is stale or unavailable; refresh computer_state.' }
+  if ($request.expectedName -and (Get-WindowTitle $hwnd) -ne [string]$request.expectedName) { throw 'The Windows window identity changed; refresh computer_state before acting.' }
+  $subscription = $null
+  try {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if ($null -ne $root) { $subscription = [UIASettleSubscription]::new($root) }
+  } catch {}
+  $action = [string]$request.action
+  switch ($action) {
+    'activate' {
+      [NativeComputer]::ShowWindow($hwnd, 9) | Out-Null
+      [NativeComputer]::BringWindowToTop($hwnd) | Out-Null
+      if (-not [NativeComputer]::SetForegroundWindow($hwnd)) { throw 'Windows refused to activate the selected window.' }
+    }
+    'close' { [NativeComputer]::PostMessage($hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null }
+    'minimize' { [NativeComputer]::ShowWindow($hwnd, 6) | Out-Null }
+    'maximize' { [NativeComputer]::ShowWindow($hwnd, 3) | Out-Null }
+    'restore' { [NativeComputer]::ShowWindow($hwnd, 9) | Out-Null }
+    'move_resize' {
+      if ($null -eq $request.x -or $null -eq $request.y -or $null -eq $request.width -or $null -eq $request.height -or [int]$request.width -le 0 -or [int]$request.height -le 0) {
+        throw 'move_resize requires x, y, and positive width and height.'
+      }
+      $x = [int][Math]::Round(([int]$request.x / [double]$res.api.width) * $res.display.width)
+      $y = [int][Math]::Round(([int]$request.y / [double]$res.api.height) * $res.display.height)
+      $width = [int][Math]::Round(([int]$request.width / [double]$res.api.width) * $res.display.width)
+      $height = [int][Math]::Round(([int]$request.height / [double]$res.api.height) * $res.display.height)
+      [NativeComputer]::ShowWindow($hwnd, 9) | Out-Null
+      if (-not [NativeComputer]::MoveWindow($hwnd, $x, $y, $width, $height, $true)) { throw 'Windows refused the requested window geometry.' }
+    }
+    default { throw "Unsupported Windows window action: $action" }
+  }
+  $settled = Complete-UIASettle $subscription
+  return @{ ok=$true; source='windows-win32-window'; action=$action; windowId=$windowId; settleDurationMs=$settled.settleDurationMs; settleEventCount=$settled.settleEventCount; settleSource=$settled.settleSource }
+}
+
+function Run-UIAObserverServer {
+  $observations = @{}
+  while ($null -ne ($line = [Console]::In.ReadLine())) {
+    $request = $null
+    try {
+      $request = $line | ConvertFrom-Json
+      $target = [string]$request.target
+      switch ([string]$request.command) {
+        'ping' { $response = @{ id=$request.id; ok=$true; source='windows-uia-service' } }
+        'watch' {
+          if (-not $observations.ContainsKey($target)) {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr][long]$target)
+            if ($null -eq $root) { throw 'Windows UIA observer target is stale.' }
+            $subscription = [UIASettleSubscription]::new($root)
+            if (-not $subscription.IsActive) { $subscription.Dispose(); throw 'Windows UIA event subscription is unavailable.' }
+            $observations[$target] = $subscription
+          }
+          $subscription = $observations[$target]
+          $response = @{ id=$request.id; ok=$true; source='windows-uia-service'; generation=[int]$subscription.EventCount }
+        }
+        'wait' {
+          if (-not $observations.ContainsKey($target)) { throw 'Windows UIA target is not watched.' }
+          $subscription = $observations[$target]
+          $baseline = if ($null -ne $request.baseline) { [int]$request.baseline } else { 0 }
+          $duration = $subscription.WaitForQuiet(
+            $(if ($request.minimumMs) { [int]$request.minimumMs } else { 180 }),
+            $(if ($request.quietMs) { [int]$request.quietMs } else { 250 }),
+            $(if ($request.maximumMs) { [int]$request.maximumMs } else { 5000 })
+          )
+          $response = @{ id=$request.id; ok=$true; source='windows-uia-service'; durationMs=[int]$duration; eventCount=[Math]::Max(0,[int]$subscription.EventCount-$baseline); generation=[int]$subscription.EventCount }
+        }
+        'unwatch' {
+          if ($observations.ContainsKey($target)) { $observations[$target].Dispose(); $observations.Remove($target) }
+          $response = @{ id=$request.id; ok=$true; source='windows-uia-service' }
+        }
+        default { throw 'Unsupported observer command.' }
+      }
+    } catch {
+      $response = @{ id=$(if ($null -ne $request) { $request.id } else { $null }); ok=$false; error=$_.Exception.Message }
+    }
+    [Console]::Out.WriteLine(($response | ConvertTo-Json -Depth 6 -Compress))
+    [Console]::Out.Flush()
+  }
+  foreach ($subscription in $observations.Values) { $subscription.Dispose() }
+}
+
+function Run-NativeRequestServer {
+  while ($null -ne ($line = [Console]::In.ReadLine())) {
+    $request = $null
+    try {
+      if ([Text.Encoding]::UTF8.GetByteCount($line) -gt 1048576) { throw 'Native request exceeds its size limit.' }
+      $request = $line | ConvertFrom-Json
+      if ([string]$request.command -ne 'request' -or $null -eq $request.payload) { throw 'Invalid native request envelope.' }
+      $payload = $request.payload | ConvertTo-Json -Depth 20 -Compress
+      $process = New-Object System.Diagnostics.Process
+      $process.StartInfo.FileName = 'powershell.exe'
+      $escapedPath = $PSCommandPath.Replace('"','\"')
+      $process.StartInfo.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$escapedPath`" --one-shot"
+      $process.StartInfo.UseShellExecute = $false
+      $process.StartInfo.CreateNoWindow = $true
+      $process.StartInfo.RedirectStandardInput = $true
+      $process.StartInfo.RedirectStandardOutput = $true
+      $process.StartInfo.RedirectStandardError = $true
+      if (-not $process.Start()) { throw 'Could not start native helper child.' }
+      $process.StandardInput.Write($payload)
+      $process.StandardInput.Close()
+      $output = $process.StandardOutput.ReadToEnd()
+      $errorOutput = $process.StandardError.ReadToEnd()
+      $process.WaitForExit()
+      if ($process.ExitCode -ne 0) { throw $(if ($errorOutput) { $errorOutput.Trim() } else { "Native helper child exited with $($process.ExitCode)." }) }
+      if ([Text.Encoding]::UTF8.GetByteCount($output) -gt 25165824) { throw 'Native helper child response exceeded its size limit.' }
+      $result = $output | ConvertFrom-Json
+      $response = @{ id=$request.id; ok=$true; result=$result }
+    } catch {
+      $response = @{ id=$(if ($null -ne $request) { $request.id } else { $null }); ok=$false; error=$_.Exception.Message }
+    }
+    [Console]::Out.WriteLine(($response | ConvertTo-Json -Depth 20 -Compress))
+    [Console]::Out.Flush()
+  }
 }
 
 try {
+  if ($args -contains '--request-server') { Run-NativeRequestServer; exit 0 }
+  if ($args -contains '--observer-server') { Run-UIAObserverServer; exit 0 }
   $text = [Console]::In.ReadToEnd()
   $request = $text | ConvertFrom-Json
   $apiWidth = if ($request.apiWidth) { [int]$request.apiWidth } else { 1280 }
   $res = Get-Resolution $apiWidth
+  $interactiveDesktop = Test-InteractiveDesktop
+  $mutatingActions = @($request.actions | Where-Object { [string]$_.action -ne 'screenshot' -and [string]$_.action -ne 'wait' })
+  if (($null -ne $request.elementAction -or $null -ne $request.windowAction -or $request.targetApplication -or $mutatingActions.Count -gt 0) -and -not $interactiveDesktop) {
+    Fail 'The Windows input desktop is locked, disconnected, or is a secure desktop; unlock the normal user desktop before sending computer input.'
+  }
   $elementActionResult = $null
   if ($null -ne $request.elementAction) { $elementActionResult = Invoke-UIAElementAction $request.elementAction }
+  $windowActionResult = $null
+  if ($null -ne $request.windowAction) { $windowActionResult = Invoke-WindowAction $request.windowAction $res }
   if ($request.targetApplication) {
     $target = [string]$request.targetApplication
     $needle = $target.ToLowerInvariant().Replace('win32:','')
     $candidate = @(Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and ($_.ProcessName.ToLowerInvariant() -eq $needle -or $_.MainWindowTitle.ToLowerInvariant().Contains($needle)) } | Select-Object -First 1)
     if ($candidate.Count -gt 0) {
-      [NativeComputer]::BringWindowToTop([IntPtr]$candidate[0].MainWindowHandle) | Out-Null
-      [NativeComputer]::SetForegroundWindow([IntPtr]$candidate[0].MainWindowHandle) | Out-Null
+      if ($request.activateTargetApplication -ne $false) {
+        [NativeComputer]::BringWindowToTop([IntPtr]$candidate[0].MainWindowHandle) | Out-Null
+        [NativeComputer]::SetForegroundWindow([IntPtr]$candidate[0].MainWindowHandle) | Out-Null
+      }
     } elseif ($target.StartsWith('startapp:')) {
       Start-Process explorer.exe "shell:AppsFolder\$($target.Substring(9))"
       Start-Sleep -Milliseconds 600
@@ -551,25 +858,35 @@ try {
       default { Fail "unsupported action $($a.action)" }
     }
   }
-  if (@($request.actions).Count -gt 0 -or $null -ne $request.elementAction) { Start-Sleep -Milliseconds 180 }
+  if (@($request.actions).Count -gt 0) { Start-Sleep -Milliseconds 180 }
   $listed = $null
   if ($request.includeElements) { $listed = Get-UIAElements $(if ($null -ne $request.elementOptions) { $request.elementOptions } else { [pscustomobject]@{} }) }
   $applications = if ($request.listApplications) { @(Get-Applications) } else { $null }
   $point = New-Object NativeComputer+POINT; [NativeComputer]::GetCursorPos([ref]$point) | Out-Null
   $active = [NativeComputer]::GetForegroundWindow(); $activeTitle = if ($active -ne [IntPtr]::Zero) { Get-WindowTitle $active } else { '' }
-  $shot = if ($request.includeScreenshot) { Capture-Screenshot $res } else { $null }
+  $screenshotBounds = if ($null -ne $listed) { $listed.screenshotBounds } else { $null }
+  if ($null -ne $screenshotBounds) {
+    $cropX = [Math]::Max(0, [int]$screenshotBounds.x); $cropY = [Math]::Max(0, [int]$screenshotBounds.y)
+    $cropWidth = [Math]::Min([int]$screenshotBounds.width, [int]$res.display.width - $cropX)
+    $cropHeight = [Math]::Min([int]$screenshotBounds.height, [int]$res.display.height - $cropY)
+    $screenshotBounds = if ($cropWidth -gt 0 -and $cropHeight -gt 0) { @{ x=$cropX; y=$cropY; width=$cropWidth; height=$cropHeight } } else { $null }
+  }
+  $shot = if ($request.includeScreenshot) { Capture-Screenshot $res $screenshotBounds } else { $null }
   $response = @{
     ok=$true; displayResolution=$res.display; apiResolution=$res.api; cursorPosition=Api-Point $point.X $point.Y $res
     activeWindow=if ($active -ne [IntPtr]::Zero) { @{ id=$active.ToInt64().ToString(); name=$activeTitle } } else { $null }
     windows=if ($request.includeWindows) { @(Get-VisibleWindows) } else { @() }
     screenshotMimeType=if ($shot) { 'image/png' } else { $null }; screenshotBase64=$shot
-    permissions=@{ interactiveDesktop=$true; elevated=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
+    screenshotScope=if ($shot) { if ($null -ne $screenshotBounds) { 'application' } else { 'desktop' } } else { $null }
+    screenshotBounds=if ($shot) { $screenshotBounds } else { $null }
+    permissions=@{ interactiveDesktop=$interactiveDesktop; screenLocked=(-not $interactiveDesktop); elevated=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
     elementSource=if ($null -ne $listed) { 'windows-uia' } else { $null }
     elementApplication=if ($null -ne $listed) { $listed.application } else { $null }
     elementApplicationId=if ($null -ne $listed) { $listed.applicationId } else { $null }
     elements=if ($null -ne $listed) { @($listed.elements) } else { $null }
     elementMessage=if ($null -ne $listed) { "Returned $(@($listed.elements).Count) Windows UI Automation elements." } else { $null }
     elementActionResult=$elementActionResult
+    windowActionResult=$windowActionResult
     applications=$applications
   }
   $response | ConvertTo-Json -Depth 12 -Compress

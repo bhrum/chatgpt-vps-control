@@ -14,13 +14,15 @@ await client.connect(transport);
 try {
   const tools = await client.listTools();
   const names = new Set(tools.tools.map((tool) => tool.name));
-  for (const name of ["computer_environment", "computer_elements", "computer_element_action", "computer_state", "computer_use", "run_shell_command", "file_info"]) {
+  for (const name of ["computer_environment", "computer_elements", "computer_element_action", "computer_state", "computer_window", "computer_use", "run_shell_command", "file_info"]) {
     assert.ok(names.has(name), `missing MCP tool: ${name}`);
   }
 
   const environment = await client.callTool({ name: "computer_environment", arguments: {} });
   assert.equal(environment.structuredContent.ready, true);
   assert.equal(environment.structuredContent.backend, "linux-x11");
+  assert.equal(environment.structuredContent.permissions.interactiveDesktop, true);
+  assert.equal(environment.structuredContent.permissions.screenLocked, false);
 
   const state = await client.callTool({ name: "computer_state", arguments: { includeScreenshot: true, includeWindows: false } });
   assert.equal(state.structuredContent.apiResolution.width, 1280);

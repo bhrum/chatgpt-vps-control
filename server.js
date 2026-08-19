@@ -12,6 +12,7 @@ import { z } from "zod";
 import { buildComputerToolDescriptors, registerComputerUseTools } from "./computer-use.js";
 import { startDeviceAgent } from "./lib/device-agent.js";
 import { attachDeviceGateway, buildDeviceToolDescriptors, registerDeviceTools } from "./lib/device-gateway.js";
+import { startBrowserExtensionBridge } from "./lib/browser-extension-bridge.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "127.0.0.1";
@@ -1966,10 +1967,13 @@ const httpServer = createServer(async (req, res) => {
 });
 
 await loadOAuthTokenStore();
+await startBrowserExtensionBridge();
 
 if (DEVICE_GATEWAY_ENABLED) {
+  const centralTools = TOOL_DESCRIPTORS.filter((tool) => !["list_devices", "describe_device_tool", "device_call"].includes(tool.name));
   attachDeviceGateway(httpServer, {
-    centralCapabilities: TOOL_DESCRIPTORS.filter((tool) => !["list_devices", "device_call"].includes(tool.name)).map((tool) => tool.name),
+    centralCapabilities: centralTools.map((tool) => tool.name),
+    centralTools,
   });
 }
 
