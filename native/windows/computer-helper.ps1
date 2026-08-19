@@ -301,31 +301,45 @@ function Get-UIAChildren($element) {
 function Resolve-UIAElement($payload) {
   $debugEnabled = $env:CHATGPT_COMPUTER_UIA_DEBUG -eq '1'
   $debug = New-Object System.Collections.Generic.List[string]
-  $root = Get-RootElement ([long]$payload.hwnd)
+  $hwnd = [long]$payload.hwnd
   $processId = [int]$payload.processId
-  if ($debugEnabled) { $debug.Add("hwnd=$([long]$payload.hwnd);pid=$processId;path=$(@($payload.path).Count);aid=$([bool][string]$payload.automationId);name=$([bool][string]$payload.name)") }
+  $root = Get-RootElement $hwnd
+  if ($debugEnabled) { $debug.Add("hwnd=$hwnd;pid=$processId;path=$(@($payload.path).Count);aid=$([bool][string]$payload.automationId);name=$([bool][string]$payload.name)") }
+
+  # A WinForms/WPF provider root reached through AutomationElement.FromHandle
+  # can expose a different ControlView subtree than the same top-level window
+  # reached through the desktop UIA tree. Snapshots are built from that desktop
+  # tree, so recover the matching desktop child by process and HWND before
+  # replaying the encoded path. This keeps element ids stable across short-lived
+  # helper processes without accepting an unrelated element.
   if ($processId -gt 0) {
-    $rootProcessId = 0
-    try { $rootProcessId = [int]$root.Current.ProcessId } catch {}
-    if ($rootProcessId -ne $processId) {
-      try {
-        $processCondition = [System.Windows.Automation.PropertyCondition]::new(
-          [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
-          $processId
-        )
-        $processRoot = [System.Windows.Automation.AutomationElement]::RootElement.FindFirst(
-          [System.Windows.Automation.TreeScope]::Children,
-          $processCondition
-        )
-        if ($null -eq $processRoot) {
-          $processRoot = [System.Windows.Automation.AutomationElement]::RootElement.FindFirst(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            $processCondition
-          )
-        }
-        if ($null -ne $processRoot) { $root = $processRoot; if ($debugEnabled) { $debug.Add('process-root=found') } }
-        elseif ($debugEnabled) { $debug.Add('process-root=missing') }
-      } catch { if ($debugEnabled) { $debug.Add('process-root=error:' + $_.Exception.GetType().Name) } }
+    try {
+      $processCondition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
+        $processId
+      )
+      $desktop = [System.Windows.Automation.AutomationElement]::RootElement
+      $processRoots = $desktop.FindAll([System.Windows.Automation.TreeScope]::Children, $processCondition)
+      $matchedRoot = $null
+      for ($i=0; $i -lt $processRoots.Count; $i++) {
+        $candidateRoot = $processRoots.Item($i)
+        try {
+          $candidateHwnd = [long]$candidateRoot.Current.NativeWindowHandle
+          if (($hwnd -ne 0 -and $candidateHwnd -eq $hwnd) -or ($hwnd -eq 0 -and $null -eq $matchedRoot)) {
+            $matchedRoot = $candidateRoot
+            if ($hwnd -ne 0) { break }
+          }
+        } catch {}
+      }
+      if ($null -eq $matchedRoot -and $processRoots.Count -eq 1) { $matchedRoot = $processRoots.Item(0) }
+      if ($null -ne $matchedRoot) {
+        $root = $matchedRoot
+        if ($debugEnabled) { $debug.Add('desktop-process-root=matched') }
+      } elseif ($debugEnabled) {
+        $debug.Add('desktop-process-root=missing')
+      }
+    } catch {
+      if ($debugEnabled) { $debug.Add('desktop-process-root=error:' + $_.Exception.GetType().Name) }
     }
   }
   $element = $root
