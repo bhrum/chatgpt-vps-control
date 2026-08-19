@@ -16,6 +16,8 @@ let reconnectTimer = null;
 let reconnectDelay = 500;
 const attachedTabs = new Set();
 const debuggerQueues = new Map();
+const childSessions = new Map();
+const childSessionWaiters = new Map();
 
 function randomId() {
   return crypto.randomUUID().replaceAll("-", "");
@@ -150,6 +152,88 @@ async function ensureDebugger(tabId) {
   });
 }
 
+function childSessionKey(tabId, parentSessionId, targetId) {
+  return `${tabId}:${String(parentSessionId || "")}:${String(targetId || "")}`;
+}
+
+function clearChildSessions(tabId) {
+  const prefix = `${tabId}:`;
+  for (const key of childSessions.keys()) if (key.startsWith(prefix)) childSessions.delete(key);
+  for (const [key, waiters] of childSessionWaiters) {
+    if (!key.startsWith(prefix)) continue;
+    for (const waiter of waiters) waiter.reject(new Error("Browser debugger child session closed."));
+    childSessionWaiters.delete(key);
+  }
+}
+
+function rememberChildSession(tabId, parentSessionId, targetId, sessionId) {
+  const key = childSessionKey(tabId, parentSessionId, targetId);
+  childSessions.set(key, String(sessionId));
+  const waiters = childSessionWaiters.get(key);
+  if (!waiters) return;
+  childSessionWaiters.delete(key);
+  for (const waiter of waiters) waiter.resolve(String(sessionId));
+}
+
+function forgetChildSession(tabId, sessionId) {
+  const prefix = `${tabId}:`;
+  for (const [key, value] of childSessions) {
+    if (key.startsWith(prefix) && value === String(sessionId)) childSessions.delete(key);
+  }
+}
+
+function waitForChildSession(key, timeoutMs = 3_000) {
+  let waiter;
+  const promise = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const waiters = childSessionWaiters.get(key);
+      waiters?.delete(waiter);
+      if (!waiters?.size) childSessionWaiters.delete(key);
+      reject(new Error("Timed out waiting for Chrome to attach the out-of-process iframe."));
+    }, timeoutMs);
+    waiter = {
+      resolve: (value) => { clearTimeout(timer); resolve(value); },
+      reject: (error) => { clearTimeout(timer); reject(error); },
+    };
+    const waiters = childSessionWaiters.get(key) ?? new Set();
+    waiters.add(waiter);
+    childSessionWaiters.set(key, waiters);
+  });
+  // A command may fail before autoAttachFrame awaits this promise. Attach a
+  // value-free rejection handler so teardown/cancellation can never surface as
+  // an unhandled service-worker rejection; callers still await the original.
+  void promise.catch(() => {});
+  return {
+    promise,
+    cancel(error) {
+      const waiters = childSessionWaiters.get(key);
+      waiters?.delete(waiter);
+      if (!waiters?.size) childSessionWaiters.delete(key);
+      waiter.reject(error);
+    },
+  };
+}
+
+async function autoAttachFrame(tabId, parentSessionId, frameTargetId) {
+  const key = childSessionKey(tabId, parentSessionId, frameTargetId);
+  const existing = childSessions.get(key);
+  if (existing) return existing;
+  const pending = waitForChildSession(key);
+  try {
+    const target = { tabId, ...(parentSessionId ? { sessionId: String(parentSessionId) } : {}) };
+    await withDebuggerLock(tabId, () => chrome.debugger.sendCommand(target, "Target.setAutoAttach", {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+      filter: [{ type: "iframe", exclude: false }],
+    }));
+    return childSessions.get(key) ?? await pending.promise;
+  } catch (error) {
+    pending.cancel(error);
+    throw error;
+  }
+}
+
 async function ensureAutomationGroup(tabId, current) {
   try {
     if (current.automationGroup != null) {
@@ -219,10 +303,20 @@ async function handleCommand(command, params) {
     await ensureDebugger(id);
     return withDebuggerLock(id, () => chrome.debugger.sendCommand(target, String(params.method), params.params || {}));
   }
+  if (command === "cdp_auto_attach_frame") {
+    const { id } = await requireClaimedTab(params.targetId);
+    const frameTargetId = String(params.frameTargetId || "");
+    const parentSessionId = String(params.parentSessionId || "");
+    if (!frameTargetId || frameTargetId.length > 200) throw new Error("cdp_auto_attach_frame requires a frame target id.");
+    if (parentSessionId.length > 200) throw new Error("cdp_auto_attach_frame parent session id is too long.");
+    await ensureDebugger(id);
+    return { sessionId: await autoAttachFrame(id, parentSessionId, frameTargetId) };
+  }
   if (command === "detach") {
     const { id, current } = await requireClaimedTab(params.targetId);
     await chrome.debugger.detach({ tabId: id }).catch(() => {});
     attachedTabs.delete(id);
+    clearChildSessions(id);
     if (!current.automation.has(id)) {
       current.claimed.delete(id);
       await saveSets(current);
@@ -248,6 +342,7 @@ async function handleCommand(command, params) {
     for (const id of ids) {
       current.retained.delete(id);
       attachedTabs.delete(id);
+      clearChildSessions(id);
     }
     await saveSets(current);
     await announce();
@@ -285,10 +380,16 @@ async function handleRequest(message) {
 }
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
-  if (source.tabId != null) post({ type: "cdp_event", targetId: String(source.tabId), method, params });
+  if (source.tabId == null) return;
+  if (method === "Target.attachedToTarget" && params?.sessionId && params?.targetInfo?.targetId) {
+    rememberChildSession(source.tabId, source.sessionId || "", params.targetInfo.targetId, params.sessionId);
+  } else if (method === "Target.detachedFromTarget" && params?.sessionId) {
+    forgetChildSession(source.tabId, params.sessionId);
+  }
+  post({ type: "cdp_event", targetId: String(source.tabId), method, params });
 });
 chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId != null) attachedTabs.delete(source.tabId);
+  if (source.tabId != null) { attachedTabs.delete(source.tabId); clearChildSessions(source.tabId); }
 });
 chrome.tabs.onUpdated.addListener(() => announce().catch(() => {}));
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -298,6 +399,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     current.automation.delete(tabId);
     current.retained.delete(tabId);
     attachedTabs.delete(tabId);
+    clearChildSessions(tabId);
     await saveSets(current);
     await announce();
   })().catch(() => {});

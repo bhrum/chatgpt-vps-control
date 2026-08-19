@@ -114,6 +114,14 @@ test("private browser bridge authenticates native hosts and correlates extension
     client.socket.write(`${JSON.stringify({ type: "response", requestId: childRequest.requestId, ok: true, result: { result: { value: "child-frame" } } })}\n`);
     assert.equal((await childPending).result.value, "child-frame");
 
+    const attachPending = extensionCdp.attachFrameTarget("oopif-target-7", "parent-session-7");
+    const attachRequest = await waitFor(() => client.messages.find((message) => message.type === "request" && message.command === "cdp_auto_attach_frame"));
+    assert.equal(attachRequest.params.targetId, "7");
+    assert.equal(attachRequest.params.frameTargetId, "oopif-target-7");
+    assert.equal(attachRequest.params.parentSessionId, "parent-session-7");
+    client.socket.write(`${JSON.stringify({ type: "response", requestId: attachRequest.requestId, ok: true, result: { sessionId: "oopif-session-7" } })}\n`);
+    assert.deepEqual(await attachPending, { sessionId: "oopif-session-7" });
+
     let captureAttempts = 0;
     const cdpRequests = [];
     client.onMessage((message) => {
@@ -209,6 +217,8 @@ test("packaged extension contains no remotely hosted executable code", async () 
   assert.match(background, /claim_tab/);
   assert.match(background, /chrome\.debugger\.sendCommand/);
   assert.match(background, /sessionId/);
+  assert.match(background, /Target\.setAutoAttach/);
+  assert.match(background, /cdp_auto_attach_frame/);
   assert.match(background, /chrome\.storage\.session/);
   assert.match(background, /onCreatedNavigationTarget/);
   assert.match(background, /ensureAutomationGroup/);
