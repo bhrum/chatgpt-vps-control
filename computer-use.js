@@ -18,6 +18,7 @@ const BROWSER_SESSION_ACTIONS = ["list", "start", "navigate", "new_tab", "activa
 const BROWSER_UTILITY_ACTIONS = ["export_html", "export_text", "export_pdf", "clipboard_read", "clipboard_write", "logs", "dialog_state", "dialog_accept", "dialog_dismiss", "downloads", "download_wait", "download_cancel"];
 const BROWSER_LOCATOR_ACTIONS = ["inspect", "wait_for", "click", "double_click", "hover", "focus", "fill", "type", "check", "uncheck", "select_option", "set_files", "drag_to", "press_key", "scroll_into_view", "scroll", "get_attribute"];
 const BROWSER_CUA_ACTIONS = ["screenshot", "click", "double_click", "move", "drag", "type", "key", "keypress", "scroll", "download_media", "wait"];
+const COMPUTER_USE_BRIDGE_OPERATIONS = ["list_apps", "get_app_state", "click", "drag", "perform_secondary_action", "press_key", "scroll", "select_text", "set_value", "type_text"];
 const WINDOW_ACTIONS = ["activate", "close", "minimize", "maximize", "restore", "move_resize"];
 const DEFAULT_SETTLE_MS = clampNumber(Number(process.env.COMPUTER_SCREENSHOT_SETTLE_MS ?? 2000), 0, 5000, 2000);
 const SEMANTIC_SETTLE_MIN_MS = clampNumber(Number(process.env.COMPUTER_SEMANTIC_SETTLE_MIN_MS ?? 800), 0, 3000, 800);
@@ -38,6 +39,7 @@ const MAX_ELEMENT_SNAPSHOTS = 24;
 const ELEMENT_ACTIONS = ["press", "click", "focus", "set_value", "select_text", "toggle", "increment", "decrement", "scroll_into_view", "scroll"];
 const ELEMENT_SNAPSHOTS = new Map();
 const APP_STATE_CACHE = new Map();
+const COMPUTER_USE_BRIDGE_STATES = new Map();
 const WINDOW_CLAIM_TTL_MS = 90_000;
 const WINDOW_CLAIM_SECRET = randomBytes(32);
 const WINDOW_CLAIMS = new Map();
@@ -186,6 +188,24 @@ const appStateResultShape = {
   screenshotMimeType: z.string().nullable(),
   screenshotScope: z.enum(["application", "desktop"]).nullable(),
   screenshotBounds: elementBoundsShape.nullable(),
+  message: z.string(),
+};
+const computerUseBridgeResultShape = {
+  operation: z.enum(COMPUTER_USE_BRIDGE_OPERATIONS),
+  app: z.string().nullable(),
+  applications: z.array(applicationShape),
+  snapshotId: z.string().nullable(),
+  expiresInMs: z.number().int().nullable(),
+  elementIndex: z.number().int().nullable(),
+  source: z.string().nullable(),
+  isDiff: z.boolean().nullable(),
+  text: z.string().nullable(),
+  coordinateSpace: z.enum(["application_screenshot", "semantic_element", "none"]),
+  screenshotIncluded: z.boolean(),
+  screenshotMimeType: z.string().nullable(),
+  screenshotScope: z.enum(["application", "desktop", "browser"]).nullable(),
+  screenshotBounds: elementBoundsShape.nullable(),
+  durationMs: z.number().int(),
   message: z.string(),
 };
 const browserTargetShape = z.object({
@@ -450,6 +470,29 @@ const appStateResultJsonSchema = {
     screenshotIncluded: { type: "boolean" }, screenshotMimeType: { type: ["string", "null"] }, screenshotScope: { type: ["string", "null"], enum: ["application", "desktop", null] }, screenshotBounds: { anyOf: [elementBoundsJsonSchema, { type: "null" }] }, message: { type: "string" },
   },
   required: ["snapshotId", "expiresInMs", "application", "applicationId", "isDiff", "text", "screenshotIncluded", "screenshotMimeType", "screenshotScope", "screenshotBounds", "message"],
+  additionalProperties: false,
+};
+const computerUseBridgeResultJsonSchema = {
+  type: "object",
+  properties: {
+    operation: { type: "string", enum: COMPUTER_USE_BRIDGE_OPERATIONS },
+    app: { type: ["string", "null"] },
+    applications: { type: "array", items: applicationJsonSchema },
+    snapshotId: { type: ["string", "null"] },
+    expiresInMs: { type: ["integer", "null"] },
+    elementIndex: { type: ["integer", "null"] },
+    source: { type: ["string", "null"] },
+    isDiff: { type: ["boolean", "null"] },
+    text: { type: ["string", "null"] },
+    coordinateSpace: { type: "string", enum: ["application_screenshot", "semantic_element", "none"] },
+    screenshotIncluded: { type: "boolean" },
+    screenshotMimeType: { type: ["string", "null"] },
+    screenshotScope: { type: ["string", "null"], enum: ["application", "desktop", "browser", null] },
+    screenshotBounds: { anyOf: [elementBoundsJsonSchema, { type: "null" }] },
+    durationMs: { type: "integer" },
+    message: { type: "string" },
+  },
+  required: ["operation", "app", "applications", "snapshotId", "expiresInMs", "elementIndex", "source", "isDiff", "text", "coordinateSpace", "screenshotIncluded", "screenshotMimeType", "screenshotScope", "screenshotBounds", "durationMs", "message"],
   additionalProperties: false,
 };
 const browserTargetJsonSchema = {
@@ -1316,6 +1359,24 @@ function appStateLine(element) {
   return `${indent}${element.index} ${element.role}${details.length ? ` ${details.join(" | ")}` : ""}`;
 }
 
+export function pruneComputerUseBridgeElements(elements, { source = "", focusedWindowOnly = false } = {}) {
+  if (String(source) !== "macos-ax" || focusedWindowOnly) return elements;
+  let skippedSystemMenu = false;
+  return elements.filter((element) => {
+    const role = String(element.role ?? "");
+    // The full macOS application AX root eagerly exposes every item from every
+    // closed menu (including the system Apple menu and recent-document names).
+    // Computer Use keeps the menu bar and its app-level headings, but does not
+    // dump those inactive descendants into each state response.
+    if (role === "AXMenu" || role === "AXMenuItem") return false;
+    if (role === "AXMenuBarItem" && !skippedSystemMenu) {
+      skippedSystemMenu = true;
+      return false;
+    }
+    return true;
+  });
+}
+
 function buildAppStateText({ application, applicationId, elements, disableDiff, filterKey = "" }) {
   const cacheKey = `${applicationId || application || "frontmost"}\0${filterKey}`;
   const current = new Map(elements.map((element) => [appStateIdentity(element), element]));
@@ -1407,13 +1468,242 @@ async function refreshElementState(snapshot, { waitForSettle = true, elementSour
         // Preserve the successful action and settled semantic state when capture permission is unavailable.
       }
     }
+    if (snapshot.options?.bridgeMode) {
+      result = {
+        ...result,
+        elements: pruneComputerUseBridgeElements(result.elements ?? [], {
+          source: result.source ?? elementSource,
+          focusedWindowOnly: snapshot.options?.focusedWindowOnly === true,
+        }),
+      };
+    }
     const next = storeElementSnapshot(result, { ...(snapshot.options ?? {}), ...(nativeSource ? { source: "desktop" } : {}) });
     const application = result.application ?? result.target?.title ?? null;
     const applicationId = result.applicationId ?? (result.target?.id ? `browser:${result.target.id}` : null);
-    const rendered = buildAppStateText({ application, applicationId, elements: next.elements, disableDiff: false });
-    return { snapshot: next, rendered, screenshot: result.screenshot ?? null, settleDurationMs: Date.now() - started };
+    const rendered = buildAppStateText({
+      application,
+      applicationId,
+      elements: next.elements,
+      disableDiff: false,
+      filterKey: snapshot.options?.bridgeMode
+        ? JSON.stringify({ bridgeMode: true, focusedWindowOnly: snapshot.options?.focusedWindowOnly === true })
+        : "",
+    });
+    return {
+      snapshot: next,
+      rendered,
+      screenshot: result.screenshot ?? null,
+      application,
+      applicationId,
+      source: String(result.source ?? elementSource ?? "unknown"),
+      settleDurationMs: Date.now() - started,
+    };
   } catch {
     return null;
+  }
+}
+
+function computerUseBridgeKey(app) {
+  return String(app ?? "").trim().toLowerCase();
+}
+
+function rememberComputerUseBridgeState(app, snapshot, result) {
+  const entry = {
+    snapshotId: snapshot.snapshotId,
+    expiresAt: Date.now() + snapshot.expiresInMs,
+    screenshotBounds: result.screenshot?.scope === "application" ? result.screenshot?.bounds ?? null : null,
+  };
+  const keys = [app, result.applicationId, result.application].map(computerUseBridgeKey).filter(Boolean);
+  for (const key of keys) {
+    COMPUTER_USE_BRIDGE_STATES.delete(key);
+    COMPUTER_USE_BRIDGE_STATES.set(key, entry);
+  }
+  const now = Date.now();
+  for (const [key, value] of COMPUTER_USE_BRIDGE_STATES) {
+    if (value.expiresAt <= now || !ELEMENT_SNAPSHOTS.has(value.snapshotId)) COMPUTER_USE_BRIDGE_STATES.delete(key);
+  }
+  while (COMPUTER_USE_BRIDGE_STATES.size > 24) COMPUTER_USE_BRIDGE_STATES.delete(COMPUTER_USE_BRIDGE_STATES.keys().next().value);
+}
+
+function currentComputerUseBridgeState(app, expectedSnapshotId = "") {
+  cleanupElementSnapshots();
+  const key = computerUseBridgeKey(app);
+  const state = COMPUTER_USE_BRIDGE_STATES.get(key);
+  if (!state || state.expiresAt <= Date.now() || !ELEMENT_SNAPSHOTS.has(state.snapshotId)) {
+    COMPUTER_USE_BRIDGE_STATES.delete(key);
+    throw new Error(`No fresh Computer Use bridge state exists for ${app}. Call computer_use_bridge with operation=get_app_state first.`);
+  }
+  if (expectedSnapshotId && state.snapshotId !== expectedSnapshotId) {
+    throw new Error(`Computer Use bridge snapshot ${expectedSnapshotId} is stale for ${app}. Use the replacement snapshotId from the latest state.`);
+  }
+  return state;
+}
+
+function computerUseBridgeAlias(preferred, legacy, preferredName, legacyName) {
+  if (preferred !== undefined && legacy !== undefined && preferred !== legacy) {
+    throw new Error(`${preferredName} and ${legacyName} disagree; provide only one spelling.`);
+  }
+  return preferred ?? legacy;
+}
+
+async function readComputerUseBridgeState(app, disableDiff = false, focusedWindowOnly = false) {
+  const options = {
+    source: "desktop",
+    application: app,
+    maxElements: 500,
+    maxDepth: 40,
+    maxVisitedNodes: 20_000,
+    focusedWindowOnly,
+    includeStaticText: true,
+    includeContainers: true,
+    launchIfNeeded: true,
+    activateApplication: false,
+    includeScreenshot: true,
+    bridgeMode: true,
+  };
+  const listed = await listSemanticElements(options);
+  const result = {
+    ...listed,
+    elements: pruneComputerUseBridgeElements(listed.elements ?? [], {
+      source: listed.source,
+      focusedWindowOnly,
+    }),
+  };
+  const snapshot = storeElementSnapshot(result, options);
+  const application = result.application == null ? null : String(result.application);
+  const applicationId = result.applicationId == null ? null : String(result.applicationId);
+  const rendered = buildAppStateText({
+    application,
+    applicationId,
+    elements: snapshot.elements,
+    disableDiff: disableDiff === true,
+    filterKey: JSON.stringify({ bridgeMode: true, focusedWindowOnly }),
+  });
+  let screenshot = result.screenshot ?? null;
+  if (!screenshot) {
+    try {
+      const fallback = (await captureComputerAfterSemanticAction()).screenshot;
+      screenshot = fallback ? { ...fallback, scope: "desktop", bounds: null } : null;
+    }
+    catch {}
+  }
+  const normalizedResult = { ...result, screenshot };
+  rememberComputerUseBridgeState(app, snapshot, normalizedResult);
+  return {
+    snapshot,
+    application: applicationId || application || String(app),
+    source: String(result.source ?? nativeComputerBackendName()),
+    rendered,
+    screenshot,
+  };
+}
+
+async function bridgeScreenshotPoints(app, snapshotId, points) {
+  const state = currentComputerUseBridgeState(app, snapshotId);
+  const bounds = state.screenshotBounds;
+  if (!bounds || bounds.width <= 0 || bounds.height <= 0) {
+    throw new Error(`Application-screenshot coordinates are unavailable for ${app}. Refresh get_app_state and use a semantic element index.`);
+  }
+  for (const { x, y } of points) {
+    if (![x, y].every(Number.isFinite) || x < 0 || y < 0 || x >= bounds.width || y >= bounds.height) {
+      throw new Error(`Coordinate (${x}, ${y}) is outside the ${bounds.width}x${bounds.height} application screenshot.`);
+    }
+  }
+  if (process.platform === "darwin") {
+    const scale = API_WIDTH / bounds.width;
+    return points.map(({ x, y }) => ({ x: Math.round(x * scale), y: Math.round(y * scale) }));
+  }
+
+  // The macOS helper natively accepts app-local coordinates. Windows and X11
+  // use a desktop-wide normalized input space, so translate the exact crop
+  // origin returned with get_app_state before sending their raw action.
+  let resolution;
+  if (nativeComputerBackendSupported()) {
+    resolution = (await nativeComputerState({ includeScreenshot: false, includeWindows: false })).resolution;
+  } else {
+    resolution = await detectResolution(await resolveDisplay());
+  }
+  return points.map(({ x, y }) => displayToApi({ x: bounds.x + x, y: bounds.y + y }, resolution));
+}
+
+async function performComputerUseBridgeElementAction({ app, snapshotId, elementIndex, action, value, text, prefix, suffix, selectionType, button, count, direction, pages, nativeAction }) {
+  const bridgeState = currentComputerUseBridgeState(app, snapshotId);
+  const { snapshot, element } = getSnapshotElement(bridgeState.snapshotId, elementIndex);
+  const source = String(element.source ?? "unknown");
+  const effectiveAction = nativeAction ? `native:${nativeAction}` : action;
+  if (nativeAction) {
+    const advertised = Array.isArray(element.nativeActions) ? element.nativeActions.map(String) : [];
+    if (!advertised.includes(nativeAction)) throw new Error(`Element ${elementIndex} does not advertise native action ${nativeAction}.`);
+  } else if (Array.isArray(element.actions) && !element.actions.includes(action)) {
+    throw new Error(`Element ${elementIndex} does not advertise action ${action}. Available: ${element.actions.join(", ") || "none"}.`);
+  }
+  const actionResult = await semanticElementAction({
+    elementId: element.id,
+    action: effectiveAction,
+    value: value ?? "",
+    text: text ?? "",
+    prefix: prefix ?? "",
+    suffix: suffix ?? "",
+    selectionType: selectionType ?? "text",
+    button: button ?? "left",
+    count: count ?? 1,
+    direction: direction ?? "down",
+    pages: pages ?? 1,
+  });
+  ELEMENT_SNAPSHOTS.delete(bridgeState.snapshotId);
+  const eventSettled = ["ax-observer", "uia-events", "atspi-events", "macos-ax-service", "windows-uia-service", "linux-atspi-service"].includes(String(actionResult?.settleSource ?? ""));
+  const refreshed = await refreshElementState(snapshot, { waitForSettle: !eventSettled, elementSource: source });
+  if (refreshed) {
+    const result = {
+      application: refreshed.application ?? snapshot.options?.application ?? app,
+      applicationId: refreshed.applicationId ?? snapshot.options?.application ?? app,
+      screenshot: refreshed.screenshot,
+    };
+    rememberComputerUseBridgeState(app, refreshed.snapshot, result);
+    return {
+      snapshot: refreshed.snapshot,
+      application: String(app),
+      source: refreshed.source || source,
+      rendered: refreshed.rendered,
+      screenshot: refreshed.screenshot ?? actionResult?.screenshot ?? null,
+    };
+  }
+  return readComputerUseBridgeState(app, false, snapshot.options?.focusedWindowOnly === true);
+}
+
+async function performComputerUseBridgeRawAction(app, snapshotId, action) {
+  const bridgeState = currentComputerUseBridgeState(app, snapshotId);
+  const snapshot = ELEMENT_SNAPSHOTS.get(bridgeState.snapshotId);
+  const focusedWindowOnly = snapshot?.options?.focusedWindowOnly === true;
+  let actionScreenshot = null;
+  if (nativeComputerBackendSupported()) {
+    const state = await nativeComputerUse([action], {
+      application: app,
+      activateApplication: process.platform !== "darwin",
+    });
+    actionScreenshot = state.screenshot;
+  } else {
+    const display = await resolveDisplay();
+    const resolution = await detectResolution(display);
+    await assertLinuxInteractiveSession([action]);
+    await activateLinuxApplication(app);
+    await executeAction(display, resolution, action);
+    if (actionRequiresSettle(action) && DEFAULT_SETTLE_MS > 0) await sleep(DEFAULT_SETTLE_MS);
+    actionScreenshot = await captureScreenshot(display, resolution);
+  }
+  // The observed state is consumed by every write. A caller must use the
+  // replacement state returned below before attempting another indexed action.
+  ELEMENT_SNAPSHOTS.delete(bridgeState.snapshotId);
+  try {
+    return await readComputerUseBridgeState(app, false, focusedWindowOnly);
+  } catch {
+    return {
+      snapshot: null,
+      application: String(app),
+      source: nativeComputerBackendSupported() ? nativeComputerBackendName() : "linux-x11",
+      rendered: null,
+      screenshot: actionScreenshot,
+    };
   }
 }
 
@@ -1780,6 +2070,51 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
       securitySchemes: writeSecuritySchemes,
       _meta: toolMeta("Controlling computer", "Computer action finished", writeSecuritySchemes),
+    },
+    {
+      name: "computer_use_bridge",
+      title: "Computer Use-compatible remote bridge",
+      description:
+        "Drive a selected remote application through one MCP entrypoint that mirrors the app-scoped Computer Use contract: list_apps, get_app_state, click, drag, perform_secondary_action, press_key, scroll, select_text, set_value, and type_text. Call get_app_state before element or screenshot-coordinate actions. Coordinates use the returned application screenshot itself, while the bridge privately handles native normalization, short-lived snapshots, diffing, event settling, and stale-index rejection.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          operation: { type: "string", enum: COMPUTER_USE_BRIDGE_OPERATIONS },
+          app: { type: "string", minLength: 1, maxLength: 500 },
+          disableDiff: { type: "boolean", default: false },
+          focusedWindowOnly: { type: "boolean", default: false, description: "Limit state to the focused app window. The default returns the complete application tree, including its menu bar." },
+          snapshotId: { type: "string", minLength: 8, maxLength: 200, description: "Required for every write; must match the latest get_app_state or action response." },
+          snapshot_id: { type: "string", minLength: 8, maxLength: 200, description: "Snake-case alias for snapshotId." },
+          elementIndex: { type: "integer", minimum: 0 },
+          element_index: { type: "integer", minimum: 0, description: "Computer Use-compatible alias for elementIndex." },
+          x: { type: "number", minimum: 0 }, y: { type: "number", minimum: 0 },
+          fromX: { type: "number", minimum: 0 }, fromY: { type: "number", minimum: 0 },
+          toX: { type: "number", minimum: 0 }, toY: { type: "number", minimum: 0 },
+          from_x: { type: "number", minimum: 0 }, from_y: { type: "number", minimum: 0 },
+          to_x: { type: "number", minimum: 0 }, to_y: { type: "number", minimum: 0 },
+          mouseButton: { type: "string", enum: ["left", "right", "middle", "l", "r", "m"], default: "left" },
+          mouse_button: { type: "string", enum: ["left", "right", "middle", "l", "r", "m"] },
+          clickCount: { type: "integer", minimum: 1, maximum: 3, default: 1 },
+          click_count: { type: "integer", minimum: 1, maximum: 3 },
+          direction: { type: "string", enum: ["up", "down", "left", "right", "u", "d", "l", "r"] },
+          pages: { type: "integer", minimum: 1, maximum: 100, default: 1 },
+          value: { type: "string", maxLength: MAX_TEXT_CHARS },
+          text: { type: "string", maxLength: MAX_TEXT_CHARS },
+          prefix: { type: "string", maxLength: 2000 }, suffix: { type: "string", maxLength: 2000 },
+          selectionType: { type: "string", enum: ["text", "cursor_before", "cursor_after"], default: "text" },
+          selection_type: { type: "string", enum: ["text", "cursor_before", "cursor_after"] },
+          key: { type: "string", minLength: 1, maxLength: 128 },
+          nativeAction: { type: "string", minLength: 1, maxLength: MAX_NATIVE_ACTION_CHARS },
+          action: { type: "string", minLength: 1, maxLength: MAX_NATIVE_ACTION_CHARS, description: "Computer Use-compatible secondary accessibility action name." },
+          description: { type: "string", maxLength: 500 },
+        },
+        required: ["operation"],
+        additionalProperties: false,
+      },
+      outputSchema: computerUseBridgeResultJsonSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Driving remote application", "Remote application action finished", writeSecuritySchemes),
     },
     {
       name: "computer_browser_cua",
@@ -2759,6 +3094,184 @@ export function registerComputerUseTools(server, options) {
           isError: true,
           content: [{ type: "text", text: `Computer action failed: ${message}` }],
         };
+      }
+    }
+  );
+
+  server.registerTool(
+    "computer_use_bridge",
+    {
+      title: "Computer Use-compatible remote bridge",
+      description: "Use the Computer Use app contract through an authenticated remote MCP device, with application-screenshot coordinates, semantic indexes, fresh-state diffing, and stale-index protection.",
+      inputSchema: {
+        operation: z.enum(COMPUTER_USE_BRIDGE_OPERATIONS),
+        app: z.string().min(1).max(500).optional(),
+        disableDiff: z.boolean().default(false).optional(),
+        focusedWindowOnly: z.boolean().default(false).optional(),
+        snapshotId: z.string().min(8).max(200).optional(),
+        snapshot_id: z.string().min(8).max(200).optional(),
+        elementIndex: z.number().int().min(0).optional(),
+        element_index: z.number().int().min(0).optional(),
+        x: z.number().min(0).optional(), y: z.number().min(0).optional(),
+        fromX: z.number().min(0).optional(), fromY: z.number().min(0).optional(),
+        toX: z.number().min(0).optional(), toY: z.number().min(0).optional(),
+        from_x: z.number().min(0).optional(), from_y: z.number().min(0).optional(),
+        to_x: z.number().min(0).optional(), to_y: z.number().min(0).optional(),
+        mouseButton: z.enum(["left", "right", "middle", "l", "r", "m"]).optional(),
+        mouse_button: z.enum(["left", "right", "middle", "l", "r", "m"]).optional(),
+        clickCount: z.number().int().min(1).max(3).optional(),
+        click_count: z.number().int().min(1).max(3).optional(),
+        direction: z.enum(["up", "down", "left", "right", "u", "d", "l", "r"]).optional(),
+        pages: z.number().int().min(1).max(100).default(1).optional(),
+        value: z.string().max(MAX_TEXT_CHARS).optional(),
+        text: z.string().max(MAX_TEXT_CHARS).optional(),
+        prefix: z.string().max(2000).optional(), suffix: z.string().max(2000).optional(),
+        selectionType: z.enum(["text", "cursor_before", "cursor_after"]).optional(),
+        selection_type: z.enum(["text", "cursor_before", "cursor_after"]).optional(),
+        key: z.string().min(1).max(128).optional(),
+        nativeAction: z.string().min(1).max(MAX_NATIVE_ACTION_CHARS).optional(),
+        action: z.string().min(1).max(MAX_NATIVE_ACTION_CHARS).optional(),
+        description: z.string().max(500).optional(),
+      },
+      outputSchema: computerUseBridgeResultShape,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Driving remote application", "Remote application action finished", writeSecuritySchemes),
+    },
+    async ({ operation, app, disableDiff, focusedWindowOnly, snapshotId, snapshot_id, elementIndex, element_index, x, y, fromX, fromY, toX, toY, from_x, from_y, to_x, to_y, mouseButton, mouse_button, clickCount, click_count, direction, pages, value, text, prefix, suffix, selectionType, selection_type, key, nativeAction, action: advertisedAction, description }) => {
+      if (!hasWriteScope()) return toolAuthError(writeAuthChallenge);
+      const started = Date.now();
+      const mutating = operation !== "list_apps" && operation !== "get_app_state";
+      try {
+        if (operation === "list_apps") {
+          const applications = await listSemanticApplications();
+          const structuredContent = {
+            operation, app: null, applications, snapshotId: null, expiresInMs: null,
+            elementIndex: null, source: null, isDiff: null, text: null, coordinateSpace: "none",
+            screenshotIncluded: false, screenshotMimeType: null, screenshotScope: null, screenshotBounds: null,
+            durationMs: Date.now() - started,
+            message: `Found ${applications.length} applications through the Computer Use-compatible remote bridge.`,
+          };
+          return { structuredContent, content: [{ type: "text", text: structuredContent.message }] };
+        }
+        if (!app) throw new Error(`${operation} requires app.`);
+
+        const selectedSnapshotId = computerUseBridgeAlias(snapshot_id, snapshotId, "snapshot_id", "snapshotId");
+        const selectedElementIndex = computerUseBridgeAlias(element_index, elementIndex, "element_index", "elementIndex");
+        const selectedFromX = computerUseBridgeAlias(from_x, fromX, "from_x", "fromX");
+        const selectedFromY = computerUseBridgeAlias(from_y, fromY, "from_y", "fromY");
+        const selectedToX = computerUseBridgeAlias(to_x, toX, "to_x", "toX");
+        const selectedToY = computerUseBridgeAlias(to_y, toY, "to_y", "toY");
+        const selectedMouseButton = computerUseBridgeAlias(mouse_button, mouseButton, "mouse_button", "mouseButton") ?? "left";
+        const selectedClickCount = computerUseBridgeAlias(click_count, clickCount, "click_count", "clickCount") ?? 1;
+        const selectedSelectionType = computerUseBridgeAlias(selection_type, selectionType, "selection_type", "selectionType") ?? "text";
+        const selectedNativeAction = computerUseBridgeAlias(advertisedAction, nativeAction, "action", "nativeAction");
+        if (operation !== "get_app_state" && !selectedSnapshotId) {
+          throw new Error(`${operation} requires snapshot_id from the latest get_app_state or action response.`);
+        }
+
+        let state;
+        let coordinateSpace = "none";
+        if (operation === "get_app_state") {
+          state = await readComputerUseBridgeState(app, disableDiff === true, focusedWindowOnly === true);
+          coordinateSpace = state.screenshot?.scope === "application" && state.screenshot?.bounds
+            ? "application_screenshot"
+            : "none";
+        } else if (operation === "click" && selectedElementIndex !== undefined) {
+          state = await performComputerUseBridgeElementAction({ app, snapshotId: selectedSnapshotId, elementIndex: selectedElementIndex, action: "click", button: ({ l: "left", r: "right", m: "middle" })[selectedMouseButton] ?? selectedMouseButton, count: selectedClickCount });
+          coordinateSpace = "semantic_element";
+        } else if (operation === "scroll" && selectedElementIndex !== undefined) {
+          const normalizedDirection = ({ u: "up", d: "down", l: "left", r: "right" })[direction] ?? direction;
+          if (!normalizedDirection) throw new Error("scroll requires direction.");
+          state = await performComputerUseBridgeElementAction({ app, snapshotId: selectedSnapshotId, elementIndex: selectedElementIndex, action: "scroll", direction: normalizedDirection, pages });
+          coordinateSpace = "semantic_element";
+        } else if (operation === "set_value") {
+          if (selectedElementIndex === undefined || value === undefined) throw new Error("set_value requires element_index and value.");
+          state = await performComputerUseBridgeElementAction({ app, snapshotId: selectedSnapshotId, elementIndex: selectedElementIndex, action: "set_value", value });
+          coordinateSpace = "semantic_element";
+        } else if (operation === "select_text") {
+          if (selectedElementIndex === undefined || !text) throw new Error("select_text requires element_index and non-empty text.");
+          state = await performComputerUseBridgeElementAction({ app, snapshotId: selectedSnapshotId, elementIndex: selectedElementIndex, action: "select_text", text, prefix, suffix, selectionType: selectedSelectionType });
+          coordinateSpace = "semantic_element";
+        } else if (operation === "perform_secondary_action") {
+          if (selectedElementIndex === undefined || !selectedNativeAction) throw new Error("perform_secondary_action requires element_index and an advertised action from get_app_state.");
+          state = await performComputerUseBridgeElementAction({ app, snapshotId: selectedSnapshotId, elementIndex: selectedElementIndex, nativeAction: selectedNativeAction });
+          coordinateSpace = "semantic_element";
+        } else {
+          let action;
+          if (operation === "click") {
+            if (x === undefined || y === undefined) throw new Error("coordinate click requires x and y from the latest application screenshot.");
+            const [point] = await bridgeScreenshotPoints(app, selectedSnapshotId, [{ x, y }]);
+            action = { action: "click", ...point, button: ({ l: "left", r: "right", m: "middle" })[selectedMouseButton] ?? selectedMouseButton, count: selectedClickCount };
+          } else if (operation === "drag") {
+            if ([selectedFromX, selectedFromY, selectedToX, selectedToY].some((coordinate) => coordinate === undefined)) throw new Error("drag requires from_x, from_y, to_x, and to_y from the latest application screenshot.");
+            const [from, to] = await bridgeScreenshotPoints(app, selectedSnapshotId, [
+              { x: selectedFromX, y: selectedFromY },
+              { x: selectedToX, y: selectedToY },
+            ]);
+            action = { action: "drag", x: from.x, y: from.y, x2: to.x, y2: to.y, button: "left" };
+          } else if (operation === "press_key") {
+            if (!key) throw new Error("press_key requires key.");
+            action = { action: "key", key };
+          } else if (operation === "type_text") {
+            if (text === undefined) throw new Error("type_text requires text.");
+            action = { action: "type", text };
+          } else if (operation === "scroll") {
+            const normalizedDirection = ({ u: "up", d: "down", l: "left", r: "right" })[direction] ?? direction;
+            if (!normalizedDirection) throw new Error("scroll requires direction.");
+            action = { action: "scroll", direction: normalizedDirection, amount: Math.min(100, Math.max(1, pages ?? 1) * 8) };
+          } else {
+            throw new Error(`Unsupported Computer Use bridge operation: ${operation}.`);
+          }
+          state = await performComputerUseBridgeRawAction(app, selectedSnapshotId, action);
+          coordinateSpace = operation === "click" || operation === "drag" ? "application_screenshot" : "none";
+        }
+
+        const screenshot = state.screenshot ?? null;
+        const structuredContent = {
+          operation,
+          app: state.application ?? String(app),
+          applications: [],
+          snapshotId: state.snapshot?.snapshotId ?? null,
+          expiresInMs: state.snapshot?.expiresInMs ?? null,
+          elementIndex: selectedElementIndex ?? null,
+          source: state.source ?? null,
+          isDiff: state.rendered?.isDiff ?? null,
+          text: state.rendered?.text ?? null,
+          coordinateSpace,
+          screenshotIncluded: Boolean(screenshot),
+          screenshotMimeType: screenshot?.mimeType ?? null,
+          screenshotScope: screenshot?.scope ?? (screenshot ? "desktop" : null),
+          screenshotBounds: screenshot?.bounds ?? null,
+          durationMs: Date.now() - started,
+          message: operation === "get_app_state"
+            ? `Returned fresh Computer Use-compatible state for ${app}; ${coordinateSpace === "application_screenshot" ? "the image is the application-local coordinate space" : "no application-local coordinate image is available, so use semantic indexes"} and snapshot ${state.snapshot?.snapshotId ?? "unavailable"} is short-lived.`
+            : `Completed Computer Use-compatible ${operation} for ${app}${state.snapshot ? `; use refreshed snapshot ${state.snapshot.snapshotId}` : ""}.`,
+        };
+        if (mutating) {
+          const detail = selectedElementIndex === undefined ? "" : ` element ${selectedElementIndex}`;
+          await audit?.({
+            command: `computer_use_bridge ${operation} ${app}${detail}${description ? ` (${description})` : ""}`,
+            cwd: state.source ?? "computer", status: "completed", exitCode: 0, signal: null,
+            durationMs: structuredContent.durationMs, stdout: structuredContent.message, stderr: "", truncated: false,
+          });
+        }
+        return {
+          structuredContent,
+          content: [
+            { type: "text", text: structuredContent.message },
+            ...(structuredContent.text ? [{ type: "text", text: structuredContent.text }] : []),
+            ...(screenshot ? [{ type: "image", data: screenshot.data, mimeType: screenshot.mimeType }] : []),
+          ],
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (mutating) await audit?.({
+          command: `computer_use_bridge ${operation}${app ? ` ${app}` : ""}`,
+          cwd: "computer", status: "failed", exitCode: 1, signal: null,
+          durationMs: Date.now() - started, stdout: "", stderr: message, truncated: false,
+        }).catch(() => {});
+        return { isError: true, content: [{ type: "text", text: `Computer Use bridge failed: ${message}` }] };
       }
     }
   );

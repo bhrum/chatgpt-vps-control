@@ -17,6 +17,8 @@ This document records behavior reconstructed from the locally installed ChatGPT 
 4. Binary metadata exposes `RefetchableSkyshotAXTree`, accessibility-tree invalidation monitors, window-ordering and focused-element observers, `SyntheticAppFocusEnforcer`, `SystemFocusStealPreventer`, accelerated window screenshots, and `SCContentFilter(desktopIndependentWindow:)` use. This confirms that background window capture and focus-steal prevention are deliberate service features.
 5. The result formatter supports full trees, incremental diffs, cumulative diffs, selected text, focused elements, and app-specific instructions. Screenshot files are returned separately from accessibility text.
 6. Browser control uses a separate extension/CDP path: ordinary tabs are enumerated first, then an exact current tab is claimed before debugger attachment. Browser-internal UI and native dialogs remain desktop-service responsibilities.
+7. The distributed `sky.js` refuses its host-routed mode unless `nodeRepl.rpc` is present and reports that Computer Use requires a trusted Node REPL Sky service. The native-pipe path additionally depends on trusted host metadata and per-app approval. A general MCP process is not an authorized client of that private transport.
+8. Native service metadata contains `AXManualAccessibility`, `AXEnhancedUserInterface`, `AXVisibleChildren`, and accessibility-enablement symbols. Combined with the observed Fabushi tree difference, this supports explicitly enabling lazy embedded-web accessibility before traversal.
 
 ## Project mapping
 
@@ -27,6 +29,8 @@ This document records behavior reconstructed from the locally installed ChatGPT 
 - Focus-safe semantics: indexed AX press, value, selection, scrolling, and secondary actions operate on the target app without global focus changes.
 - Tree freshness: bounded traversal, short-lived indexed snapshots, event-driven invalidation/settling, and optional act-then-observe calls.
 - Existing signed-in Chrome: automatic tab enumeration, atomic claim, serialized debugger access, heartbeat/reconnect, tab grouping, child-tab inheritance, and user/automation ownership.
+- Remote compatibility: `computer_use_bridge` implements the public window-operation contract independently behind the authenticated device gateway; it does not proxy the private Sky pipe.
+- Protected-folder isolation: service and browser-host launchers execute a content-addressed package copy from the connector's private application-data directory.
 
 ## Limits of source recovery
 

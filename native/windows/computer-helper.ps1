@@ -259,7 +259,7 @@ function Mouse-Flags($button, $down) {
     default { if ($down) { return [NativeComputer]::MOUSEEVENTF_LEFTDOWN } else { return [NativeComputer]::MOUSEEVENTF_LEFTUP } }
   }
 }
-$vk = @{ 'return'=0x0D; 'enter'=0x0D; 'tab'=0x09; 'space'=0x20; 'backspace'=0x08; 'delete'=0x2E; 'escape'=0x1B; 'esc'=0x1B; 'left'=0x25; 'up'=0x26; 'right'=0x27; 'down'=0x28; 'home'=0x24; 'end'=0x23; 'pageup'=0x21; 'pagedown'=0x22; 'ctrl'=0x11; 'control'=0x11; 'alt'=0x12; 'shift'=0x10; 'meta'=0x5B; 'win'=0x5B; 'super'=0x5B }
+$vk = @{ 'return'=0x0D; 'enter'=0x0D; 'tab'=0x09; 'space'=0x20; 'backspace'=0x08; 'delete'=0x2E; 'escape'=0x1B; 'esc'=0x1B; 'left'=0x25; 'up'=0x26; 'right'=0x27; 'down'=0x28; 'home'=0x24; 'end'=0x23; 'pageup'=0x21; 'pagedown'=0x22; 'ctrl'=0x11; 'control'=0x11; 'ctrl_l'=0x11; 'ctrl_r'=0x11; 'control_l'=0x11; 'control_r'=0x11; 'alt'=0x12; 'alt_l'=0x12; 'alt_r'=0x12; 'option'=0x12; 'option_l'=0x12; 'option_r'=0x12; 'shift'=0x10; 'shift_l'=0x10; 'shift_r'=0x10; 'meta'=0x5B; 'meta_l'=0x5B; 'meta_r'=0x5B; 'cmd'=0x5B; 'command'=0x5B; 'win'=0x5B; 'super'=0x5B; 'super_l'=0x5B; 'super_r'=0x5B }
 function Send-KeyChord($raw) {
   $parts = ([string]$raw).ToLowerInvariant().Split('+') | Where-Object { $_ }
   if ($parts.Count -eq 0) { return }

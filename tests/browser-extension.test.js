@@ -58,8 +58,10 @@ test("browser extension install creates a stable isolated extension and allow-li
   const oldHome = process.env.COMPUTER_BROWSER_EXTENSION_HOME;
   process.env.COMPUTER_BROWSER_EXTENSION_HOME = join(root, "bridge");
   try {
-    const first = await installBrowserExtension({ currentPlatform: "linux", manifestDestinations: [{ browser: "test", directory: nativeDir }] });
-    const second = await installBrowserExtension({ currentPlatform: "linux", manifestDestinations: [{ browser: "test", directory: nativeDir }] });
+    const privateHost = join(root, "private-runtime", "scripts", "browser-extension-host.mjs");
+    const runtimeInstaller = async () => ({ root: resolve("."), browserHostPath: privateHost });
+    const first = await installBrowserExtension({ currentPlatform: "linux", manifestDestinations: [{ browser: "test", directory: nativeDir }], runtimeInstaller });
+    const second = await installBrowserExtension({ currentPlatform: "linux", manifestDestinations: [{ browser: "test", directory: nativeDir }], runtimeInstaller });
     assert.equal(first.extensionId, second.extensionId);
     assert.match(first.extensionId, /^[a-p]{32}$/);
     const manifest = JSON.parse(await readFile(join(first.extension, "manifest.json"), "utf8"));
@@ -72,6 +74,9 @@ test("browser extension install creates a stable isolated extension and allow-li
     const native = JSON.parse(await readFile(join(nativeDir, `${NATIVE_HOST_NAME}.json`), "utf8"));
     assert.deepEqual(native.allowed_origins, [`chrome-extension://${first.extensionId}/`]);
     assert.equal(native.type, "stdio");
+    const launcher = await readFile(first.launcher, "utf8");
+    assert.ok(launcher.includes(privateHost));
+    assert.equal(first.runtime, resolve("."));
     assert.equal((await browserExtensionStatus()).installed, true);
   } finally {
     if (oldHome === undefined) delete process.env.COMPUTER_BROWSER_EXTENSION_HOME; else process.env.COMPUTER_BROWSER_EXTENSION_HOME = oldHome;

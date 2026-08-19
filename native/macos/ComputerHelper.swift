@@ -458,10 +458,10 @@ func postKey(_ raw: String, targetPid: pid_t? = nil) {
     var flags: CGEventFlags = []
     for part in parts.dropLast() {
         switch part {
-        case "ctrl", "control": flags.insert(.maskControl)
-        case "alt", "option": flags.insert(.maskAlternate)
-        case "shift": flags.insert(.maskShift)
-        case "meta", "cmd", "command", "super": flags.insert(.maskCommand)
+        case "ctrl", "control", "ctrl_l", "ctrl_r", "control_l", "control_r": flags.insert(.maskControl)
+        case "alt", "option", "alt_l", "alt_r", "option_l", "option_r": flags.insert(.maskAlternate)
+        case "shift", "shift_l", "shift_r": flags.insert(.maskShift)
+        case "meta", "cmd", "command", "super", "meta_l", "meta_r", "super_l", "super_r": flags.insert(.maskCommand)
         default: break
         }
     }
@@ -705,6 +705,7 @@ func resolveRunningApplication(_ requested: String) -> NSRunningApplication? {
 func applicationWindowTarget(_ requested: String) -> (pid: pid_t, bounds: RectInfo)? {
     guard let app = resolveRunningApplication(requested) else { return nil }
     let root = AXUIElementCreateApplication(app.processIdentifier)
+    axEnableApplicationTree(root)
     if let focused = axAttribute(root, kAXFocusedWindowAttribute as CFString), CFGetTypeID(focused) == AXUIElementGetTypeID(),
        let bounds = axRect(unsafeBitCast(focused, to: AXUIElement.self)), bounds.width > 0, bounds.height > 0 {
         return (app.processIdentifier, bounds)
@@ -804,8 +805,36 @@ func axBool(_ element: AXUIElement, _ attribute: CFString, default fallback: Boo
     return fallback
 }
 
+// Chromium, Electron, WKWebView, and some other embedded web runtimes keep
+// their rich accessibility subtree lazy until an assistive client explicitly
+// enables it. These attributes are intentionally best-effort: ordinary
+// AppKit applications commonly reject one or both, while web-backed apps use
+// them to expose the same controls that VoiceOver and Computer Use can see.
+func axEnableApplicationTree(_ application: AXUIElement) {
+    for attribute in ["AXManualAccessibility", "AXEnhancedUserInterface"] {
+        _ = AXUIElementSetAttributeValue(application, attribute as CFString, kCFBooleanTrue)
+    }
+}
+
 func axChildren(_ element: AXUIElement) -> [AXUIElement] {
-    (axAttribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement]) ?? []
+    // AXChildren remains authoritative for path resolution. Web areas and
+    // virtualized controls can expose additional descendants through one of
+    // the other standard AX collections, so merge them deterministically and
+    // remove native-object duplicates.
+    let attributes = [
+        "AXChildren",
+        "AXChildrenInNavigationOrder",
+        "AXVisibleChildren",
+        "AXContents",
+    ]
+    var result: [AXUIElement] = []
+    for attribute in attributes {
+        guard let children = axAttribute(element, attribute as CFString) as? [AXUIElement] else { continue }
+        for child in children where !result.contains(where: { CFEqual($0, child) }) {
+            result.append(child)
+        }
+    }
+    return result
 }
 
 func axActions(_ element: AXUIElement) -> [String] {
@@ -849,6 +878,7 @@ func axDecodeElementId(_ value: String) -> (pid: pid_t, path: [Int])? {
 
 func axResolve(pid: pid_t, path: [Int]) -> AXUIElement? {
     var element = AXUIElementCreateApplication(pid)
+    axEnableApplicationTree(element)
     for index in path {
         let children = axChildren(element)
         guard index >= 0 && index < children.count else { return nil }
@@ -863,6 +893,10 @@ let axInteractiveRoles: Set<String> = [
     "AXTextField", "AXToolbarButton"
 ]
 let axStaticRoles: Set<String> = ["AXHeading", "AXImage", "AXStaticText"]
+let axContainerRoles: Set<String> = [
+    "AXApplication", "AXWindow", "AXGroup", "AXWebArea", "AXScrollArea", "AXToolbar",
+    "AXMenuBar", "AXMenu", "AXList", "AXTable", "AXOutline", "AXRow"
+]
 
 func semanticActions(_ element: AXUIElement, role: String, native: [String]) -> [String] {
     var result: [String] = []
@@ -909,6 +943,7 @@ func listAXElements(options: ElementOptions?) -> (application: String, applicati
     guard let app else { return ("", "", [], nil, nil) }
     let pid = app.processIdentifier
     let root = AXUIElementCreateApplication(pid)
+    axEnableApplicationTree(root)
     var screenshotBounds: RectInfo? = nil
     var focusedWindow: AXUIElement? = nil
     if let focusedValue = axAttribute(root, kAXFocusedWindowAttribute as CFString), CFGetTypeID(focusedValue) == AXUIElementGetTypeID() {
@@ -936,7 +971,10 @@ func listAXElements(options: ElementOptions?) -> (application: String, applicati
         let elementDescription = axString(element, kAXDescriptionAttribute as CFString)
         let identifier = axString(element, kAXIdentifierAttribute as CFString)
         let hasIdentity = !title.isEmpty || !elementDescription.isEmpty || !identifier.isEmpty
-        let interesting = axInteractiveRoles.contains(role) || axBool(element, kAXFocusedAttribute as CFString) || (includeStatic && axStaticRoles.contains(role)) || (includeContainers && hasIdentity)
+        let interesting = axInteractiveRoles.contains(role)
+            || axBool(element, kAXFocusedAttribute as CFString)
+            || (includeStatic && axStaticRoles.contains(role))
+            || (includeContainers && (hasIdentity || axContainerRoles.contains(role)))
         if depth > 0 && interesting {
             let roleMatches = roleFilter.isEmpty || role.lowercased() == roleFilter
             var queryMatches = query.isEmpty
@@ -946,8 +984,14 @@ func listAXElements(options: ElementOptions?) -> (application: String, applicati
             }
             if roleMatches && queryMatches { result.append(axElementInfo(element, pid: pid, path: path, depth: depth)) }
         }
+        // Match the compact Computer Use tree: retain the menu bar and its
+        // application-level headings, but do not recursively enumerate every
+        // item from closed menus. The first macOS menu-bar child is the system
+        // Apple menu, not part of the target application's own menu contract.
+        if role == "AXMenuBarItem" { return }
         for (index, child) in axChildren(element).prefix(500).enumerated() {
             if result.count >= maximum || visited >= maximumVisited { break }
+            if role == "AXMenuBar" && index == 0 && axString(child, kAXRoleAttribute as CFString) == "AXMenuBarItem" { continue }
             walk(child, path: path + [index], depth: depth + 1)
         }
     }
@@ -1012,15 +1056,18 @@ func beginAXSettleObservation(pid: pid_t) -> AXSettleObservation? {
     return AXSettleObservation(observer: observer, tracker: tracker, source: source)
 }
 
-func finishAXSettleObservation(_ observation: AXSettleObservation?) -> (durationMs: Int, eventCount: Int, source: String) {
+func finishAXSettleObservation(
+    _ observation: AXSettleObservation?,
+    minimum: TimeInterval = 0.18,
+    quietWindow: TimeInterval = 0.25,
+    maximum: TimeInterval = 5.0
+) -> (durationMs: Int, eventCount: Int, source: String) {
     let started = ProcessInfo.processInfo.systemUptime
     guard let observation else {
-        usleep(180_000)
-        return (180, 0, "bounded-fallback")
+        let fallback = max(0.0, min(minimum, maximum))
+        usleep(useconds_t((fallback * 1_000_000).rounded()))
+        return (Int((fallback * 1000).rounded()), 0, "bounded-fallback")
     }
-    let minimum: TimeInterval = 0.18
-    let quietWindow: TimeInterval = 0.25
-    let maximum: TimeInterval = 5.0
     while ProcessInfo.processInfo.systemUptime - started < maximum {
         _ = RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.025))
         let now = ProcessInfo.processInfo.systemUptime
@@ -1131,8 +1178,8 @@ func performAXElementAction(_ request: ElementActionRequest) -> ElementActionRes
     case "click":
         guard let bounds = axRect(element), bounds.width > 0, bounds.height > 0 else { fail("macOS accessibility element has no visible click bounds") }
         let point = CGPoint(x: CGFloat(bounds.x + bounds.width / 2), y: CGFloat(bounds.y + bounds.height / 2))
-        postMouseMove(point)
-        postClick(point, button: mouseButton(request.button), count: max(1, min(request.count ?? 1, 3)))
+        postMouseMove(point, targetPid: decoded.pid)
+        postClick(point, button: mouseButton(request.button), count: max(1, min(request.count ?? 1, 3)), targetPid: decoded.pid)
     case "press", "toggle": error = AXUIElementPerformAction(element, kAXPressAction as CFString)
     case "focus": error = AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     case "set_value": error = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, (request.value ?? "") as CFTypeRef)
@@ -1143,12 +1190,12 @@ func performAXElementAction(_ request: ElementActionRequest) -> ElementActionRes
         if error != .success { error = AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) }
     case "scroll":
         guard let bounds = axRect(element), bounds.width > 0, bounds.height > 0 else { fail("macOS accessibility element has no visible scroll bounds") }
-        postMouseMove(CGPoint(x: CGFloat(bounds.x + bounds.width / 2), y: CGFloat(bounds.y + bounds.height / 2)))
+        postMouseMove(CGPoint(x: CGFloat(bounds.x + bounds.width / 2), y: CGFloat(bounds.y + bounds.height / 2)), targetPid: decoded.pid)
         let direction = request.direction ?? "down"
         let amount = Int32(max(1, min(request.pages ?? 1, 100)) * 8)
         let horizontal = direction == "left" || direction == "right"
         let sign: Int32 = direction == "up" || direction == "left" ? 1 : -1
-        CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: horizontal ? 0 : sign * amount, wheel2: horizontal ? sign * amount : 0, wheel3: 0)?.post(tap: .cghidEventTap)
+        postEvent(CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: horizontal ? 0 : sign * amount, wheel2: horizontal ? sign * amount : 0, wheel3: 0), targetPid: decoded.pid)
     case "select_text":
         let needle = request.text ?? ""
         guard !needle.isEmpty else { fail("select_text requires non-empty text") }
@@ -1260,8 +1307,17 @@ func runHelper() async {
     if let elementAction = request.elementAction { elementActionResult = performAXElementAction(elementAction) }
     var windowActionResult: WindowActionResult? = nil
     if let windowAction = request.windowAction { windowActionResult = performAXWindowAction(windowAction, display: resolutions.display, api: resolutions.api) }
-    for action in request.actions ?? [] { perform(action, display: actionDisplay, api: actionApi, origin: actionOrigin, targetPid: backgroundInputPid) }
-    if !(request.actions ?? []).isEmpty { usleep(180_000) }
+    let rawActions = request.actions ?? []
+    let mutatingRawAction = rawActions.contains { $0.action != "screenshot" && $0.action != "wait" }
+    let rawTargetPid = backgroundInputPid ?? (mutatingRawAction ? NSWorkspace.shared.frontmostApplication?.processIdentifier : nil)
+    let rawSettleObservation = rawTargetPid.flatMap(beginAXSettleObservation)
+    for action in rawActions { perform(action, display: actionDisplay, api: actionApi, origin: actionOrigin, targetPid: backgroundInputPid) }
+    if mutatingRawAction {
+        // Coordinate actions still need an act-then-observe settle phase. A
+        // longer minimum than element actions prevents a fast route change in
+        // an Electron/WKWebView app from returning an intermediate frame.
+        _ = finishAXSettleObservation(rawSettleObservation, minimum: 0.8, quietWindow: 0.45, maximum: 5.0)
+    }
 
     var elementApplication: String? = nil
     var elementApplicationId: String? = nil
