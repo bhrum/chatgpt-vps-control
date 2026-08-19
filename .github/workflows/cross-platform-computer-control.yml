@@ -72,7 +72,7 @@ jobs:
           # package URIs, fetch them concurrently into apt's cache, then let
           # apt perform the normal verified install from that cache.
           apt-get "${apt_opts[@]}" --print-uris --yes --no-install-recommends install "${packages[@]}" \
-            | python3 -c 'import pathlib,re,sys; mirrors=[x.strip().rstrip("/") for x in pathlib.Path("/etc/apt/apt-mirrors.txt").read_text().splitlines() if x.strip().startswith(("http://","https://"))]; prefix="mirror+file:/etc/apt/apt-mirrors.txt/"; [(print((mirrors[0]+"/"+m.group(1)[len(prefix):]) if m.group(1).startswith(prefix) and mirrors else m.group(1)), print("  out="+m.group(2))) for line in sys.stdin if (m:=re.match(r"^\x27([^\x27]+)\x27\s+(\S+)",line))]' \
+            | python3 -c 'import pathlib,re,sys; mirrors=[x.strip().split()[0].rstrip("/") for x in pathlib.Path("/etc/apt/apt-mirrors.txt").read_text().splitlines() if x.strip().startswith(("http://","https://"))]; prefix="mirror+file:/etc/apt/apt-mirrors.txt/"; [(print((mirrors[0]+"/"+m.group(1)[len(prefix):]) if m.group(1).startswith(prefix) and mirrors else m.group(1)), print("  out="+m.group(2))) for line in sys.stdin if (m:=re.match(r"^\x27([^\x27]+)\x27\s+(\S+)",line))]' \
             > "$RUNNER_TEMP/apt-aria2.txt"
           if [[ -s "$RUNNER_TEMP/apt-aria2.txt" ]] && command -v aria2c >/dev/null; then
             sudo aria2c --input-file="$RUNNER_TEMP/apt-aria2.txt" --dir=/var/cache/apt/archives \

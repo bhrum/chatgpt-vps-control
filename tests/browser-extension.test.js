@@ -14,7 +14,7 @@ import {
 } from "../lib/browser-extension-bridge.js";
 import { browserExtensionPaths, NATIVE_HOST_NAME } from "../lib/browser-extension-paths.js";
 import { browserExtensionStatus, installBrowserExtension } from "../lib/browser-extension-install.js";
-import { browserSessionUtility, listBrowserSessions } from "../lib/browser-session.js";
+import { browserSessionCua, browserSessionUtility, listBrowserSessions } from "../lib/browser-session.js";
 
 function lineClient(path) {
   const socket = connect(path);
@@ -114,12 +114,24 @@ test("private browser bridge authenticates native hosts and correlates extension
     client.socket.write(`${JSON.stringify({ type: "response", requestId: childRequest.requestId, ok: true, result: { result: { value: "child-frame" } } })}\n`);
     assert.equal((await childPending).result.value, "child-frame");
 
+    let captureAttempts = 0;
+    const cdpRequests = [];
     client.onMessage((message) => {
       if (message.type !== "request") return;
       let result = {};
+      let ok = true;
+      let error = "";
       if (message.command === "list_tabs") result = { tabs: [{ id: "7", title: "Signed in", url: "https://example.test/", owner: "user", retained: true }] };
-      if (message.command === "cdp" && message.params?.method === "Runtime.evaluate") result = { result: { value: "signed-in page text" } };
-      client.socket.write(`${JSON.stringify({ type: "response", requestId: message.requestId, ok: true, result })}\n`);
+      if (message.command === "cdp") {
+        cdpRequests.push(message.params);
+        if (message.params?.method === "Runtime.evaluate") result = { result: { value: "signed-in page text" } };
+        if (message.params?.method === "Page.captureScreenshot") {
+          captureAttempts += 1;
+          if (captureAttempts === 1) { ok = false; error = "CDP Page.captureScreenshot timed out."; }
+          else result = { data: Buffer.from("test-png").toString("base64") };
+        }
+      }
+      client.socket.write(`${JSON.stringify({ type: "response", requestId: message.requestId, ok, ...(ok ? { result } : { error }) })}\n`);
     });
     const exported = await browserSessionUtility({
       name: extension.name,
@@ -128,6 +140,18 @@ test("private browser bridge authenticates native hosts and correlates extension
       targetClaim: extension.targets[0].claim,
     });
     assert.equal(exported.text, "signed-in page text");
+
+    const cua = await browserSessionCua({
+      name: extension.name,
+      targetId: extension.targets[0].id,
+      targetClaim: extension.targets[0].claim,
+      actions: [{ action: "move", x: 10, y: 10 }],
+    });
+    assert.equal(cua.actionCount, 1);
+    assert.equal(cua.screenshot?.mimeType, "image/png");
+    assert.equal(captureAttempts, 2);
+    assert.ok(cdpRequests.some((request) => request.method === "Page.bringToFront"));
+    assert.equal(cdpRequests.filter((request) => request.method === "Page.captureScreenshot").at(-1)?.params?.fromSurface, false);
     client.socket.end();
   } finally {
     await stopBrowserExtensionBridgeForTests().catch(() => {});
