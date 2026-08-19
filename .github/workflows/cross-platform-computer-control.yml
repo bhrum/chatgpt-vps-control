@@ -52,6 +52,7 @@ jobs:
 
   linux-managed-semantic-desktop:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -61,8 +62,8 @@ jobs:
       - run: npm ci
       - name: Install X11, AT-SPI, and GTK test dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xdotool wmctrl ffmpeg x11-utils x11-xserver-utils xvfb x11vnc xfwm4 dbus-x11 at-spi2-core python3-pyatspi gir1.2-atspi-2.0 libglib2.0-bin python3-gi gir1.2-gtk-3.0
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y xdotool wmctrl ffmpeg x11-utils x11-xserver-utils xvfb x11vnc xfwm4 dbus-x11 at-spi2-core python3-pyatspi gir1.2-atspi-2.0 libglib2.0-bin python3-gi gir1.2-gtk-3.0
           google-chrome --version
       - name: Configure managed headless desktop
         shell: bash
