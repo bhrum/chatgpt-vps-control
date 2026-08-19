@@ -299,8 +299,11 @@ function Get-UIAChildren($element) {
   return @($items)
 }
 function Resolve-UIAElement($payload) {
+  $debugEnabled = $env:CHATGPT_COMPUTER_UIA_DEBUG -eq '1'
+  $debug = New-Object System.Collections.Generic.List[string]
   $root = Get-RootElement ([long]$payload.hwnd)
   $processId = [int]$payload.processId
+  if ($debugEnabled) { $debug.Add("hwnd=$([long]$payload.hwnd);pid=$processId;path=$(@($payload.path).Count);aid=$([bool][string]$payload.automationId);name=$([bool][string]$payload.name)") }
   if ($processId -gt 0) {
     $rootProcessId = 0
     try { $rootProcessId = [int]$root.Current.ProcessId } catch {}
@@ -320,8 +323,9 @@ function Resolve-UIAElement($payload) {
             $processCondition
           )
         }
-        if ($null -ne $processRoot) { $root = $processRoot }
-      } catch {}
+        if ($null -ne $processRoot) { $root = $processRoot; if ($debugEnabled) { $debug.Add('process-root=found') } }
+        elseif ($debugEnabled) { $debug.Add('process-root=missing') }
+      } catch { if ($debugEnabled) { $debug.Add('process-root=error:' + $_.Exception.GetType().Name) } }
     }
   }
   $element = $root
@@ -332,7 +336,8 @@ function Resolve-UIAElement($payload) {
       if ([int]$index -lt 0 -or [int]$index -ge $children.Count) { $pathResolved = $false; break }
       $element = $children[[int]$index]
     }
-  } catch { $pathResolved = $false }
+  } catch { $pathResolved = $false; if ($debugEnabled) { $debug.Add('path=error:' + $_.Exception.GetType().Name) } }
+  if ($debugEnabled) { $debug.Add('path-resolved=' + [string]$pathResolved) }
 
   $automationId = [string]$payload.automationId
   $controlType = [string]$payload.controlType
@@ -346,7 +351,8 @@ function Resolve-UIAElement($payload) {
         if ($automationId -and [string]$nativeElement.Current.AutomationId -ne $automationId) { $nativeMatches = $false }
         if ($controlType -and [string]$nativeElement.Current.ControlType.ProgrammaticName -ne $controlType) { $nativeMatches = $false }
         if ($name -and [string]$nativeElement.Current.Name -ne $name) { $nativeMatches = $false }
-        if ($nativeMatches) { return $nativeElement }
+        if ($nativeMatches) { if ($debugEnabled) { $debug.Add('native-hwnd=matched') }; return $nativeElement }
+        elseif ($debugEnabled) { $debug.Add('native-hwnd=mismatch') }
       }
     } catch {}
   }
@@ -357,7 +363,8 @@ function Resolve-UIAElement($payload) {
       if ($controlType -and [string]$element.Current.ControlType.ProgrammaticName -ne $controlType) { $identityMatches = $false }
       if ($name -and [string]$element.Current.Name -ne $name) { $identityMatches = $false }
     } catch { $identityMatches = $false }
-    if ($identityMatches) { return $element }
+    if ($identityMatches) { if ($debugEnabled) { $debug.Add('path-identity=matched') }; return $element }
+    elseif ($debugEnabled) { $debug.Add('path-identity=mismatch') }
   }
 
   # Control-view paths can move between short-lived helper processes. When the
@@ -370,6 +377,7 @@ function Resolve-UIAElement($payload) {
       $automationId
     )
     $matches = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $idCondition)
+    if ($debugEnabled) { $debug.Add('aid-matches=' + [string]$matches.Count) }
     for ($i=0; $i -lt $matches.Count; $i++) {
       $candidate = $matches.Item($i)
       try {
@@ -384,6 +392,7 @@ function Resolve-UIAElement($payload) {
       $name
     )
     $matches = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $nameCondition)
+    if ($debugEnabled) { $debug.Add('name-matches=' + [string]$matches.Count) }
     for ($i=0; $i -lt $matches.Count; $i++) {
       $candidate = $matches.Item($i)
       try {
@@ -404,6 +413,7 @@ function Resolve-UIAElement($payload) {
         ([double]$bounds.y + ([double]$bounds.height / 2))
       )
       $candidate = [System.Windows.Automation.AutomationElement]::FromPoint($point)
+      if ($debugEnabled) { $debug.Add('from-point=' + [string]($null -ne $candidate)) }
       for ($depth=0; $depth -lt 12 -and $null -ne $candidate; $depth++) {
         $matchesIdentity = $true
         try {
@@ -415,9 +425,10 @@ function Resolve-UIAElement($payload) {
         if ($matchesIdentity) { return $candidate }
         $candidate = $ControlWalker.GetParent($candidate)
       }
-    } catch {}
+    } catch { if ($debugEnabled) { $debug.Add('from-point=error:' + $_.Exception.GetType().Name) } }
   }
-  throw 'The Windows accessibility snapshot is stale; refresh computer_elements.'
+  $suffix = if ($debugEnabled) { ' [' + ($debug -join ';') + ']' } else { '' }
+  throw ('The Windows accessibility snapshot is stale; refresh computer_elements.' + $suffix)
 }
 function Get-ControlTypeName($element) {
   $programmatic = $element.Current.ControlType.ProgrammaticName
@@ -557,6 +568,7 @@ function Invoke-UIAElementAction($request) {
   $action = [string]$request.action
   try { $element = Resolve-UIAElement $payload }
   catch {
+    $resolverError = $_.Exception.Message
     $bounds = $payload.bounds
     $canClick = $null -ne $bounds -and [int]$bounds.width -gt 0 -and [int]$bounds.height -gt 0
     $isPress = $action -eq 'press' -or $action -eq 'click' -or $action -eq 'native:Invoke'
@@ -578,7 +590,9 @@ function Invoke-UIAElementAction($request) {
       [NativeComputer]::UnicodeText([string]$request.value)
     }
     Start-Sleep -Milliseconds 180
-    return @{ ok=$true; source='windows-uia-bounds-fallback'; action=$action; settleDurationMs=180; settleEventCount=0; settleSource='bounded-fallback' }
+    $fallback = @{ ok=$true; source='windows-uia-bounds-fallback'; action=$action; settleDurationMs=180; settleEventCount=0; settleSource='bounded-fallback' }
+    if ($env:CHATGPT_COMPUTER_UIA_DEBUG -eq '1') { $fallback.resolverError = $resolverError }
+    return $fallback
   }
   $settleSubscription = $null
   if (-not $request.eventObserverActive) {

@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+$env:CHATGPT_COMPUTER_UIA_DEBUG = '1'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $helper = Join-Path $root 'native\windows\computer-helper.ps1'
 $observerPing = '{"id":1,"command":"ping"}' | powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $helper --observer-server | ConvertFrom-Json
@@ -87,7 +88,7 @@ try {
   $entry = @($snapshot.elements) | Where-Object { $_.role -eq 'edit' -and $_.name -like '*Semantic entry*' } | Select-Object -First 1
   if ($null -eq $entry) { throw 'Semantic entry disappeared after Windows window actions.' }
   $setValue = Invoke-Helper @{ apiWidth=1280; actions=@(); includeScreenshot=$false; includeWindows=$false; elementAction=@{ elementId=$entry.id; action='set_value'; value='semantic-windows-ok' } }
-  if ($setValue.elementActionResult.settleSource -ne 'uia-events') { throw "Windows action did not use UIA event settling: $($setValue.elementActionResult | ConvertTo-Json -Compress)" }
+  if ($setValue.elementActionResult.settleSource -ne 'uia-events') { throw "Windows action did not use UIA event settling: $($setValue.elementActionResult | ConvertTo-Json -Depth 8 -Compress)" }
   if ($setValue.elementActionResult.settleDurationMs -lt 0) { throw 'Windows settle duration was invalid.' }
   $snapshot = Wait-Elements
   $entry = @($snapshot.elements) | Where-Object { $_.role -eq 'edit' -and $_.name -like '*Semantic entry*' } | Select-Object -First 1
