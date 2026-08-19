@@ -260,23 +260,27 @@ $InteractiveTypes = @('Button','CheckBox','ComboBox','Edit','Hyperlink','ListIte
 $StaticTypes = @('Header','Image','Text')
 $ContainerTypes = @('Custom','DataGrid','Group','List','Menu','Pane','Tab','Table','ToolBar','Tree','Window')
 
-function Encode-ElementId([long]$hwnd, [int[]]$path, $element) {
+function Encode-ElementId([long]$hwnd, [int[]]$path, $element, $rootElement) {
   $automationId = ''
   $controlType = ''
   $name = ''
   $nativeHwnd = 0
   $processId = 0
+  $runtimeId = @()
+  $rootRuntimeId = @()
   $bounds = $null
   try { $automationId = [string]$element.Current.AutomationId } catch {}
   try { $controlType = [string]$element.Current.ControlType.ProgrammaticName } catch {}
   try { $name = [string]$element.Current.Name } catch {}
   try { $nativeHwnd = [long]$element.Current.NativeWindowHandle } catch {}
   try { $processId = [int]$element.Current.ProcessId } catch {}
+  try { $runtimeId = @($element.GetRuntimeId() | ForEach-Object { [int]$_ }) } catch {}
+  try { if ($null -ne $rootElement) { $rootRuntimeId = @($rootElement.GetRuntimeId() | ForEach-Object { [int]$_ }) } } catch {}
   try {
     $rect = $element.Current.BoundingRectangle
     if (-not $rect.IsEmpty) { $bounds = @{ x=[int]$rect.X; y=[int]$rect.Y; width=[int]$rect.Width; height=[int]$rect.Height } }
   } catch {}
-  $json = @{ source='windows-uia'; hwnd=$hwnd; processId=$processId; path=@($path); automationId=$automationId; controlType=$controlType; name=$name; nativeHwnd=$nativeHwnd; bounds=$bounds } | ConvertTo-Json -Compress
+  $json = @{ source='windows-uia'; hwnd=$hwnd; processId=$processId; path=@($path); automationId=$automationId; controlType=$controlType; name=$name; nativeHwnd=$nativeHwnd; runtimeId=@($runtimeId); rootRuntimeId=@($rootRuntimeId); bounds=$bounds } | ConvertTo-Json -Compress
   return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+','-').Replace('/','_')
 }
 function Decode-ElementId([string]$value) {
@@ -285,6 +289,13 @@ function Decode-ElementId([string]$value) {
   $payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($base64)) | ConvertFrom-Json
   if ($payload.source -ne 'windows-uia') { throw 'Invalid Windows UIA element id.' }
   return $payload
+}
+function Test-RuntimeIdEqual($left, $right) {
+  $a = @($left)
+  $b = @($right)
+  if ($a.Count -eq 0 -or $a.Count -ne $b.Count) { return $false }
+  for ($i=0; $i -lt $a.Count; $i++) { if ([int]$a[$i] -ne [int]$b[$i]) { return $false } }
+  return $true
 }
 function Get-RootElement([long]$hwnd) {
   if ($hwnd -eq 0) { return [System.Windows.Automation.AutomationElement]::RootElement }
@@ -303,8 +314,10 @@ function Resolve-UIAElement($payload) {
   $debug = New-Object System.Collections.Generic.List[string]
   $hwnd = [long]$payload.hwnd
   $processId = [int]$payload.processId
+  $runtimeId = @($payload.runtimeId)
+  $rootRuntimeId = @($payload.rootRuntimeId)
   $root = Get-RootElement $hwnd
-  if ($debugEnabled) { $debug.Add("hwnd=$hwnd;pid=$processId;path=$(@($payload.path).Count);aid=$([bool][string]$payload.automationId);name=$([bool][string]$payload.name)") }
+  if ($debugEnabled) { $debug.Add("hwnd=$hwnd;pid=$processId;path=$(@($payload.path).Count);aid=$([bool][string]$payload.automationId);name=$([bool][string]$payload.name);rid=$($runtimeId.Count);rootRid=$($rootRuntimeId.Count)") }
 
   # A WinForms/WPF provider root reached through AutomationElement.FromHandle
   # can expose a different ControlView subtree than the same top-level window
@@ -325,13 +338,19 @@ function Resolve-UIAElement($payload) {
         $candidateRoot = $processRoots.Item($i)
         try {
           $candidateHwnd = [long]$candidateRoot.Current.NativeWindowHandle
-          if (($hwnd -ne 0 -and $candidateHwnd -eq $hwnd) -or ($hwnd -eq 0 -and $null -eq $matchedRoot)) {
+          $candidateRootRuntimeId = @($candidateRoot.GetRuntimeId())
+          if ($rootRuntimeId.Count -gt 0 -and (Test-RuntimeIdEqual $candidateRootRuntimeId $rootRuntimeId)) {
+            $matchedRoot = $candidateRoot
+            if ($debugEnabled) { $debug.Add('desktop-root-runtime=matched') }
+            break
+          }
+          if ($rootRuntimeId.Count -eq 0 -and (($hwnd -ne 0 -and $candidateHwnd -eq $hwnd) -or ($hwnd -eq 0 -and $null -eq $matchedRoot))) {
             $matchedRoot = $candidateRoot
             if ($hwnd -ne 0) { break }
           }
         } catch {}
       }
-      if ($null -eq $matchedRoot -and $processRoots.Count -eq 1) { $matchedRoot = $processRoots.Item(0) }
+      if ($null -eq $matchedRoot -and $rootRuntimeId.Count -eq 0 -and $processRoots.Count -eq 1) { $matchedRoot = $processRoots.Item(0) }
       if ($null -ne $matchedRoot) {
         $root = $matchedRoot
         if ($debugEnabled) { $debug.Add('desktop-process-root=matched') }
@@ -374,6 +393,10 @@ function Resolve-UIAElement($payload) {
   if ($pathResolved) {
     $identityMatches = $true
     try {
+      if ($runtimeId.Count -gt 0 -and (Test-RuntimeIdEqual @($element.GetRuntimeId()) $runtimeId)) {
+        if ($debugEnabled) { $debug.Add('path-runtime=matched') }
+        return $element
+      }
       if ($automationId -and [string]$element.Current.AutomationId -ne $automationId) { $identityMatches = $false }
       if ($controlType -and [string]$element.Current.ControlType.ProgrammaticName -ne $controlType) { $identityMatches = $false }
       if (-not $automationId -and $name -and [string]$element.Current.Name -ne $name) { $identityMatches = $false }
@@ -395,6 +418,10 @@ function Resolve-UIAElement($payload) {
     $scanned++
     $candidateMatches = $true
     try {
+      if ($runtimeId.Count -gt 0 -and (Test-RuntimeIdEqual @($candidate.GetRuntimeId()) $runtimeId)) {
+        if ($debugEnabled) { $debug.Add('tree-runtime=matched;scanned=' + [string]$scanned) }
+        return $candidate
+      }
       $candidatePid = [int]$candidate.Current.ProcessId
       $candidateAutomationId = [string]$candidate.Current.AutomationId
       $candidateControlType = [string]$candidate.Current.ControlType.ProgrammaticName
@@ -434,6 +461,7 @@ function Resolve-UIAElement($payload) {
       for ($depth=0; $depth -lt 12 -and $null -ne $candidate; $depth++) {
         $matchesIdentity = $true
         try {
+          if ($runtimeId.Count -gt 0 -and (Test-RuntimeIdEqual @($candidate.GetRuntimeId()) $runtimeId)) { return $candidate }
           if ($processId -gt 0 -and [int]$candidate.Current.ProcessId -ne $processId) { $matchesIdentity = $false }
           if ($automationId -and [string]$candidate.Current.AutomationId -ne $automationId) { $matchesIdentity = $false }
           if ($controlType -and [string]$candidate.Current.ControlType.ProgrammaticName -ne $controlType) { $matchesIdentity = $false }
@@ -461,7 +489,7 @@ function Get-UIABounds($element) {
   if ($rect.IsEmpty -or [double]::IsInfinity($rect.X) -or [double]::IsNaN($rect.X)) { return $null }
   return @{ x=[int][Math]::Round($rect.X); y=[int][Math]::Round($rect.Y); width=[Math]::Max(0,[int][Math]::Round($rect.Width)); height=[Math]::Max(0,[int][Math]::Round($rect.Height)) }
 }
-function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path, [int]$depth) {
+function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path, [int]$depth, $rootElement) {
   $type = Get-ControlTypeName $element
   $invoke = Try-Pattern $element ([System.Windows.Automation.InvokePattern]::Pattern)
   $valuePattern = Try-Pattern $element ([System.Windows.Automation.ValuePattern]::Pattern)
@@ -498,7 +526,7 @@ function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path, [int]$depth) {
   $checked = if ($null -ne $toggle) { $toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On } else { $null }
   $expanded = if ($null -ne $expand) { $expand.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Expanded } else { $null }
   return @{
-    id = Encode-ElementId $hwnd $path $element; source='windows-uia'; role=$type.ToLowerInvariant(); name=[string]$element.Current.Name
+    id = Encode-ElementId $hwnd $path $element $rootElement; source='windows-uia'; role=$type.ToLowerInvariant(); name=[string]$element.Current.Name
     value=$value; description=[string]$element.Current.HelpText; enabled=[bool]$element.Current.IsEnabled
     focused=[bool]$element.Current.HasKeyboardFocus; selected=if ($null -ne $selection) { [bool]$selection.Current.IsSelected } else { $false }
     checked=$checked; expanded=$expanded; bounds=Get-UIABounds $element; actions=@($actions); nativeActions=@($nativeActions)
@@ -550,7 +578,7 @@ function Get-UIAElements($options) {
     $type = Get-ControlTypeName $element
     $interesting = $InteractiveTypes -contains $type -or $element.Current.IsKeyboardFocusable -or ($includeStatic -and $StaticTypes -contains $type) -or ($includeContainers -and $ContainerTypes -contains $type -and [string]$element.Current.Name)
     if ($depth -gt 0 -and $interesting) {
-      $info = Get-UIAElementInfo $element $hwnd $path $depth
+      $info = Get-UIAElementInfo $element $hwnd $path $depth $root
       $searchable = "$($info.name) $($info.description) $($info.value)".ToLowerInvariant()
       if ((-not $roleFilter -or $info.role -eq $roleFilter) -and (-not $query -or $searchable.Contains($query))) { [void]$items.Add($info) }
     }
