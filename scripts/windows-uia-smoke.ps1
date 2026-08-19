@@ -81,6 +81,11 @@ try {
   $controlled = Invoke-Helper @{ apiWidth=1280; actions=@(); includeScreenshot=$false; includeWindows=$true; windowAction=@{ windowId=$window.id; action='move_resize'; x=40; y=40; width=800; height=500 } }
   if ($controlled.windowActionResult.action -ne 'move_resize') { throw 'Windows move_resize did not complete.' }
 
+  # Window mutations can rebuild the UIA subtree. Refresh the semantic snapshot
+  # instead of intentionally exercising a stale element id through the bounds fallback.
+  $snapshot = Wait-Elements
+  $entry = @($snapshot.elements) | Where-Object { $_.role -eq 'edit' -and $_.name -like '*Semantic entry*' } | Select-Object -First 1
+  if ($null -eq $entry) { throw 'Semantic entry disappeared after Windows window actions.' }
   $setValue = Invoke-Helper @{ apiWidth=1280; actions=@(); includeScreenshot=$false; includeWindows=$false; elementAction=@{ elementId=$entry.id; action='set_value'; value='semantic-windows-ok' } }
   if ($setValue.elementActionResult.settleSource -ne 'uia-events') { throw "Windows action did not use UIA event settling: $($setValue.elementActionResult | ConvertTo-Json -Compress)" }
   if ($setValue.elementActionResult.settleDurationMs -lt 0) { throw 'Windows settle duration was invalid.' }
