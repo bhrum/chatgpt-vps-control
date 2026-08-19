@@ -799,7 +799,10 @@ function Invoke-UIAElementAction($request) {
           ($processId -gt 0 -and [int]$nativePid -ne $processId)) {
         throw 'Element does not support UI Automation text selection.'
       }
-      $textValue = if ($null -ne $valuePattern) { [string]$valuePattern.Current.Value } else { Get-NativeControlText $nativeTextHwnd }
+      # Once the native Edit identity has been verified, read from that HWND
+      # directly. Windows 2025 can surface a transient UIA proxy whose
+      # ValuePattern value lags the actual Win32 control text.
+      $textValue = Get-NativeControlText $nativeTextHwnd
       $prefix = [string]$request.prefix
       $suffix = [string]$request.suffix
       $matchStart = -1
