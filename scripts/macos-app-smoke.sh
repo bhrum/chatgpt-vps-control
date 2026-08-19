@@ -24,7 +24,7 @@ otool -l "$EXECUTABLE" | awk '/minos / { found=1; if ($2 != "14.0") bad=1 } END 
 OBSERVER=$(printf '%s\n' '{"id":1,"command":"ping"}' | "$EXECUTABLE" --observer-server)
 python3 -c 'import json,sys; data=json.load(sys.stdin); assert data == {"id":1,"ok":True,"source":"macos-ax-service"}' <<<"$OBSERVER"
 REQUEST_SERVICE=$(printf '%s\n' '{"id":2,"command":"request","payload":{"apiWidth":1280,"actions":[],"includeScreenshot":false,"includeWindows":false,"doctor":false}}' | "$EXECUTABLE" --request-server)
-python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["id"] == 2 and data["ok"] is True and data["result"]["ok"] is True and data["transport"] == "xpc"' <<<"$REQUEST_SERVICE"
+python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["id"] == 2 and data["ok"] is True and data["result"]["ok"] is True and data["transport"] == "persistent-broker"' <<<"$REQUEST_SERVICE"
 BASE=$(printf '%s' '{"apiWidth":1280,"actions":[],"includeScreenshot":false,"includeWindows":false,"doctor":false}' | "$EXECUTABLE")
 python3 -c 'import json,sys; data=json.load(sys.stdin); p=data["permissions"]; assert data["ok"] is True; assert isinstance(p["interactiveDesktop"], bool); assert isinstance(p["screenLocked"], bool)' <<<"$BASE"
 REQUEST_FILE="$RUNNER_TEMP/computer-helper-request.json"
