@@ -20,6 +20,8 @@ public static class NativeComputer {
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport("user32.dll", SetLastError=true)] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
@@ -180,6 +182,13 @@ function Get-WindowTitle([IntPtr]$hwnd) {
   [NativeComputer]::GetWindowText($hwnd, $sb, $sb.Capacity) | Out-Null
   return $sb.ToString()
 }
+function Get-NativeControlText([IntPtr]$hwnd) {
+  $length = [Math]::Max(0, [NativeComputer]::GetWindowTextLength($hwnd))
+  $capacity = [Math]::Min(1048577, $length + 1)
+  $sb = New-Object System.Text.StringBuilder $capacity
+  [NativeComputer]::GetWindowText($hwnd, $sb, $sb.Capacity) | Out-Null
+  return $sb.ToString()
+}
 function Get-VisibleWindows {
   $items = New-Object System.Collections.ArrayList
   $callback = [NativeComputer+EnumWindowsProc]{ param([IntPtr]$hWnd, [IntPtr]$lParam)
@@ -268,6 +277,7 @@ function Encode-ElementId([long]$hwnd, [int[]]$path, $element, $rootElement) {
   $controlType = ''
   $name = ''
   $nativeHwnd = 0
+  $className = ''
   $processId = 0
   $runtimeId = @()
   $rootRuntimeId = @()
@@ -276,6 +286,7 @@ function Encode-ElementId([long]$hwnd, [int[]]$path, $element, $rootElement) {
   try { $controlType = [string]$element.Current.ControlType.ProgrammaticName } catch {}
   try { $name = [string]$element.Current.Name } catch {}
   try { $nativeHwnd = [long]$element.Current.NativeWindowHandle } catch {}
+  try { $className = [string]$element.Current.ClassName } catch {}
   try { $processId = [int]$element.Current.ProcessId } catch {}
   try { $runtimeId = @($element.GetRuntimeId() | ForEach-Object { [int]$_ }) } catch {}
   try { if ($null -ne $rootElement) { $rootRuntimeId = @($rootElement.GetRuntimeId() | ForEach-Object { [int]$_ }) } } catch {}
@@ -283,7 +294,7 @@ function Encode-ElementId([long]$hwnd, [int[]]$path, $element, $rootElement) {
     $rect = $element.Current.BoundingRectangle
     if (-not $rect.IsEmpty) { $bounds = @{ x=[int]$rect.X; y=[int]$rect.Y; width=[int]$rect.Width; height=[int]$rect.Height } }
   } catch {}
-  $json = @{ source='windows-uia'; hwnd=$hwnd; processId=$processId; path=@($path); automationId=$automationId; controlType=$controlType; name=$name; nativeHwnd=$nativeHwnd; runtimeId=@($runtimeId); rootRuntimeId=@($rootRuntimeId); bounds=$bounds } | ConvertTo-Json -Compress
+  $json = @{ source='windows-uia'; hwnd=$hwnd; processId=$processId; path=@($path); automationId=$automationId; controlType=$controlType; name=$name; nativeHwnd=$nativeHwnd; className=$className; runtimeId=@($runtimeId); rootRuntimeId=@($rootRuntimeId); bounds=$bounds } | ConvertTo-Json -Compress
   return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+','-').Replace('/','_')
 }
 function Decode-ElementId([string]$value) {
@@ -518,8 +529,10 @@ function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path, [int]$depth, $r
   if ($element.Current.IsKeyboardFocusable) { [void]$actions.Add('focus') }
   if (($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) -or $type -eq 'Edit') { [void]$actions.Add('set_value') }
   $nativeTextHwnd = 0
+  $nativeTextClass = ''
   try { $nativeTextHwnd = [long]$element.Current.NativeWindowHandle } catch {}
-  if ($null -ne $textPattern -or ($type -eq 'Edit' -and $nativeTextHwnd -ne 0 -and $null -ne $valuePattern)) { [void]$actions.Add('select_text') }
+  try { $nativeTextClass = [string]$element.Current.ClassName } catch {}
+  if ($null -ne $textPattern -or ($type -eq 'Edit' -and $nativeTextHwnd -ne 0 -and $nativeTextClass -match '(?i)edit')) { [void]$actions.Add('select_text') }
   if ($null -ne $toggle) { [void]$actions.Add('toggle') }
   if ($null -ne $range -and -not $range.Current.IsReadOnly) { [void]$actions.Add('increment'); [void]$actions.Add('decrement') }
   if ($null -ne $scrollItem) { [void]$actions.Add('scroll_into_view') }
@@ -777,11 +790,16 @@ function Invoke-UIAElementAction($request) {
       # resolver has already verified the semantic UIA element identity.
       $valuePattern = Try-Pattern $element ([System.Windows.Automation.ValuePattern]::Pattern)
       $nativeTextHwnd = [IntPtr][long]$payload.nativeHwnd
-      $controlTypeName = Get-ControlTypeName $element
-      if ($controlTypeName -ne 'Edit' -or $nativeTextHwnd -eq [IntPtr]::Zero -or $null -eq $valuePattern) {
+      $snapshotControlType = [string]$payload.controlType
+      $snapshotClassName = [string]$payload.className
+      $nativePid = [uint32]0
+      if ($nativeTextHwnd -eq [IntPtr]::Zero -or -not [NativeComputer]::IsWindow($nativeTextHwnd) -or
+          $snapshotControlType -ne 'ControlType.Edit' -or $snapshotClassName -notmatch '(?i)edit' -or
+          [NativeComputer]::GetWindowThreadProcessId($nativeTextHwnd, [ref]$nativePid) -eq 0 -or
+          ($processId -gt 0 -and [int]$nativePid -ne $processId)) {
         throw 'Element does not support UI Automation text selection.'
       }
-      $textValue = [string]$valuePattern.Current.Value
+      $textValue = if ($null -ne $valuePattern) { [string]$valuePattern.Current.Value } else { Get-NativeControlText $nativeTextHwnd }
       $prefix = [string]$request.prefix
       $suffix = [string]$request.suffix
       $matchStart = -1
