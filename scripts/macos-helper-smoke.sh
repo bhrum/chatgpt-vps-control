@@ -14,7 +14,7 @@ printf '%s\n' "$BASE"
 python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["ok"] is True; assert "permissions" in data' <<<"$BASE"
 APPLICATIONS=$(printf '%s' '{"apiWidth":1280,"actions":[],"includeScreenshot":false,"includeWindows":false,"listApplications":true}' | "$EXECUTABLE")
 printf '%s\n' "$APPLICATIONS"
-python3 -c 'import json,sys; data=json.load(sys.stdin); apps=data.get("applications", []); assert data["ok"] is True; assert apps; assert all({"id", "displayName", "path", "isRunning", "pid"} <= set(app) for app in apps)' <<<"$APPLICATIONS"
+python3 -c 'import json,sys; data=json.load(sys.stdin); apps=data.get("applications", []); assert data["ok"] is True; assert apps; assert all({"id", "displayName", "path", "isRunning", "pid", "lastUsedDate", "useCount"} <= set(app) for app in apps)' <<<"$APPLICATIONS"
 SEMANTIC=$(printf '%s' '{"apiWidth":1280,"actions":[],"includeScreenshot":false,"includeWindows":false,"includeElements":true,"elementOptions":{"maxElements":20}}' | "$EXECUTABLE")
 printf '%s\n' "$SEMANTIC"
 python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True or "Accessibility permission" in data.get("error", "")' <<<"$SEMANTIC"

@@ -35,6 +35,17 @@ code + PKCE, one-hour access tokens, and rotating 180-day refresh tokens.
 Use `https://chatgpt-mcp.371080.xyz/manage` to revoke all active access and
 refresh tokens. Do not commit any secret.
 
+## Dynamic device tool discovery
+
+Each device agent reads its local MCP `tools/list` result and registers a bounded,
+sanitized copy of each advertised tool descriptor. The Worker stores those
+descriptors separately from the WebSocket attachment and exposes three stable
+gateway operations: `list_devices`, `describe_device_tool`, and `device_call`.
+`list_devices` includes a compact schema count/version, while
+`describe_device_tool` returns one tool's current input/output JSON Schema and
+annotations on demand. This lets ChatGPT learn newly deployed device capabilities
+without expanding every device tool into the public Worker tool list.
+
 ## Private user input
 
 The MCP exposes an MCP Apps card for passwords, OTPs, API keys, personal data,

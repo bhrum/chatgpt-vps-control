@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 import base64
 import configparser
+import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 
@@ -46,6 +49,32 @@ def safe(call, default=None):
         return call()
     except Exception:
         return default
+
+
+def session_guard():
+    """Fail closed on a known locked/inactive logind session.
+
+    Managed Xvfb desktops commonly have no logind session id; reachability of
+    their private DISPLAY remains the authorization boundary in that mode.
+    """
+    session_id = str(os.environ.get("XDG_SESSION_ID", "") or "").strip()
+    loginctl = shutil.which("loginctl")
+    if not session_id or not loginctl:
+        return {"interactiveDesktop": True, "screenLocked": False, "source": "display"}
+    result = subprocess.run(
+        [loginctl, "show-session", session_id, "--property=Active", "--property=LockedHint"],
+        capture_output=True, text=True, timeout=3, check=False,
+    )
+    if result.returncode != 0:
+        return {"interactiveDesktop": False, "screenLocked": True, "source": "logind-unavailable"}
+    values = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key.strip()] = value.strip().lower()
+    active = values.get("Active") == "yes"
+    locked = values.get("LockedHint") == "yes"
+    return {"interactiveDesktop": active and not locked, "screenLocked": locked, "source": "logind"}
 
 
 def encode_id(path):
@@ -165,11 +194,11 @@ def bounds_info(obj):
 def semantic_actions(obj, role, native_actions, editable, has_value):
     actions = []
     if native_actions or role in INTERACTIVE_ROLES:
-        actions.append("press")
+        actions.extend(["press", "click"])
     if safe(lambda: obj.queryComponent(), None) is not None:
-        actions.extend(["focus", "scroll_into_view"])
+        actions.extend(["click", "focus", "scroll_into_view", "scroll"])
     if editable:
-        actions.append("set_value")
+        actions.extend(["set_value", "select_text"])
     if role in {"check box", "radio button", "toggle button"}:
         actions.append("toggle")
     if has_value:
@@ -238,6 +267,7 @@ def list_elements(request):
     result = []
     selected_application = ""
     selected_application_id = ""
+    selected_application_object = None
 
     def has_application():
         count = int(safe(lambda: desktop.childCount, 0) or 0)
@@ -285,12 +315,37 @@ def list_elements(request):
             continue
         if application and not selected_application:
             selected_application = app_name
+            selected_application_object = app
             selected_application_id = (
                 application_id
                 if application_id.startswith(("atspi:", "desktop:"))
                 else f"atspi:{normalized_name}"
             )
         walk(app, [app_index], 0)
+
+    screenshot = None
+    screenshot_bounds = None
+    if request.get("includeScreenshot") and selected_application_object is not None and shutil.which("ffmpeg"):
+        candidates = []
+        child_count = int(safe(lambda: selected_application_object.childCount, 0) or 0)
+        for child_index in range(min(child_count, 100)):
+            child = child_at(selected_application_object, child_index)
+            bounds = bounds_info(child) if child is not None else None
+            if bounds and bounds["width"] > 0 and bounds["height"] > 0:
+                active = bool(safe(lambda: child.getState().contains(pyatspi.STATE_ACTIVE), False))
+                candidates.append((not active, bounds))
+        if candidates:
+            screenshot_bounds = sorted(candidates, key=lambda item: item[0])[0][1]
+            x = max(0, int(screenshot_bounds["x"])); y = max(0, int(screenshot_bounds["y"]))
+            width = max(1, min(16384, int(screenshot_bounds["width"]))); height = max(1, min(16384, int(screenshot_bounds["height"])))
+            screenshot_bounds = {"x": x, "y": y, "width": width, "height": height}
+            display = os.environ.get("DISPLAY", ":0")
+            captured = subprocess.run([
+                "ffmpeg", "-loglevel", "error", "-nostdin", "-f", "x11grab", "-video_size", f"{width}x{height}",
+                "-i", f"{display}+{x},{y}", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1",
+            ], capture_output=True, timeout=8, check=False)
+            if captured.returncode == 0 and captured.stdout:
+                screenshot = base64.b64encode(captured.stdout).decode("ascii")
 
     return {
         "ok": True,
@@ -299,6 +354,10 @@ def list_elements(request):
         "application": selected_application or None,
         "applicationId": selected_application_id or None,
         "elements": result,
+        "screenshotMimeType": "image/png" if screenshot else None,
+        "screenshotBase64": screenshot,
+        "screenshotScope": "application" if screenshot else None,
+        "screenshotBounds": screenshot_bounds if screenshot else None,
         "message": f"Returned {len(result)} AT-SPI accessibility elements.",
     }
 
@@ -313,8 +372,148 @@ def choose_native_action(names):
     return 0 if names else None
 
 
+def begin_atspi_settle(target_application_name):
+    try:
+        from gi.repository import GLib
+    except Exception:
+        return None
+    tracker = {"count": 0, "last": time.monotonic()}
+    lock = threading.Lock()
+    event_types = [
+        "object:property-change", "object:state-changed", "object:children-changed",
+        "object:text-changed", "object:text-caret-moved", "object:selection-changed", "window",
+    ]
+
+    def listener(event):
+        host_name = str(safe(lambda: event.host_application.name, "") or "")
+        if target_application_name and host_name and host_name != target_application_name:
+            return
+        with lock:
+            tracker["count"] += 1
+            tracker["last"] = time.monotonic()
+
+    registered = []
+    for event_type in event_types:
+        try:
+            pyatspi.Registry.registerEventListener(listener, event_type)
+            registered.append(event_type)
+        except Exception:
+            pass
+    if not registered:
+        return None
+    loop = GLib.MainLoop()
+    thread = threading.Thread(target=loop.run, name="atspi-settle", daemon=True)
+    thread.start()
+    return {"tracker": tracker, "lock": lock, "listener": listener, "eventTypes": registered, "loop": loop, "thread": thread}
+
+
+def finish_atspi_settle(observation):
+    started = time.monotonic()
+    if observation is None:
+        time.sleep(0.18)
+        return {"settleDurationMs": 180, "settleEventCount": 0, "settleSource": "bounded-fallback"}
+    while time.monotonic() - started < 5.0:
+        with observation["lock"]:
+            last_event = observation["tracker"]["last"]
+        if time.monotonic() - started >= 0.18 and time.monotonic() - last_event >= 0.25:
+            break
+        time.sleep(0.025)
+    for event_type in observation["eventTypes"]:
+        safe(lambda event_type=event_type: pyatspi.Registry.deregisterEventListener(observation["listener"], event_type), None)
+    observation["loop"].quit()
+    observation["thread"].join(timeout=0.5)
+    with observation["lock"]:
+        count = observation["tracker"]["count"]
+    return {
+        "settleDurationMs": int(round((time.monotonic() - started) * 1000)),
+        "settleEventCount": count,
+        "settleSource": "atspi-events",
+    }
+
+
+def wait_atspi_service(observation, baseline, minimum_ms=180, quiet_ms=250, maximum_ms=5000):
+    started = time.monotonic()
+    minimum = max(0, min(int(minimum_ms), 5000)) / 1000.0
+    quiet = max(0, min(int(quiet_ms), 5000)) / 1000.0
+    maximum = max(1, min(int(maximum_ms), 10000)) / 1000.0
+    while time.monotonic() - started < maximum:
+        with observation["lock"]:
+            last_event = observation["tracker"]["last"]
+        now = time.monotonic()
+        if now - started >= minimum and now - last_event >= quiet:
+            break
+        time.sleep(0.025)
+    with observation["lock"]:
+        count = observation["tracker"]["count"]
+    return {
+        "durationMs": int(round((time.monotonic() - started) * 1000)),
+        "eventCount": max(0, count - int(baseline or 0)),
+        "generation": count,
+    }
+
+
+def observer_server():
+    observations = {}
+    for raw in sys.stdin:
+        request = {}
+        try:
+            request = json.loads(raw or "{}")
+            command = str(request.get("command", ""))
+            target = str(request.get("target", ""))
+            if command == "ping":
+                response = {"id": request.get("id"), "ok": True, "source": "linux-atspi-service"}
+            elif command == "watch":
+                index = int(target)
+                desktop = pyatspi.Registry.getDesktop(0)
+                application = child_at(desktop, index)
+                if application is None:
+                    raise RuntimeError("AT-SPI application target is stale")
+                name = str(safe(lambda: application.name, "") or "")
+                observation = observations.get(target)
+                if observation is None:
+                    observation = begin_atspi_settle(name)
+                    if observation is None:
+                        raise RuntimeError("AT-SPI event listener is unavailable")
+                    observations[target] = observation
+                with observation["lock"]:
+                    generation = observation["tracker"]["count"]
+                response = {"id": request.get("id"), "ok": True, "source": "linux-atspi-service", "generation": generation}
+            elif command == "wait":
+                observation = observations.get(target)
+                if observation is None:
+                    raise RuntimeError("AT-SPI target is not watched")
+                settled = wait_atspi_service(
+                    observation, request.get("baseline", 0), request.get("minimumMs", 180),
+                    request.get("quietMs", 250), request.get("maximumMs", 5000),
+                )
+                response = {"id": request.get("id"), "ok": True, "source": "linux-atspi-service", **settled}
+            elif command == "unwatch":
+                observation = observations.pop(target, None)
+                if observation is not None:
+                    for event_type in observation["eventTypes"]:
+                        safe(lambda event_type=event_type: pyatspi.Registry.deregisterEventListener(observation["listener"], event_type), None)
+                    observation["loop"].quit()
+                response = {"id": request.get("id"), "ok": True, "source": "linux-atspi-service"}
+            else:
+                raise ValueError("Unsupported observer command")
+        except Exception as exc:
+            response = {"id": request.get("id"), "ok": False, "error": str(exc)}
+        sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+
 def perform_action(request):
-    obj = resolve_path(decode_id(request.get("elementId", "")))
+    path = decode_id(request.get("elementId", ""))
+    obj = resolve_path(path)
+    desktop = pyatspi.Registry.getDesktop(0)
+    target_application = child_at(desktop, path[0]) if path else None
+    target_application_name = str(safe(lambda: target_application.name, "") or "")
+    external_observer = bool(request.get("eventObserverActive"))
+    settle_observation = None if external_observer else begin_atspi_settle(target_application_name)
+    def action_settle():
+        if external_observer:
+            return {"settleDurationMs": 0, "settleEventCount": 0, "settleSource": "external-observer-pending"}
+        return finish_atspi_settle(settle_observation)
     action = str(request.get("action", ""))
     value = str(request.get("value", "") or "")
     names, action_iface = action_names(obj)
@@ -326,9 +525,23 @@ def perform_action(request):
             raise RuntimeError(f"AT-SPI action is no longer available: {requested}")
         if not action_iface.doAction(names.index(requested)):
             raise RuntimeError("AT-SPI native action returned false")
-        return {"ok": True, "source": "linux-atspi", "action": action}
+        return {"ok": True, "source": "linux-atspi", "action": action, **action_settle()}
 
-    if action in {"press", "toggle"}:
+    if action == "click":
+        bounds = bounds_info(obj)
+        if not bounds or bounds["width"] <= 0 or bounds["height"] <= 0:
+            raise RuntimeError("Element has no visible click bounds")
+        x = bounds["x"] + bounds["width"] // 2
+        y = bounds["y"] + bounds["height"] // 2
+        button = {"left": 1, "middle": 2, "right": 3}.get(str(request.get("button", "left")), 1)
+        count = max(1, min(int(request.get("count", 1) or 1), 3))
+        event = f"b{button}d" if count == 2 else f"b{button}c"
+        if count == 3:
+            for _ in range(3):
+                pyatspi.Registry.generateMouseEvent(x, y, f"b{button}c")
+        else:
+            pyatspi.Registry.generateMouseEvent(x, y, event)
+    elif action in {"press", "toggle"}:
         index = choose_native_action(names)
         if action_iface is not None and index is not None:
             if not action_iface.doAction(index):
@@ -351,11 +564,56 @@ def perform_action(request):
             scrolled = bool(safe(lambda: component.scrollTo(pyatspi.SCROLL_ANYWHERE), False))
         if not scrolled:
             component.grabFocus()
+    elif action == "scroll":
+        bounds = bounds_info(obj)
+        if not bounds or bounds["width"] <= 0 or bounds["height"] <= 0:
+            raise RuntimeError("Element has no visible scroll bounds")
+        if not shutil.which("xdotool"):
+            raise RuntimeError("xdotool is required for element-targeted scrolling")
+        x = bounds["x"] + bounds["width"] // 2
+        y = bounds["y"] + bounds["height"] // 2
+        direction = str(request.get("direction", "down"))
+        wheel = {"up": "4", "down": "5", "left": "6", "right": "7"}.get(direction, "5")
+        pages = max(1, min(int(request.get("pages", 1) or 1), 100))
+        subprocess.run(["xdotool", "mousemove", str(x), str(y), "click", "--repeat", str(pages * 5), wheel], check=True, timeout=10)
     elif action == "set_value":
         editable = safe(lambda: obj.queryEditableText(), None)
         if editable is None:
             raise RuntimeError("Element is not editable")
         editable.setTextContents(value)
+    elif action == "select_text":
+        needle = str(request.get("text", "") or "")
+        if not needle:
+            raise RuntimeError("select_text requires non-empty text")
+        text_iface = safe(lambda: obj.queryText(), None)
+        if text_iface is None:
+            raise RuntimeError("Element has no text interface")
+        count = int(safe(lambda: text_iface.characterCount, 0) or 0)
+        source = str(safe(lambda: text_iface.getText(0, count), "") or "")
+        prefix = str(request.get("prefix", "") or "")
+        suffix = str(request.get("suffix", "") or "")
+        start = -1
+        cursor = 0
+        while cursor <= len(source):
+            found = source.find(needle, cursor)
+            if found < 0:
+                break
+            if (not prefix or source[:found].endswith(prefix)) and (not suffix or source[found + len(needle):].startswith(suffix)):
+                start = found
+                break
+            cursor = found + max(1, len(needle))
+        if start < 0:
+            raise RuntimeError("Text was not found in the AT-SPI element")
+        end = start + len(needle)
+        selection_type = str(request.get("selectionType", "text"))
+        if selection_type == "cursor_before":
+            end = start
+        elif selection_type == "cursor_after":
+            start = end
+        selections = int(safe(lambda: text_iface.getNSelections(), 0) or 0)
+        changed = safe(lambda: text_iface.setSelection(0, start, end), False) if selections else safe(lambda: text_iface.addSelection(start, end), False)
+        if not changed:
+            raise RuntimeError("AT-SPI element did not accept the requested text selection")
     elif action in {"increment", "decrement"}:
         iface = safe(lambda: obj.queryValue(), None)
         if iface is None:
@@ -366,10 +624,29 @@ def perform_action(request):
     else:
         raise RuntimeError(f"Unsupported AT-SPI action: {action}")
 
-    return {"ok": True, "source": "linux-atspi", "action": action}
+    return {"ok": True, "source": "linux-atspi", "action": action, **action_settle()}
 
 
 def list_applications():
+    usage = {}
+    usage_path = os.path.join(os.path.expanduser("~"), ".local", "share", "gnome-shell", "application_state")
+    try:
+        with open(usage_path, "r", encoding="utf-8") as stream:
+            raw_usage = json.load(stream)
+        records = raw_usage.get("applications", raw_usage) if isinstance(raw_usage, dict) else {}
+        for key, value in records.items():
+            if not isinstance(value, dict):
+                continue
+            seen = value.get("last_seen", value.get("lastUsed"))
+            if isinstance(seen, (int, float)) and seen > 0:
+                seconds = seen / 1000.0 if seen > 10_000_000_000 else seen
+                last_used = datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            else:
+                last_used = None
+            count = value.get("count", value.get("use_count"))
+            usage[str(key).lower()] = {"lastUsedDate": last_used, "useCount": int(count) if isinstance(count, (int, float)) and count >= 0 else None}
+    except Exception:
+        pass
     desktop = pyatspi.Registry.getDesktop(0)
     by_id = {}
     count = int(safe(lambda: desktop.childCount, 0) or 0)
@@ -379,7 +656,7 @@ def list_applications():
         if not name:
             continue
         app_id = f"atspi:{name.lower()}"
-        by_id[app_id] = {"id": app_id, "displayName": name, "path": "", "isRunning": True, "pid": None}
+        by_id[app_id] = {"id": app_id, "displayName": name, "path": "", "isRunning": True, "pid": None, "lastUsedDate": None, "useCount": None}
 
     for entry in desktop_application_entries():
         app_id = entry["id"]
@@ -387,8 +664,74 @@ def list_applications():
         by_id[app_id] = {
             "id": app_id, "displayName": entry["displayName"], "path": entry["path"],
             "isRunning": bool(running_match), "pid": None,
+            **usage.get(entry["desktopId"].lower(), usage.get((entry["desktopId"] + ".desktop").lower(), {"lastUsedDate": None, "useCount": None})),
         }
-    return sorted(by_id.values(), key=lambda item: (not item["isRunning"], item["displayName"].lower()))
+    return sorted(by_id.values(), key=lambda item: (not item["isRunning"], -(item.get("useCount") or -1), item.get("lastUsedDate") or "", item["displayName"].lower()))
+
+
+def activate_application(request):
+    guard = session_guard()
+    if not guard["interactiveDesktop"]:
+        raise RuntimeError("The Linux desktop session is locked or inactive; unlock the active session before activating an application")
+    requested = str(request.get("application", "") or "").strip()
+    if not requested:
+        raise RuntimeError("application is required")
+    requested_lower = requested.lower()
+    desktop_id = requested[8:] if requested_lower.startswith("desktop:") else ""
+    entry = next((item for item in desktop_application_entries() if item["desktopId"].lower() == desktop_id.lower()), None) if desktop_id else None
+    display_name = entry["displayName"] if entry else (requested[6:] if requested_lower.startswith("atspi:") else requested)
+
+    def matching_app():
+        desktop = pyatspi.Registry.getDesktop(0)
+        count = int(safe(lambda: desktop.childCount, 0) or 0)
+        for index in range(min(count, 100)):
+            app = child_at(desktop, index)
+            name = str(safe(lambda: app.name, "") or "").strip()
+            if name and (name.lower() == display_name.lower() or display_name.lower() in name.lower()):
+                return app, name
+        return None, ""
+
+    app, matched_name = matching_app()
+    launched = False
+    if app is None and desktop_id:
+        launcher = shutil.which("gtk-launch")
+        if not launcher:
+            raise RuntimeError("gtk-launch is required to start a desktop application")
+        subprocess.Popen([launcher, desktop_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        launched = True
+        for _ in range(40):
+            time.sleep(0.1)
+            app, matched_name = matching_app()
+            if app is not None:
+                break
+    if app is None:
+        raise RuntimeError(f"Linux application is not running and cannot be launched by this identifier: {requested}")
+
+    xdotool = shutil.which("xdotool")
+    if xdotool:
+        found = subprocess.run(
+            [xdotool, "search", "--onlyvisible", "--name", re.escape(matched_name or display_name)],
+            capture_output=True, text=True, timeout=4, check=False,
+        )
+        window_id = next((line.strip() for line in found.stdout.splitlines() if line.strip()), "")
+        if window_id:
+            activated = subprocess.run([xdotool, "windowactivate", "--sync", window_id], timeout=5, check=False)
+            if activated.returncode == 0:
+                return {"ok": True, "source": "linux-atspi", "application": matched_name, "applicationId": requested, "launched": launched}
+
+    def focus_first_window(obj, depth=0):
+        if obj is None or depth > 4:
+            return False
+        role = canonical_role(safe(lambda: obj.getRoleName(), ""))
+        component = safe(lambda: obj.queryComponent(), None)
+        if role in {"frame", "window", "dialog"} and component is not None and safe(lambda: component.grabFocus(), False):
+            return True
+        count = int(safe(lambda: obj.childCount, 0) or 0)
+        return any(focus_first_window(child_at(obj, index), depth + 1) for index in range(min(count, 100)))
+
+    if not focus_first_window(app):
+        raise RuntimeError(f"Linux application was found but could not be activated: {matched_name or display_name}")
+    return {"ok": True, "source": "linux-atspi", "application": matched_name, "applicationId": requested, "launched": launched}
 
 
 def main():
@@ -396,18 +739,26 @@ def main():
     mode = request.get("mode", "list")
     if mode == "doctor":
         desktop = pyatspi.Registry.getDesktop(0)
-        emit({"ok": True, "source": "linux-atspi", "applications": int(safe(lambda: desktop.childCount, 0) or 0)})
+        emit({"ok": True, "source": "linux-atspi", "applications": int(safe(lambda: desktop.childCount, 0) or 0), "permissions": session_guard()})
     elif mode == "list":
         emit(list_elements(request))
     elif mode == "applications":
         emit({"ok": True, "source": "linux-atspi", "applications": list_applications()})
+    elif mode == "activate":
+        emit(activate_application(request))
     elif mode == "action":
+        guard = session_guard()
+        if not guard["interactiveDesktop"]:
+            raise RuntimeError("The Linux desktop session is locked or inactive; unlock the active session before sending computer input")
         emit(perform_action(request))
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
 
 try:
-    main()
+    if "--observer-server" in sys.argv:
+        observer_server()
+    else:
+        main()
 except Exception as exc:
     emit({"ok": False, "error": str(exc), "trace": traceback.format_exc(limit=3)})

@@ -3,9 +3,10 @@ import { platform } from "node:os";
 import { applyLocalConfig, doctorLocalComputer, readLocalConfig, setupLocalComputer } from "../lib/local-install.js";
 import { installService, removeService } from "../lib/service-manager.js";
 import { ensureLinuxDesktop } from "../lib/linux-desktop.js";
+import { browserExtensionStatus, installBrowserExtension } from "../lib/browser-extension-install.js";
 
 function printUsage() {
-  console.log(`ChatGPT Computer Control\n\nUsage:\n  chatgpt-computer-control setup [--no-deps] [--host 127.0.0.1] [--port 8787]\n  chatgpt-computer-control doctor\n  chatgpt-computer-control serve\n  chatgpt-computer-control service install\n  chatgpt-computer-control service remove\n  chatgpt-computer-control url\n\nThe MCP server binds to loopback by default. Expose it only through an authenticated HTTPS tunnel or another trusted transport.`);
+  console.log(`ChatGPT Computer Control\n\nUsage:\n  chatgpt-computer-control setup [--no-deps] [--host 127.0.0.1] [--port 8787]\n  chatgpt-computer-control doctor\n  chatgpt-computer-control serve\n  chatgpt-computer-control service install\n  chatgpt-computer-control service remove\n  chatgpt-computer-control browser-extension install\n  chatgpt-computer-control browser-extension status\n  chatgpt-computer-control url\n\nThe MCP server binds to loopback by default. Expose it only through an authenticated HTTPS tunnel or another trusted transport.`);
 }
 
 function valueAfter(args, flag, fallback) {
@@ -63,6 +64,26 @@ async function printUrl() {
   console.log(`http://${host}:${port}${prefix}/${cfg.VPS_APP_TOKEN}`);
 }
 
+async function browserExtension(command) {
+  if (command === "install") {
+    const result = await installBrowserExtension();
+    console.log("Browser bridge installed.");
+    console.log(`Extension ID: ${result.extensionId}`);
+    console.log("1. Open chrome://extensions and enable Developer mode.");
+    console.log(`2. Choose Load unpacked and select: ${result.extension}`);
+    console.log("3. Keep the local service running. The MCP can now enumerate ordinary tabs and atomically claim the exact selected tab.");
+    return;
+  }
+  if (command === "status") {
+    const result = await browserExtensionStatus();
+    console.log(result.installed ? "Browser bridge files: installed" : "Browser bridge files: not installed");
+    console.log(`Extension path: ${result.extensionPath}`);
+    if (result.extensionId) console.log(`Extension ID: ${result.extensionId}`);
+    return;
+  }
+  throw new Error("Use: chatgpt-computer-control browser-extension install|status");
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const command = args[0] || "help";
@@ -71,6 +92,7 @@ async function main() {
   if (command === "doctor") return doctor();
   if (command === "serve") return serve();
   if (command === "url") return printUrl();
+  if (command === "browser-extension") return browserExtension(args[1]);
   if (command === "service" && args[1] === "install") {
     await applyLocalConfig();
     const result = await installService();

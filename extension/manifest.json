@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT Computer Control Bridge",
+  "version": "0.1.0",
+  "description": "Let your local ChatGPT Computer Control service securely discover and claim signed-in Chrome tabs.",
+  "permissions": ["alarms", "debugger", "downloads", "nativeMessaging", "storage", "tabGroups", "tabs", "webNavigation"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": {
+    "default_title": "ChatGPT Computer Control status",
+    "default_popup": "popup.html"
+  }
+}

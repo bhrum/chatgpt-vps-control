@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { z } from "zod";
 import {
   nativeComputerBackendName,
@@ -7,11 +7,22 @@ import {
   nativeComputerDoctor,
   nativeComputerState,
   nativeComputerUse,
+  nativeComputerWindowAction,
 } from "./lib/native-computer-backend.js";
 import { listSemanticApplications, listSemanticElements, semanticElementAction } from "./lib/semantic-computer.js";
+import { browserSessionCua, browserSessionLocator, browserSessionTabAction, browserSessionUtility, listBrowserSessions, navigateBrowserSession, startBrowserSession, stopBrowserSession } from "./lib/browser-session.js";
+import { activateLinuxApplication } from "./lib/linux-accessibility.js";
 
 const API_WIDTH = 1280;
+const BROWSER_SESSION_ACTIONS = ["list", "start", "navigate", "new_tab", "activate_tab", "back", "forward", "reload", "screenshot", "retain_tab", "release_tab", "cleanup_tabs", "close_tab", "stop"];
+const BROWSER_UTILITY_ACTIONS = ["export_html", "export_text", "export_pdf", "clipboard_read", "clipboard_write", "logs", "dialog_state", "dialog_accept", "dialog_dismiss", "downloads", "download_wait", "download_cancel"];
+const BROWSER_LOCATOR_ACTIONS = ["inspect", "wait_for", "click", "double_click", "hover", "focus", "fill", "type", "check", "uncheck", "select_option", "set_files", "drag_to", "press_key", "scroll_into_view", "scroll", "get_attribute"];
+const BROWSER_CUA_ACTIONS = ["screenshot", "click", "double_click", "move", "drag", "type", "key", "keypress", "scroll", "download_media", "wait"];
+const WINDOW_ACTIONS = ["activate", "close", "minimize", "maximize", "restore", "move_resize"];
 const DEFAULT_SETTLE_MS = clampNumber(Number(process.env.COMPUTER_SCREENSHOT_SETTLE_MS ?? 2000), 0, 5000, 2000);
+const SEMANTIC_SETTLE_MIN_MS = clampNumber(Number(process.env.COMPUTER_SEMANTIC_SETTLE_MIN_MS ?? 800), 0, 3000, 800);
+const SEMANTIC_SETTLE_MAX_MS = clampNumber(Number(process.env.COMPUTER_SEMANTIC_SETTLE_MAX_MS ?? 5000), 500, 10_000, 5000);
+const SEMANTIC_SETTLE_POLL_MS = clampNumber(Number(process.env.COMPUTER_SEMANTIC_SETTLE_POLL_MS ?? 250), 100, 1000, 250);
 const DEFAULT_TYPING_DELAY_MS = clampNumber(Number(process.env.COMPUTER_TYPING_DELAY_MS ?? 12), 0, 1000, 12);
 const DEFAULT_TYPING_BATCH_SIZE = clampNumber(Number(process.env.COMPUTER_TYPING_BATCH_SIZE ?? 50), 1, 500, 50);
 const KEYMAP_SETTLE_MS = 300;
@@ -24,9 +35,12 @@ const MAX_STDERR_BYTES = 256 * 1024;
 const MAX_SCREENSHOT_BYTES = 12 * 1024 * 1024;
 const ELEMENT_SNAPSHOT_TTL_MS = 90_000;
 const MAX_ELEMENT_SNAPSHOTS = 24;
-const ELEMENT_ACTIONS = ["press", "focus", "set_value", "toggle", "increment", "decrement", "scroll_into_view"];
+const ELEMENT_ACTIONS = ["press", "click", "focus", "set_value", "select_text", "toggle", "increment", "decrement", "scroll_into_view", "scroll"];
 const ELEMENT_SNAPSHOTS = new Map();
 const APP_STATE_CACHE = new Map();
+const WINDOW_CLAIM_TTL_MS = 90_000;
+const WINDOW_CLAIM_SECRET = randomBytes(32);
+const WINDOW_CLAIMS = new Map();
 
 const BUTTONS = {
   left: "1",
@@ -69,8 +83,37 @@ const actionSchema = z.object({
 const computerUseArgsSchema = actionSchema.extend({
   display: z.string().min(1).max(64).optional(),
   application: z.string().min(1).max(500).optional(),
+  activateApplication: z.boolean().default(false).optional(),
   description: z.string().max(500).optional(),
   then: z.array(actionSchema).min(1).max(MAX_FOLLOW_UP_ACTIONS).optional(),
+});
+
+const browserLocatorSchema = z.object({
+  css: z.string().max(2000).optional(),
+  role: z.string().max(200).optional(),
+  name: z.string().max(2000).optional(),
+  text: z.string().max(5000).optional(),
+  exact: z.boolean().default(false).optional(),
+  nth: z.number().int().min(0).max(10_000).default(0).optional(),
+}).refine((locator) => Boolean(locator.css || locator.role || locator.name || locator.text), "Locator requires css, role, name, or text.");
+
+const browserLocatorStepSchema = z.object({
+  action: z.enum(BROWSER_LOCATOR_ACTIONS),
+  locator: browserLocatorSchema,
+  frames: z.array(browserLocatorSchema).max(8).optional(),
+  target: browserLocatorSchema.optional(),
+  value: z.string().max(200_000).optional(),
+  values: z.array(z.string().max(20_000)).max(100).optional(),
+  files: z.array(z.string().min(1).max(4000)).max(20).optional(),
+  key: z.string().max(200).optional(),
+  attribute: z.string().max(500).optional(),
+  button: z.enum(["left", "right", "middle"]).default("left").optional(),
+  count: z.number().int().min(1).max(3).default(1).optional(),
+  direction: z.enum(["up", "down", "left", "right"]).default("down").optional(),
+  pages: z.number().int().min(1).max(100).default(1).optional(),
+  state: z.enum(["attached", "detached", "visible", "hidden", "enabled", "disabled"]).default("visible").optional(),
+  timeoutMs: z.number().int().min(0).max(30_000).default(5000).optional(),
+  limit: z.number().int().min(1).max(500).default(100).optional(),
 });
 
 const stateShape = {
@@ -79,7 +122,7 @@ const stateShape = {
   apiResolution: z.object({ width: z.number().int(), height: z.number().int() }),
   cursorPosition: z.object({ x: z.number().int(), y: z.number().int() }).nullable(),
   activeWindow: z.object({ id: z.string(), name: z.string() }).nullable(),
-  windows: z.array(z.object({ id: z.string(), name: z.string() })),
+  windows: z.array(z.object({ id: z.string(), name: z.string(), claim: z.string() })),
   screenshotIncluded: z.boolean(),
   screenshotMimeType: z.string().nullable(),
   message: z.string(),
@@ -125,6 +168,8 @@ const applicationShape = z.object({
   path: z.string(),
   isRunning: z.boolean(),
   pid: z.number().int().nullable(),
+  lastUsedDate: z.string().nullable(),
+  useCount: z.number().int().nullable(),
 });
 const applicationsResultShape = {
   applications: z.array(applicationShape),
@@ -137,6 +182,124 @@ const appStateResultShape = {
   applicationId: z.string().nullable(),
   isDiff: z.boolean(),
   text: z.string(),
+  screenshotIncluded: z.boolean(),
+  screenshotMimeType: z.string().nullable(),
+  screenshotScope: z.enum(["application", "desktop"]).nullable(),
+  screenshotBounds: elementBoundsShape.nullable(),
+  message: z.string(),
+};
+const browserTargetShape = z.object({
+  id: z.string(), title: z.string(), url: z.string(), endpoint: z.string(),
+});
+const managedBrowserTargetShape = browserTargetShape.extend({ claim: z.string(), owner: z.enum(["user", "automation"]), retained: z.boolean() });
+const browserSessionShape = z.object({
+  name: z.string(), kind: z.enum(["managed", "attached", "extension"]), running: z.boolean(), endpoint: z.string().nullable(), pid: z.number().int().nullable(),
+  targets: z.array(managedBrowserTargetShape),
+});
+const browserSessionResultShape = {
+  action: z.string(),
+  session: browserSessionShape.nullable(),
+  sessions: z.array(browserSessionShape),
+  target: managedBrowserTargetShape.nullable(),
+  screenshotIncluded: z.boolean(),
+  screenshotMimeType: z.string().nullable(),
+  message: z.string(),
+};
+
+// Browser-session objects also carry private routing fields internally (for
+// example extension instance ids and CDP websocket urls).  Never place those
+// objects directly in MCP structuredContent: strict clients validate the
+// advertised output schema and reject the whole result when an internal field
+// leaks through.
+function publicBrowserTarget(target) {
+  if (!target) return null;
+  return {
+    id: String(target.id ?? ""),
+    title: String(target.title ?? ""),
+    url: String(target.url ?? ""),
+    endpoint: String(target.endpoint ?? ""),
+    claim: String(target.claim ?? ""),
+    owner: target.owner === "automation" ? "automation" : "user",
+    retained: target.retained === true,
+  };
+}
+
+function publicBrowserSession(session) {
+  if (!session) return null;
+  return {
+    name: String(session.name ?? ""),
+    kind: session.kind,
+    running: session.running === true,
+    endpoint: session.endpoint == null ? null : String(session.endpoint),
+    pid: Number.isInteger(session.pid) ? session.pid : null,
+    targets: Array.isArray(session.targets) ? session.targets.map(publicBrowserTarget) : [],
+  };
+}
+const browserLogShape = z.object({
+  level: z.string(), text: z.string(), source: z.string(), timestamp: z.number(), url: z.string(), lineNumber: z.number().int().nullable(),
+});
+const browserDialogShape = z.object({ type: z.string(), message: z.string(), defaultPrompt: z.string(), url: z.string() });
+const browserDownloadShape = z.object({
+  guid: z.string(), url: z.string(), suggestedFilename: z.string(), state: z.string(),
+  receivedBytes: z.number(), totalBytes: z.number().nullable(), path: z.string().nullable(), size: z.number().nullable(),
+});
+const browserDownloadFileShape = z.object({ name: z.string(), path: z.string(), size: z.number(), modifiedAt: z.string() });
+const browserArtifactShape = z.object({ kind: z.enum(["pdf"]), name: z.string(), path: z.string(), size: z.number() });
+const browserUtilityResultShape = {
+  action: z.string(),
+  session: browserSessionShape,
+  target: managedBrowserTargetShape.nullable(),
+  text: z.string().nullable(),
+  logs: z.array(browserLogShape),
+  dialog: browserDialogShape.nullable(),
+  downloads: z.array(browserDownloadShape),
+  files: z.array(browserDownloadFileShape),
+  artifacts: z.array(browserArtifactShape),
+  message: z.string(),
+};
+const browserLocatorElementShape = z.object({
+  index: z.number().int(), tag: z.string(), role: z.string(), name: z.string(), text: z.string(), value: z.string(),
+  checked: z.boolean().nullable(), disabled: z.boolean(), visible: z.boolean(), bounds: z.object({ x: z.number(), y: z.number(), width: z.number(), height: z.number() }),
+});
+const browserLocatorStepResultShape = z.object({
+  action: z.string(), matched: z.boolean(), value: z.string().nullable(),
+  element: browserLocatorElementShape.nullable(), matches: z.array(browserLocatorElementShape),
+});
+const browserLocatorResultShape = {
+  session: browserSessionShape,
+  target: managedBrowserTargetShape.nullable(),
+  results: z.array(browserLocatorStepResultShape),
+  screenshotIncluded: z.boolean(),
+  screenshotMimeType: z.string().nullable(),
+  message: z.string(),
+};
+const browserCuaPointShape = z.object({
+  x: z.number().min(0).max(100_000), y: z.number().min(0).max(100_000),
+});
+const browserCuaClipShape = z.object({
+  x: z.number().min(0).max(100_000), y: z.number().min(0).max(100_000),
+  width: z.number().positive().max(100_000), height: z.number().positive().max(100_000),
+  scale: z.number().positive().max(4).default(1).optional(),
+});
+const browserCuaActionShape = z.object({
+  action: z.enum(BROWSER_CUA_ACTIONS),
+  x: z.number().min(0).max(100_000).optional(), y: z.number().min(0).max(100_000).optional(),
+  fromX: z.number().min(0).max(100_000).optional(), fromY: z.number().min(0).max(100_000).optional(), toX: z.number().min(0).max(100_000).optional(), toY: z.number().min(0).max(100_000).optional(),
+  path: z.array(browserCuaPointShape).min(2).max(100).optional(),
+  text: z.string().max(200_000).optional(), key: z.string().max(200).optional(), keys: z.array(z.string().max(64)).max(12).optional(), keypress: z.array(z.string().max(64)).max(12).optional(),
+  button: z.union([z.enum(["left", "right", "middle", "back", "forward"]), z.number().int().min(1).max(5)]).default("left").optional(),
+  count: z.number().int().min(1).max(3).default(1).optional(),
+  scrollX: z.number().min(-100_000).max(100_000).optional(), scrollY: z.number().min(-100_000).max(100_000).optional(),
+  direction: z.enum(["up", "down", "left", "right"]).default("down").optional(), pages: z.number().int().min(1).max(100).default(1).optional(), steps: z.number().int().min(2).max(60).default(12).optional(),
+  durationMs: z.number().int().min(0).max(30_000).default(100).optional(), timeoutMs: z.number().int().min(0).max(30_000).default(30_000).optional(),
+  clip: browserCuaClipShape.optional(), fullPage: z.boolean().default(false).optional(),
+});
+const browserCuaResultShape = {
+  session: browserSessionShape,
+  target: managedBrowserTargetShape.nullable(),
+  actionCount: z.number().int(),
+  screenshotIncluded: z.boolean(),
+  screenshotMimeType: z.string().nullable(),
   message: z.string(),
 };
 const elementsResultShape = {
@@ -155,6 +318,8 @@ const elementsResultShape = {
 };
 const elementActionResultShape = {
   snapshotId: z.string(),
+  nextSnapshotId: z.string().nullable(),
+  nextExpiresInMs: z.number().int().nullable(),
   elementIndex: z.number().int(),
   source: z.string(),
   action: z.string(),
@@ -162,6 +327,13 @@ const elementActionResultShape = {
   activeWindow: z.object({ id: z.string(), name: z.string() }).nullable(),
   screenshotIncluded: z.boolean(),
   screenshotMimeType: z.string().nullable(),
+  screenshotScope: z.enum(["application", "desktop", "browser"]).nullable(),
+  screenshotBounds: elementBoundsShape.nullable(),
+  stateIsDiff: z.boolean().nullable(),
+  stateText: z.string().nullable(),
+  settleDurationMs: z.number().int().nullable(),
+  settleEventCount: z.number().int().nullable(),
+  settleSource: z.string().nullable(),
   message: z.string(),
 };
 
@@ -178,6 +350,15 @@ const useResultShape = {
   message: z.string(),
 };
 
+const windowActionResultShape = {
+  ...stateShape,
+  action: z.enum(WINDOW_ACTIONS),
+  windowId: z.string(),
+  settleDurationMs: z.number().int().nullable(),
+  settleEventCount: z.number().int().nullable(),
+  settleSource: z.string().nullable(),
+};
+
 const stateJsonSchema = {
   type: "object",
   properties: {
@@ -186,12 +367,26 @@ const stateJsonSchema = {
     apiResolution: resolutionJsonSchema(),
     cursorPosition: pointOrNullJsonSchema(),
     activeWindow: windowOrNullJsonSchema(),
-    windows: { type: "array", items: windowJsonSchema() },
+    windows: { type: "array", items: claimedWindowJsonSchema() },
     screenshotIncluded: { type: "boolean" },
     screenshotMimeType: { type: ["string", "null"] },
     message: { type: "string" },
   },
   required: ["display", "displayResolution", "apiResolution", "cursorPosition", "activeWindow", "windows", "screenshotIncluded", "screenshotMimeType", "message"],
+  additionalProperties: false,
+};
+
+const windowActionResultJsonSchema = {
+  type: "object",
+  properties: {
+    ...stateJsonSchema.properties,
+    action: { type: "string", enum: WINDOW_ACTIONS },
+    windowId: { type: "string" },
+    settleDurationMs: { type: ["integer", "null"] },
+    settleEventCount: { type: ["integer", "null"] },
+    settleSource: { type: ["string", "null"] },
+  },
+  required: [...stateJsonSchema.required, "action", "windowId", "settleDurationMs", "settleEventCount", "settleSource"],
   additionalProperties: false,
 };
 
@@ -235,9 +430,9 @@ const applicationJsonSchema = {
   type: "object",
   properties: {
     id: { type: "string" }, displayName: { type: "string" }, path: { type: "string" },
-    isRunning: { type: "boolean" }, pid: { type: ["integer", "null"] },
+    isRunning: { type: "boolean" }, pid: { type: ["integer", "null"] }, lastUsedDate: { type: ["string", "null"] }, useCount: { type: ["integer", "null"] },
   },
-  required: ["id", "displayName", "path", "isRunning", "pid"],
+  required: ["id", "displayName", "path", "isRunning", "pid", "lastUsedDate", "useCount"],
   additionalProperties: false,
 };
 const applicationsResultJsonSchema = {
@@ -251,10 +446,143 @@ const appStateResultJsonSchema = {
   properties: {
     snapshotId: { type: "string" }, expiresInMs: { type: "integer" },
     application: { type: ["string", "null"] }, applicationId: { type: ["string", "null"] },
-    isDiff: { type: "boolean" }, text: { type: "string" }, message: { type: "string" },
+    isDiff: { type: "boolean" }, text: { type: "string" },
+    screenshotIncluded: { type: "boolean" }, screenshotMimeType: { type: ["string", "null"] }, screenshotScope: { type: ["string", "null"], enum: ["application", "desktop", null] }, screenshotBounds: { anyOf: [elementBoundsJsonSchema, { type: "null" }] }, message: { type: "string" },
   },
-  required: ["snapshotId", "expiresInMs", "application", "applicationId", "isDiff", "text", "message"],
+  required: ["snapshotId", "expiresInMs", "application", "applicationId", "isDiff", "text", "screenshotIncluded", "screenshotMimeType", "screenshotScope", "screenshotBounds", "message"],
   additionalProperties: false,
+};
+const browserTargetJsonSchema = {
+  type: "object",
+  properties: { id: { type: "string" }, title: { type: "string" }, url: { type: "string" }, endpoint: { type: "string" }, claim: { type: "string" }, owner: { type: "string", enum: ["user", "automation"] }, retained: { type: "boolean" } },
+  required: ["id", "title", "url", "endpoint", "claim", "owner", "retained"],
+  additionalProperties: false,
+};
+const browserSessionJsonSchema = {
+  type: "object",
+  properties: {
+    name: { type: "string" }, kind: { type: "string", enum: ["managed", "attached", "extension"] }, running: { type: "boolean" }, endpoint: { type: ["string", "null"] }, pid: { type: ["integer", "null"] },
+    targets: { type: "array", items: browserTargetJsonSchema },
+  },
+  required: ["name", "kind", "running", "endpoint", "pid", "targets"],
+  additionalProperties: false,
+};
+const browserSessionResultJsonSchema = {
+  type: "object",
+  properties: {
+    action: { type: "string" },
+    session: { anyOf: [browserSessionJsonSchema, { type: "null" }] },
+    sessions: { type: "array", items: browserSessionJsonSchema },
+    target: { anyOf: [browserTargetJsonSchema, { type: "null" }] },
+    screenshotIncluded: { type: "boolean" },
+    screenshotMimeType: { type: ["string", "null"] },
+    message: { type: "string" },
+  },
+  required: ["action", "session", "sessions", "target", "screenshotIncluded", "screenshotMimeType", "message"],
+  additionalProperties: false,
+};
+const browserLogJsonSchema = {
+  type: "object",
+  properties: {
+    level: { type: "string" }, text: { type: "string" }, source: { type: "string" }, timestamp: { type: "number" },
+    url: { type: "string" }, lineNumber: { type: ["integer", "null"] },
+  },
+  required: ["level", "text", "source", "timestamp", "url", "lineNumber"],
+  additionalProperties: false,
+};
+const browserDialogJsonSchema = {
+  type: "object",
+  properties: { type: { type: "string" }, message: { type: "string" }, defaultPrompt: { type: "string" }, url: { type: "string" } },
+  required: ["type", "message", "defaultPrompt", "url"],
+  additionalProperties: false,
+};
+const browserDownloadJsonSchema = {
+  type: "object",
+  properties: {
+    guid: { type: "string" }, url: { type: "string" }, suggestedFilename: { type: "string" }, state: { type: "string" },
+    receivedBytes: { type: "number" }, totalBytes: { type: ["number", "null"] }, path: { type: ["string", "null"] }, size: { type: ["number", "null"] },
+  },
+  required: ["guid", "url", "suggestedFilename", "state", "receivedBytes", "totalBytes", "path", "size"],
+  additionalProperties: false,
+};
+const browserDownloadFileJsonSchema = {
+  type: "object",
+  properties: { name: { type: "string" }, path: { type: "string" }, size: { type: "number" }, modifiedAt: { type: "string" } },
+  required: ["name", "path", "size", "modifiedAt"],
+  additionalProperties: false,
+};
+const browserArtifactJsonSchema = {
+  type: "object",
+  properties: { kind: { type: "string", enum: ["pdf"] }, name: { type: "string" }, path: { type: "string" }, size: { type: "number" } },
+  required: ["kind", "name", "path", "size"],
+  additionalProperties: false,
+};
+const browserUtilityResultJsonSchema = {
+  type: "object",
+  properties: {
+    action: { type: "string" }, session: browserSessionJsonSchema,
+    target: { anyOf: [browserTargetJsonSchema, { type: "null" }] }, text: { type: ["string", "null"] },
+    logs: { type: "array", items: browserLogJsonSchema },
+    dialog: { anyOf: [browserDialogJsonSchema, { type: "null" }] },
+    downloads: { type: "array", items: browserDownloadJsonSchema },
+    files: { type: "array", items: browserDownloadFileJsonSchema },
+    artifacts: { type: "array", items: browserArtifactJsonSchema },
+    message: { type: "string" },
+  },
+  required: ["action", "session", "target", "text", "logs", "dialog", "downloads", "files", "artifacts", "message"],
+  additionalProperties: false,
+};
+const browserLocatorElementJsonSchema = {
+  type: "object",
+  properties: {
+    index: { type: "integer" }, tag: { type: "string" }, role: { type: "string" }, name: { type: "string" },
+    text: { type: "string" }, value: { type: "string" }, checked: { type: ["boolean", "null"] }, disabled: { type: "boolean" }, visible: { type: "boolean" },
+    bounds: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, width: { type: "number" }, height: { type: "number" } }, required: ["x", "y", "width", "height"], additionalProperties: false },
+  },
+  required: ["index", "tag", "role", "name", "text", "value", "checked", "disabled", "visible", "bounds"],
+  additionalProperties: false,
+};
+const browserLocatorStepResultJsonSchema = {
+  type: "object",
+  properties: {
+    action: { type: "string" }, matched: { type: "boolean" }, value: { type: ["string", "null"] },
+    element: { anyOf: [browserLocatorElementJsonSchema, { type: "null" }] }, matches: { type: "array", items: browserLocatorElementJsonSchema },
+  },
+  required: ["action", "matched", "value", "element", "matches"],
+  additionalProperties: false,
+};
+const browserLocatorResultJsonSchema = {
+  type: "object",
+  properties: {
+    session: browserSessionJsonSchema, target: { anyOf: [browserTargetJsonSchema, { type: "null" }] },
+    results: { type: "array", items: browserLocatorStepResultJsonSchema }, screenshotIncluded: { type: "boolean" },
+    screenshotMimeType: { type: ["string", "null"] }, message: { type: "string" },
+  },
+  required: ["session", "target", "results", "screenshotIncluded", "screenshotMimeType", "message"],
+  additionalProperties: false,
+};
+const browserCuaActionJsonSchema = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: BROWSER_CUA_ACTIONS },
+    x: { type: "number", minimum: 0, maximum: 100000 }, y: { type: "number", minimum: 0, maximum: 100000 },
+    fromX: { type: "number", minimum: 0, maximum: 100000 }, fromY: { type: "number", minimum: 0, maximum: 100000 }, toX: { type: "number", minimum: 0, maximum: 100000 }, toY: { type: "number", minimum: 0, maximum: 100000 },
+    path: { type: "array", minItems: 2, maxItems: 100, items: { type: "object", properties: { x: { type: "number", minimum: 0, maximum: 100000 }, y: { type: "number", minimum: 0, maximum: 100000 } }, required: ["x", "y"], additionalProperties: false } },
+    text: { type: "string", maxLength: 200000 }, key: { type: "string", maxLength: 200 },
+    keys: { type: "array", maxItems: 12, items: { type: "string", maxLength: 64 } }, keypress: { type: "array", maxItems: 12, items: { type: "string", maxLength: 64 } },
+    button: { anyOf: [{ type: "string", enum: ["left", "right", "middle", "back", "forward"] }, { type: "integer", minimum: 1, maximum: 5 }], default: "left" }, count: { type: "integer", minimum: 1, maximum: 3, default: 1 },
+    scrollX: { type: "number", minimum: -100000, maximum: 100000 }, scrollY: { type: "number", minimum: -100000, maximum: 100000 },
+    direction: { type: "string", enum: ["up", "down", "left", "right"], default: "down" }, pages: { type: "integer", minimum: 1, maximum: 100, default: 1 }, steps: { type: "integer", minimum: 2, maximum: 60, default: 12 }, durationMs: { type: "integer", minimum: 0, maximum: 30000, default: 100 },
+    timeoutMs: { type: "integer", minimum: 0, maximum: 30000, default: 30000 },
+    clip: { type: "object", properties: { x: { type: "number", minimum: 0, maximum: 100000 }, y: { type: "number", minimum: 0, maximum: 100000 }, width: { type: "number", exclusiveMinimum: 0, maximum: 100000 }, height: { type: "number", exclusiveMinimum: 0, maximum: 100000 }, scale: { type: "number", exclusiveMinimum: 0, maximum: 4, default: 1 } }, required: ["x", "y", "width", "height"], additionalProperties: false },
+    fullPage: { type: "boolean", default: false },
+  },
+  required: ["action"], additionalProperties: false,
+};
+const browserCuaResultJsonSchema = {
+  type: "object",
+  properties: { session: browserSessionJsonSchema, target: { anyOf: [browserTargetJsonSchema, { type: "null" }] }, actionCount: { type: "integer" }, screenshotIncluded: { type: "boolean" }, screenshotMimeType: { type: ["string", "null"] }, message: { type: "string" } },
+  required: ["session", "target", "actionCount", "screenshotIncluded", "screenshotMimeType", "message"], additionalProperties: false,
 };
 const elementsResultJsonSchema = {
   type: "object",
@@ -274,10 +602,14 @@ const elementsResultJsonSchema = {
 const elementActionResultJsonSchema = {
   type: "object",
   properties: {
-    snapshotId: { type: "string" }, elementIndex: { type: "integer" }, source: { type: "string" }, action: { type: "string" }, durationMs: { type: "integer" },
-    activeWindow: windowOrNullJsonSchema(), screenshotIncluded: { type: "boolean" }, screenshotMimeType: { type: ["string", "null"] }, message: { type: "string" },
+    snapshotId: { type: "string" }, nextSnapshotId: { type: ["string", "null"] }, nextExpiresInMs: { type: ["integer", "null"] },
+    elementIndex: { type: "integer" }, source: { type: "string" }, action: { type: "string" }, durationMs: { type: "integer" },
+    activeWindow: windowOrNullJsonSchema(), screenshotIncluded: { type: "boolean" }, screenshotMimeType: { type: ["string", "null"] },
+    screenshotScope: { type: ["string", "null"], enum: ["application", "desktop", "browser", null] }, screenshotBounds: { anyOf: [elementBoundsJsonSchema, { type: "null" }] },
+    stateIsDiff: { type: ["boolean", "null"] }, stateText: { type: ["string", "null"] }, settleDurationMs: { type: ["integer", "null"] },
+    settleEventCount: { type: ["integer", "null"] }, settleSource: { type: ["string", "null"] }, message: { type: "string" },
   },
-  required: ["snapshotId", "elementIndex", "source", "action", "durationMs", "activeWindow", "screenshotIncluded", "screenshotMimeType", "message"],
+  required: ["snapshotId", "nextSnapshotId", "nextExpiresInMs", "elementIndex", "source", "action", "durationMs", "activeWindow", "screenshotIncluded", "screenshotMimeType", "screenshotScope", "screenshotBounds", "stateIsDiff", "stateText", "settleDurationMs", "settleEventCount", "settleSource", "message"],
   additionalProperties: false,
 };
 
@@ -333,6 +665,15 @@ function windowJsonSchema() {
 
 function windowOrNullJsonSchema() {
   return { anyOf: [windowJsonSchema(), { type: "null" }] };
+}
+
+function claimedWindowJsonSchema() {
+  return {
+    type: "object",
+    properties: { id: { type: "string" }, name: { type: "string" }, claim: { type: "string" } },
+    required: ["id", "name", "claim"],
+    additionalProperties: false,
+  };
 }
 
 function actionPropertiesJsonSchema() {
@@ -505,6 +846,39 @@ async function resolveDisplay(requested) {
   throw new Error(`No working X11 display found. Tried ${unique.join(", ")}. ${errors.slice(0, 3).join(" | ")}`);
 }
 
+function parseLogindSessionState(output) {
+  const values = new Map();
+  for (const line of String(output ?? "").split(/\r?\n/)) {
+    const separator = line.indexOf("=");
+    if (separator > 0) values.set(line.slice(0, separator).trim(), line.slice(separator + 1).trim().toLowerCase());
+  }
+  return {
+    active: values.get("Active") === "yes",
+    locked: values.get("LockedHint") === "yes",
+  };
+}
+
+async function linuxInteractiveSessionState() {
+  if (process.env.COMPUTER_MANAGED_X11 === "1") return { interactiveDesktop: true, screenLocked: false };
+  const sessionId = String(process.env.XDG_SESSION_ID ?? "").trim();
+  if (!sessionId) return { interactiveDesktop: true, screenLocked: false };
+  const output = await runText("loginctl", ["show-session", sessionId, "--property=Active", "--property=LockedHint"], {
+    timeoutMs: 3000,
+    maxStdoutBytes: 16 * 1024,
+  });
+  const state = parseLogindSessionState(output);
+  return { interactiveDesktop: state.active && !state.locked, screenLocked: state.locked };
+}
+
+async function assertLinuxInteractiveSession(actions) {
+  const mutatesDesktop = actions.some((action) => !["screenshot", "wait"].includes(action.action));
+  if (!mutatesDesktop) return;
+  const state = await linuxInteractiveSessionState();
+  if (!state.interactiveDesktop) {
+    throw new Error("The Linux desktop session is locked or inactive; unlock the active session before sending computer input.");
+  }
+}
+
 async function detectResolution(display) {
   const output = await runText("xrandr", ["--display", display, "--current"], {
     env: commandEnvironment(display),
@@ -558,6 +932,15 @@ function displayToApi(point, resolution) {
   };
 }
 
+function validateWindowGeometry({ x, y, width, height }, apiResolution) {
+  if (![x, y, width, height].every(Number.isInteger) || width <= 0 || height <= 0) {
+    throw new Error("move_resize requires integer x, y, width, and height with positive size.");
+  }
+  if (x < 0 || y < 0 || x + width > apiResolution.width || y + height > apiResolution.height) {
+    throw new Error(`Window geometry must fit inside API display ${apiResolution.width}x${apiResolution.height}.`);
+  }
+}
+
 async function cursorPosition(display, resolution) {
   const output = await tryText("xdotool", ["getmouselocation", "--shell"], {
     env: commandEnvironment(display),
@@ -596,6 +979,38 @@ async function visibleWindows(display) {
     if (windows.length >= MAX_WINDOWS) break;
   }
   return windows;
+}
+
+async function linuxWindowAction(display, resolution, { windowId, windowName, action, x, y, width, height }) {
+  if (!/^\d{1,20}$/.test(String(windowId))) throw new Error("Invalid X11 window id; refresh computer_state.");
+  const env = commandEnvironment(display);
+  const id = String(windowId);
+  const name = (await tryText("xdotool", ["getwindowname", id], { env, timeoutMs: 2000 })).trim();
+  if (!name) throw new Error("The X11 window is stale or unavailable; refresh computer_state.");
+  if (name !== windowName) throw new Error("The X11 window identity changed; refresh computer_state before acting.");
+  const wmId = `0x${Number(id).toString(16)}`;
+  if (action === "activate") {
+    await runText("xdotool", ["windowactivate", "--sync", id], { env, timeoutMs: 5000 });
+  } else if (action === "close") {
+    await runText("xdotool", ["windowclose", id], { env, timeoutMs: 5000 });
+  } else if (action === "minimize") {
+    await runText("xdotool", ["windowminimize", id], { env, timeoutMs: 5000 });
+  } else if (action === "maximize") {
+    await runText("wmctrl", ["-i", "-r", wmId, "-b", "add,maximized_vert,maximized_horz"], { env, timeoutMs: 5000 });
+  } else if (action === "restore") {
+    await runText("wmctrl", ["-i", "-r", wmId, "-b", "remove,maximized_vert,maximized_horz,hidden"], { env, timeoutMs: 5000 });
+    await runText("xdotool", ["windowmap", id, "windowactivate", "--sync", id], { env, timeoutMs: 5000 });
+  } else if (action === "move_resize") {
+    const position = apiToDisplay({ x, y }, resolution);
+    const displayWidth = Math.max(1, Math.round((width / resolution.api.width) * resolution.display.width));
+    const displayHeight = Math.max(1, Math.round((height / resolution.api.height) * resolution.display.height));
+    await runText("wmctrl", ["-i", "-r", wmId, "-b", "remove,maximized_vert,maximized_horz"], { env, timeoutMs: 5000 });
+    await runText("xdotool", ["windowmove", "--sync", id, String(position.x), String(position.y), "windowsize", "--sync", id, String(displayWidth), String(displayHeight)], { env, timeoutMs: 5000 });
+  } else {
+    throw new Error(`Unsupported X11 window action: ${action}`);
+  }
+  await sleep(250);
+  return { ok: true, source: "linux-x11-window", action, windowId: id, settleDurationMs: 250, settleEventCount: 0, settleSource: "bounded-window-manager" };
 }
 
 async function captureScreenshot(display, resolution) {
@@ -901,8 +1316,8 @@ function appStateLine(element) {
   return `${indent}${element.index} ${element.role}${details.length ? ` ${details.join(" | ")}` : ""}`;
 }
 
-function buildAppStateText({ application, applicationId, elements, disableDiff }) {
-  const cacheKey = applicationId || application || "frontmost";
+function buildAppStateText({ application, applicationId, elements, disableDiff, filterKey = "" }) {
+  const cacheKey = `${applicationId || application || "frontmost"}\0${filterKey}`;
   const current = new Map(elements.map((element) => [appStateIdentity(element), element]));
   const previous = APP_STATE_CACHE.get(cacheKey);
   APP_STATE_CACHE.set(cacheKey, current);
@@ -950,6 +1365,58 @@ async function captureComputerAfterSemanticAction(display) {
   return { display: resolvedDisplay, resolution, screenshot, active };
 }
 
+function semanticStateFingerprint(result) {
+  return JSON.stringify((result.elements ?? []).map((element) => [
+    element.source, element.role, element.name, element.value, element.description,
+    element.identifier, element.depth, element.enabled, element.focused,
+    element.selected, element.checked, element.expanded, element.bounds,
+  ]));
+}
+
+function semanticStateLooksBusy(result) {
+  return (result.elements ?? []).some((element) => {
+    const role = String(element.role ?? "").toLowerCase();
+    const label = `${element.name ?? ""} ${element.description ?? ""} ${element.value ?? ""}`.toLowerCase();
+    return role.includes("progress") || role.includes("busy") || /\b(loading|working|progress|please wait)\b/.test(label);
+  });
+}
+
+async function refreshElementState(snapshot, { waitForSettle = true, elementSource = "" } = {}) {
+  try {
+    const started = Date.now();
+    const nativeSource = ["macos-ax", "windows-uia", "linux-atspi"].includes(String(elementSource));
+    const refreshOptions = { ...(snapshot.options ?? {}), ...(nativeSource ? { source: "desktop" } : {}), includeScreenshot: false };
+    let result = await listSemanticElements(refreshOptions);
+    if (waitForSettle) {
+      let fingerprint = semanticStateFingerprint(result);
+      let stableRounds = 0;
+      while (Date.now() - started < SEMANTIC_SETTLE_MAX_MS) {
+        const elapsed = Date.now() - started;
+        if (elapsed >= SEMANTIC_SETTLE_MIN_MS && stableRounds >= 1 && !semanticStateLooksBusy(result)) break;
+        await sleep(Math.min(SEMANTIC_SETTLE_POLL_MS, Math.max(1, SEMANTIC_SETTLE_MAX_MS - elapsed)));
+        const next = await listSemanticElements(refreshOptions);
+        const nextFingerprint = semanticStateFingerprint(next);
+        stableRounds = nextFingerprint === fingerprint ? stableRounds + 1 : 0;
+        fingerprint = nextFingerprint;
+        result = next;
+      }
+    }
+    if (nativeSource) {
+      try { result = await listSemanticElements({ ...refreshOptions, includeScreenshot: true }); }
+      catch {
+        // Preserve the successful action and settled semantic state when capture permission is unavailable.
+      }
+    }
+    const next = storeElementSnapshot(result, { ...(snapshot.options ?? {}), ...(nativeSource ? { source: "desktop" } : {}) });
+    const application = result.application ?? result.target?.title ?? null;
+    const applicationId = result.applicationId ?? (result.target?.id ? `browser:${result.target.id}` : null);
+    const rendered = buildAppStateText({ application, applicationId, elements: next.elements, disableDiff: false });
+    return { snapshot: next, rendered, screenshot: result.screenshot ?? null, settleDurationMs: Date.now() - started };
+  } catch {
+    return null;
+  }
+}
+
 async function collectState(display, resolution, includeScreenshot = true, includeWindows = true) {
   const [cursor, active, windows, screenshot] = await Promise.all([
     cursorPosition(display, resolution),
@@ -958,6 +1425,28 @@ async function collectState(display, resolution, includeScreenshot = true, inclu
     includeScreenshot ? captureScreenshot(display, resolution) : Promise.resolve(null),
   ]);
   return { cursor, active, windows, screenshot };
+}
+
+function claimedWindows(scope, windows) {
+  const now = Date.now();
+  for (const [claim, entry] of WINDOW_CLAIMS) if (entry.expiresAt <= now) WINDOW_CLAIMS.delete(claim);
+  const result = (windows ?? []).map((window) => {
+    const id = String(window.id ?? "");
+    const name = String(window.name ?? "");
+    const claim = createHmac("sha256", WINDOW_CLAIM_SECRET).update(String(scope)).update("\0").update(id).update("\0").update(name).digest("base64url");
+    WINDOW_CLAIMS.set(claim, { scope: String(scope), id, name, expiresAt: now + WINDOW_CLAIM_TTL_MS });
+    return { id, name, claim };
+  });
+  while (WINDOW_CLAIMS.size > 200) WINDOW_CLAIMS.delete(WINDOW_CLAIMS.keys().next().value);
+  return result;
+}
+
+function resolveWindowClaim(scope, windowId, claim) {
+  const entry = WINDOW_CLAIMS.get(String(claim));
+  if (!entry || entry.expiresAt <= Date.now() || entry.scope !== String(scope) || entry.id !== String(windowId)) {
+    throw new Error("Window claim is missing, stale, or belongs to another desktop. Refresh computer_state.");
+  }
+  return entry;
 }
 
 export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecuritySchemes, toolMeta }) {
@@ -981,7 +1470,7 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
     {
       name: "computer_applications",
       title: "Computer applications",
-      description: "List installed and running desktop applications with stable platform identifiers. Use this before targeting a specific app.",
+      description: "List installed and running desktop applications with stable platform identifiers, running state, and evidence-backed recent-use metadata when the operating system exposes it. Use this before targeting a specific app.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       outputSchema: applicationsResultJsonSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
@@ -991,13 +1480,19 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
     {
       name: "computer_app_state",
       title: "Computer application state",
-      description: "Launch or activate one application when needed, then read its rich accessibility tree by stable app id. Later calls return a compact diff by default.",
+      description: "Ensure one application is running, without taking foreground focus by default, then read its rich accessibility tree by stable app id. Later calls return a compact diff.",
       inputSchema: {
         type: "object",
         properties: {
           app: { type: "string", minLength: 1, maxLength: 500 },
           disableDiff: { type: "boolean", default: false },
           maxElements: { type: "integer", minimum: 1, maximum: 500, default: 240 },
+          query: { type: "string", maxLength: 1000, description: "Optional native accessibility text filter for large browser-internal pages and system dialogs." },
+          role: { type: "string", maxLength: 200 },
+          maxDepth: { type: "integer", minimum: 1, maximum: 40, default: 16 },
+          maxVisitedNodes: { type: "integer", minimum: 1, maximum: 20000, default: 3000 },
+          focusedWindowOnly: { type: "boolean", default: true, description: "Read only the focused app window, including native file choosers." },
+          activate: { type: "boolean", default: false, description: "Explicitly bring the application to the foreground. Leave false for background inspection." },
         },
         required: ["app"],
         additionalProperties: false,
@@ -1006,6 +1501,131 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
       securitySchemes: writeSecuritySchemes,
       _meta: toolMeta("Opening and reading application state", "Application state ready", writeSecuritySchemes),
+    },
+    {
+      name: "computer_browser_session",
+      title: "Browser session",
+      description: "Manage a dedicated Chrome/Chromium profile with loopback-only DevTools isolated from ordinary browser windows, an explicitly attached loopback CDP browser, or user-shared signed-in tabs connected through the optional browser extension. Exact claims and user/automation ownership protect every tab; automation tabs can be retained for handoff or batch-cleaned without closing user tabs. Attached and extension browsers can never be stopped by this tool.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: BROWSER_SESSION_ACTIONS },
+          session: { type: "string", minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+          url: { type: "string", maxLength: 4000 },
+          targetId: { type: "string", maxLength: 200 },
+          targetClaim: { type: "string", maxLength: 200, description: "Current claim returned with the target; required for every existing-tab action." },
+          headless: { type: "boolean", default: false },
+        },
+        required: ["action"],
+        additionalProperties: false,
+      },
+      outputSchema: browserSessionResultJsonSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Managing browser session", "Browser session ready", writeSecuritySchemes),
+    },
+    {
+      name: "computer_browser_utility",
+      title: "Browser utilities",
+      description: "Use an exact claimed tab in a managed, attached, or extension-connected browser session for live DOM/text/PDF export, clipboard access (which may activate the claimed tab when browser focus is required), buffered developer logs, JavaScript dialogs, and supported download tracking.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: BROWSER_UTILITY_ACTIONS },
+          session: { type: "string", minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+          targetId: { type: "string", maxLength: 200, description: "Required for tab-scoped actions; must belong to the selected managed session." },
+          targetClaim: { type: "string", maxLength: 200, description: "Current claim returned with the target; required for tab-scoped actions." },
+          text: { type: "string", maxLength: 2_000_000, description: "Clipboard text for clipboard_write. Its contents are not echoed in the result." },
+          promptText: { type: "string", maxLength: 20_000, description: "Optional prompt response for dialog_accept." },
+          clear: { type: "boolean", default: false, description: "Clear buffered developer logs after returning them." },
+          limit: { type: "integer", minimum: 1, maximum: 500, default: 100 },
+          downloadGuid: { type: "string", maxLength: 500 },
+          timeoutMs: { type: "integer", minimum: 0, maximum: 30_000, default: 30_000 },
+          filename: { type: "string", maxLength: 200 },
+          pdfOptions: {
+            type: "object",
+            properties: {
+              landscape: { type: "boolean", default: false }, printBackground: { type: "boolean", default: true }, preferCSSPageSize: { type: "boolean", default: false },
+              scale: { type: "number", minimum: 0.1, maximum: 2, default: 1 }, paperWidth: { type: "number", minimum: 1, maximum: 100, default: 8.27 }, paperHeight: { type: "number", minimum: 1, maximum: 100, default: 11.69 },
+              marginTop: { type: "number", minimum: 0, maximum: 10, default: 0 }, marginBottom: { type: "number", minimum: 0, maximum: 10, default: 0 }, marginLeft: { type: "number", minimum: 0, maximum: 10, default: 0 }, marginRight: { type: "number", minimum: 0, maximum: 10, default: 0 },
+            },
+            additionalProperties: false,
+          },
+        },
+        required: ["action", "session"],
+        additionalProperties: false,
+      },
+      outputSchema: browserUtilityResultJsonSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Using managed browser utility", "Managed browser utility finished", writeSecuritySchemes),
+    },
+    {
+      name: "computer_browser_locator",
+      title: "Browser locator",
+      description: "Run one to twenty declarative visible-DOM locator steps against an exact claimed target in a managed, attached, or extension-connected browser session. Locators use CSS, role, accessible name, or text, can enter up to eight same-origin or cross-origin frames through isolated CDP worlds, and support click/double-click, approved-root file inputs, and element drag; arbitrary JavaScript evaluation is not exposed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session: { type: "string", minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+          targetId: { type: "string", minLength: 1, maxLength: 200 },
+          targetClaim: { type: "string", minLength: 1, maxLength: 200 },
+          steps: {
+            type: "array", minItems: 1, maxItems: 20,
+            items: {
+              type: "object",
+              properties: {
+                action: { type: "string", enum: BROWSER_LOCATOR_ACTIONS },
+                locator: {
+                  type: "object",
+                  properties: {
+                    css: { type: "string", maxLength: 2000 }, role: { type: "string", maxLength: 200 },
+                    name: { type: "string", maxLength: 2000 }, text: { type: "string", maxLength: 5000 },
+                    exact: { type: "boolean", default: false }, nth: { type: "integer", minimum: 0, maximum: 10_000, default: 0 },
+                  },
+                  additionalProperties: false,
+                },
+                frames: {
+                  type: "array", maxItems: 8,
+                  items: {
+                    type: "object",
+                    properties: {
+                      css: { type: "string", maxLength: 2000 }, role: { type: "string", maxLength: 200 },
+                      name: { type: "string", maxLength: 2000 }, text: { type: "string", maxLength: 5000 },
+                      exact: { type: "boolean", default: false }, nth: { type: "integer", minimum: 0, maximum: 10_000, default: 0 },
+                    },
+                    additionalProperties: false,
+                  },
+                },
+                target: {
+                  type: "object",
+                  properties: {
+                    css: { type: "string", maxLength: 2000 }, role: { type: "string", maxLength: 200 },
+                    name: { type: "string", maxLength: 2000 }, text: { type: "string", maxLength: 5000 },
+                    exact: { type: "boolean", default: false }, nth: { type: "integer", minimum: 0, maximum: 10_000, default: 0 },
+                  },
+                  additionalProperties: false,
+                },
+                value: { type: "string", maxLength: 200_000 }, values: { type: "array", maxItems: 100, items: { type: "string", maxLength: 20_000 } },
+                files: { type: "array", maxItems: 20, items: { type: "string", minLength: 1, maxLength: 4000 } },
+                key: { type: "string", maxLength: 200 }, attribute: { type: "string", maxLength: 500 },
+                button: { type: "string", enum: ["left", "right", "middle"], default: "left" }, count: { type: "integer", minimum: 1, maximum: 3, default: 1 },
+                direction: { type: "string", enum: ["up", "down", "left", "right"], default: "down" }, pages: { type: "integer", minimum: 1, maximum: 100, default: 1 },
+                state: { type: "string", enum: ["attached", "detached", "visible", "hidden", "enabled", "disabled"], default: "visible" },
+                timeoutMs: { type: "integer", minimum: 0, maximum: 30_000, default: 5000 }, limit: { type: "integer", minimum: 1, maximum: 500, default: 100 },
+              },
+              required: ["action", "locator"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["session", "targetId", "targetClaim", "steps"],
+        additionalProperties: false,
+      },
+      outputSchema: browserLocatorResultJsonSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Running managed browser locator", "Managed browser locator finished", writeSecuritySchemes),
     },
     {
       name: "computer_elements",
@@ -1024,6 +1644,9 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
           maxElements: { type: "integer", minimum: 1, maximum: 500, default: 120 },
           includeStaticText: { type: "boolean", default: false },
           includeContainers: { type: "boolean", default: false, description: "Include named container/group elements to preserve more of the accessibility hierarchy." },
+          maxDepth: { type: "integer", minimum: 1, maximum: 40, default: 16, description: "Bound native accessibility recursion on very large app trees." },
+          maxVisitedNodes: { type: "integer", minimum: 1, maximum: 20000, default: 3000, description: "Bound native nodes inspected even when a filter has few matches." },
+          focusedWindowOnly: { type: "boolean", default: false, description: "On macOS, restrict traversal to the focused app window." },
         },
         additionalProperties: false,
       },
@@ -1035,7 +1658,7 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
     {
       name: "computer_element_action",
       title: "Computer element action",
-      description: "Operate one element from a recent computer_elements snapshot by index, then return a fresh screenshot. Element snapshots are short-lived; refresh after every UI-changing action.",
+      description: "Operate one element from a recent computer_elements snapshot by index, including exact click, scroll, value, and text-selection semantics, then return a fresh screenshot. Element snapshots are short-lived; refresh after every UI-changing action.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1043,8 +1666,17 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
           elementIndex: { type: "integer", minimum: 0 },
           action: { type: "string", enum: ELEMENT_ACTIONS },
           value: { type: "string", maxLength: MAX_TEXT_CHARS, description: "Required only for set_value." },
+          text: { type: "string", maxLength: MAX_TEXT_CHARS, description: "Required only for select_text." },
+          prefix: { type: "string", maxLength: 2000, description: "Optional preceding context used to disambiguate select_text." },
+          suffix: { type: "string", maxLength: 2000, description: "Optional following context used to disambiguate select_text." },
+          selectionType: { type: "string", enum: ["text", "cursor_before", "cursor_after"], default: "text" },
+          button: { type: "string", enum: ["left", "right", "middle"], default: "left" },
+          count: { type: "integer", minimum: 1, maximum: 3, default: 1 },
+          direction: { type: "string", enum: ["up", "down", "left", "right"], default: "down" },
+          pages: { type: "integer", minimum: 1, maximum: 100, default: 1 },
           display: { type: "string", maxLength: 64, description: "Optional Linux X11 display used for the post-action screenshot." },
           description: { type: "string", maxLength: 500, description: "Concise purpose for the action; value text is not stored in audit history." },
+          returnState: { type: "boolean", default: true, description: "Set false for a fast action-only call, then explicitly refresh computer_app_state or computer_elements." },
         },
         required: ["snapshotId", "elementIndex", "action"],
         additionalProperties: false,
@@ -1066,6 +1698,7 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
           nativeAction: { type: "string", minLength: 1, maxLength: MAX_NATIVE_ACTION_CHARS },
           display: { type: "string", maxLength: 64 },
           description: { type: "string", maxLength: 500 },
+          returnState: { type: "boolean", default: true, description: "Set false for a fast action-only call, then explicitly refresh semantic state." },
         },
         required: ["snapshotId", "elementIndex", "nativeAction"],
         additionalProperties: false,
@@ -1095,15 +1728,41 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
       _meta: toolMeta("Inspecting computer", "Computer state ready", readSecuritySchemes),
     },
     {
+      name: "computer_window",
+      title: "Computer window",
+      description: "Control an exact window id returned by computer_state: activate, close, minimize, maximize, restore, or move and resize it in the same normalized API coordinate space. Returns refreshed windows and a screenshot.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          display: { type: "string", maxLength: 64, description: "Optional Linux X11 display." },
+          windowId: { type: "string", minLength: 1, maxLength: 100 },
+          windowClaim: { type: "string", minLength: 20, maxLength: 200 },
+          action: { type: "string", enum: WINDOW_ACTIONS },
+          x: { type: "integer", minimum: 0, maximum: 10000 },
+          y: { type: "integer", minimum: 0, maximum: 10000 },
+          width: { type: "integer", minimum: 1, maximum: 10000 },
+          height: { type: "integer", minimum: 1, maximum: 10000 },
+          description: { type: "string", maxLength: 500 },
+        },
+        required: ["windowId", "windowClaim", "action"],
+        additionalProperties: false,
+      },
+      outputSchema: windowActionResultJsonSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Controlling window", "Window action finished", writeSecuritySchemes),
+    },
+    {
       name: "computer_use",
       title: "Computer use",
       description:
-        `Control the local computer using the Grok Bot computer-use model with a platform-native backend, 1280-wide normalized coordinates, and one final screenshot. Supports screenshot/click/move/drag/type/key/scroll/wait plus up to ${MAX_FOLLOW_UP_ACTIONS} known follow-up actions in then. A ${DEFAULT_SETTLE_MS}ms settle is applied before the final screenshot after click/move/drag/key/scroll. Use computer_state first and do not batch steps that depend on seeing an intermediate screen.`,
+        `Control an app-scoped background window on macOS, or the foreground desktop elsewhere, with a platform-native backend, 1280-wide normalized coordinates, and one final screenshot. Raw keyboard/mouse input never activates a named app unless activateApplication=true; macOS sends background events directly to the target PID and captures its independent window. Supports screenshot/click/move/drag/type/key/scroll/wait plus up to ${MAX_FOLLOW_UP_ACTIONS} known follow-up actions in then, and rejects locked, inactive, or secure desktops.`,
       inputSchema: {
         type: "object",
         properties: {
           display: { type: "string", maxLength: 64, description: "Optional X11 display such as :3. Defaults to the connector process DISPLAY." },
-          application: { type: "string", maxLength: 500, description: "Optional macOS/Windows application name or bundle identifier to launch/activate before sending actions." },
+          application: { type: "string", maxLength: 500, description: "Optional application name or stable platform identifier. On macOS this enables background app-window coordinates by default." },
+          activateApplication: { type: "boolean", default: false, description: "Explicitly permit bringing application to the foreground before global keyboard/mouse input." },
           description: { type: "string", maxLength: 500, description: "Optional concise purpose for the action; typed text is never copied into connector command history." },
           ...actionPropertiesJsonSchema(),
           then: {
@@ -1121,6 +1780,31 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
       securitySchemes: writeSecuritySchemes,
       _meta: toolMeta("Controlling computer", "Computer action finished", writeSecuritySchemes),
+    },
+    {
+      name: "computer_browser_cua",
+      title: "Browser page coordinate control",
+      description:
+        "Control one exact claimed browser tab in page CSS-pixel coordinates, in a coordinate space separate from desktop computer_use coordinates. Supports screenshot/click/double-click/move/drag/type/keypress/scroll/media-download/wait batches with modifier keys and bounded capture options, then returns a target-only page screenshot; stale or mismatched browser claims fail closed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session: { type: "string", minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+          targetId: { type: "string", minLength: 1, maxLength: 200 },
+          targetClaim: { type: "string", minLength: 1, maxLength: 200, description: "Current claim returned with the target; required to bind input to this exact browser tab." },
+          actions: {
+            type: "array", minItems: 1, maxItems: 20,
+            items: browserCuaActionJsonSchema,
+            description: "Known page-coordinate actions executed in order; coordinates are browser viewport CSS pixels, not desktop screenshot coordinates.",
+          },
+        },
+        required: ["session", "targetId", "targetClaim", "actions"],
+        additionalProperties: false,
+      },
+      outputSchema: browserCuaResultJsonSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Controlling browser page coordinates", "Browser page coordinate action finished", writeSecuritySchemes),
     },
   ];
 }
@@ -1171,16 +1855,19 @@ export function registerComputerUseTools(server, options) {
         }
         const resolvedDisplay = await resolveDisplay(display);
         const resolution = await detectResolution(resolvedDisplay);
+        const session = await linuxInteractiveSessionState();
         const structuredContent = {
           platform: process.platform,
           backend: "linux-x11",
-          ready: true,
+          ready: session.interactiveDesktop,
           display: resolvedDisplay,
           displayResolution: resolution.display,
           apiResolution: resolution.api,
-          permissions: {},
+          permissions: session,
           details: ["xdpyinfo/xrandr reachable", "xdotool input and ffmpeg screenshot backend enabled"],
-          message: `linux-x11 is ready on ${resolvedDisplay}.`,
+          message: session.interactiveDesktop
+            ? `linux-x11 is ready on ${resolvedDisplay}.`
+            : `linux-x11 is reachable on ${resolvedDisplay}, but its desktop session is locked or inactive.`,
         };
         return { structuredContent, content: [{ type: "text", text: structuredContent.message }] };
       } catch (error) {
@@ -1205,7 +1892,7 @@ export function registerComputerUseTools(server, options) {
     "computer_applications",
     {
       title: "Computer applications",
-      description: "List installed and running desktop applications with stable identifiers for precise app targeting.",
+      description: "List installed and running desktop applications with stable identifiers and evidence-backed recent-use metadata for precise app targeting.",
       inputSchema: {},
       outputSchema: applicationsResultShape,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
@@ -1232,33 +1919,54 @@ export function registerComputerUseTools(server, options) {
     "computer_app_state",
     {
       title: "Computer application state",
-      description: "Launch or activate one application when needed, then read its rich accessibility tree by stable app id; later calls return a compact diff.",
+      description: "Ensure one application is running without taking foreground focus by default, then return its rich accessibility tree and current screenshot; later calls return a compact AX diff.",
       inputSchema: {
         app: z.string().min(1).max(500),
         disableDiff: z.boolean().default(false).optional(),
         maxElements: z.number().int().min(1).max(500).default(240).optional(),
+        query: z.string().max(1000).optional(),
+        role: z.string().max(200).optional(),
+        maxDepth: z.number().int().min(1).max(40).default(16).optional(),
+        maxVisitedNodes: z.number().int().min(1).max(20_000).default(3000).optional(),
+        focusedWindowOnly: z.boolean().default(true).optional(),
+        activate: z.boolean().default(false).optional(),
       },
       outputSchema: appStateResultShape,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
       securitySchemes: writeSecuritySchemes,
       _meta: toolMeta("Opening and reading application state", "Application state ready", writeSecuritySchemes),
     },
-    async ({ app, disableDiff, maxElements }) => {
+    async ({ app, disableDiff, maxElements, query, role, maxDepth, maxVisitedNodes, focusedWindowOnly, activate }) => {
       if (!hasWriteScope()) return toolAuthError(writeAuthChallenge);
       try {
         const options = {
           source: "desktop",
           application: app,
           maxElements: maxElements ?? 240,
+          query,
+          role,
+          maxDepth: maxDepth ?? 16,
+          maxVisitedNodes: maxVisitedNodes ?? 3000,
+          focusedWindowOnly: focusedWindowOnly !== false,
           includeStaticText: true,
           includeContainers: true,
           launchIfNeeded: true,
+          activateApplication: activate === true,
+          includeScreenshot: true,
         };
         const result = await listSemanticElements(options);
         const snapshot = storeElementSnapshot(result, options);
         const application = result.application == null ? null : String(result.application);
         const applicationId = result.applicationId == null ? null : String(result.applicationId);
-        const rendered = buildAppStateText({ application, applicationId, elements: snapshot.elements, disableDiff: disableDiff === true });
+        const filterKey = JSON.stringify({ query: query ?? "", role: role ?? "", maxDepth: maxDepth ?? 16, maxVisitedNodes: maxVisitedNodes ?? 3000, focusedWindowOnly: focusedWindowOnly !== false });
+        const rendered = buildAppStateText({ application, applicationId, elements: snapshot.elements, disableDiff: disableDiff === true, filterKey });
+        let state = { screenshot: result.screenshot ?? null };
+        if (!state.screenshot) {
+          try { state = await captureComputerAfterSemanticAction(); }
+          catch {
+            // Accessibility state remains useful when Screen Recording permission is unavailable.
+          }
+        }
         const structuredContent = {
           snapshotId: snapshot.snapshotId,
           expiresInMs: snapshot.expiresInMs,
@@ -1266,12 +1974,262 @@ export function registerComputerUseTools(server, options) {
           applicationId,
           isDiff: rendered.isDiff,
           text: rendered.text,
+          screenshotIncluded: Boolean(state.screenshot),
+          screenshotMimeType: state.screenshot?.mimeType ?? null,
+          screenshotScope: state.screenshot?.scope ?? (state.screenshot ? "desktop" : null),
+          screenshotBounds: state.screenshot?.bounds ?? null,
           message: `${rendered.isDiff ? "Returned accessibility changes" : "Returned the full accessibility tree"} for ${applicationId || application || app}. Snapshot ${snapshot.snapshotId} expires in ${Math.round(snapshot.expiresInMs / 1000)} seconds.`,
         };
-        return { structuredContent, content: [{ type: "text", text: `${structuredContent.message}\n${structuredContent.text}` }] };
+        return {
+          structuredContent,
+          content: [
+            { type: "text", text: `${structuredContent.message}\n${structuredContent.text}` },
+            ...(state.screenshot ? [{ type: "image", data: state.screenshot.data, mimeType: state.screenshot.mimeType }] : []),
+          ],
+        };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return { isError: true, content: [{ type: "text", text: `Computer application state failed: ${message}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
+    "computer_browser_session",
+    {
+      title: "Browser session",
+      description: "Control a dedicated Chrome/Chromium profile, an explicitly configured loopback CDP browser, or explicitly shared signed-in tabs through the optional extension, with exact target claims, ownership, lifecycle, history, reload, and page-only screenshots.",
+      inputSchema: {
+        action: z.enum(BROWSER_SESSION_ACTIONS),
+        session: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/).optional(),
+        url: z.string().max(4000).optional(),
+        targetId: z.string().max(200).optional(),
+        targetClaim: z.string().max(200).optional(),
+        headless: z.boolean().default(false).optional(),
+      },
+      outputSchema: browserSessionResultShape,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Managing browser session", "Browser session ready", writeSecuritySchemes),
+    },
+    async ({ action, session, url, targetId, targetClaim, headless }) => {
+      if (!hasWriteScope()) return toolAuthError(writeAuthChallenge);
+      try {
+        let selectedSession = null;
+        let target = null;
+        let screenshot = null;
+        if (action === "start") {
+          if (!session) throw new Error("start requires session.");
+          selectedSession = await startBrowserSession({ name: session, url: url || "about:blank", headless: headless === true });
+          target = selectedSession.targets.find((item) => !item.url.startsWith("chrome://")) ?? selectedSession.targets[0] ?? null;
+        } else if (action === "navigate") {
+          if (!session) throw new Error("navigate requires session.");
+          if (!url) throw new Error("navigate requires url.");
+          const result = await navigateBrowserSession({ name: session, url, targetId: targetId || "", targetClaim: targetClaim || "" });
+          selectedSession = result.session;
+          target = result.target ?? null;
+          screenshot = result.screenshot ?? null;
+        } else if (["new_tab", "activate_tab", "back", "forward", "reload", "screenshot", "retain_tab", "release_tab", "cleanup_tabs", "close_tab"].includes(action)) {
+          if (!session) throw new Error(`${action} requires session.`);
+          if (action === "new_tab" && !url) url = "about:blank";
+          const result = await browserSessionTabAction({ name: session, action, targetId: targetId || "", targetClaim: targetClaim || "", url: url || "" });
+          selectedSession = result.session;
+          target = result.target ?? null;
+          screenshot = result.screenshot ?? null;
+        } else if (action === "stop") {
+          if (!session) throw new Error("stop requires session.");
+          selectedSession = await stopBrowserSession({ name: session });
+        } else if (action !== "list") {
+          throw new Error(`Unsupported browser session action: ${action}`);
+        }
+        const sessions = await listBrowserSessions();
+        const structuredContent = {
+          action,
+          session: publicBrowserSession(selectedSession),
+          sessions: sessions.map(publicBrowserSession),
+          target: publicBrowserTarget(target),
+          screenshotIncluded: Boolean(screenshot),
+          screenshotMimeType: screenshot?.mimeType ?? null,
+          message: action === "list"
+            ? `Found ${sessions.length} browser session${sessions.length === 1 ? "" : "s"} (${sessions.filter((item) => item.kind === "attached").length} explicitly attached).`
+            : `Browser session ${session} ${action} completed${selectedSession ? `; running=${selectedSession.running}` : ""}.`,
+        };
+        return {
+          structuredContent,
+          content: [
+            { type: "text", text: structuredContent.message },
+            ...(screenshot ? [{ type: "image", data: screenshot.data, mimeType: screenshot.mimeType }] : []),
+          ],
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { isError: true, content: [{ type: "text", text: `Browser session failed: ${message}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
+    "computer_browser_utility",
+    {
+      title: "Browser utilities",
+      description: "Operate an exact claimed target in a managed, attached, or extension-connected browser: export content or a private PDF artifact, access clipboard, inspect logs, handle dialogs, or track supported downloads.",
+      inputSchema: {
+        action: z.enum(BROWSER_UTILITY_ACTIONS),
+        session: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
+        targetId: z.string().max(200).optional(),
+        targetClaim: z.string().max(200).optional(),
+        text: z.string().max(2_000_000).optional(),
+        promptText: z.string().max(20_000).optional(),
+        clear: z.boolean().default(false).optional(),
+        limit: z.number().int().min(1).max(500).default(100).optional(),
+        downloadGuid: z.string().max(500).optional(),
+        timeoutMs: z.number().int().min(0).max(30_000).default(30_000).optional(),
+        filename: z.string().max(200).optional(),
+        pdfOptions: z.object({
+          landscape: z.boolean().default(false).optional(), printBackground: z.boolean().default(true).optional(), preferCSSPageSize: z.boolean().default(false).optional(),
+          scale: z.number().min(0.1).max(2).default(1).optional(), paperWidth: z.number().min(1).max(100).default(8.27).optional(), paperHeight: z.number().min(1).max(100).default(11.69).optional(),
+          marginTop: z.number().min(0).max(10).default(0).optional(), marginBottom: z.number().min(0).max(10).default(0).optional(), marginLeft: z.number().min(0).max(10).default(0).optional(), marginRight: z.number().min(0).max(10).default(0).optional(),
+        }).optional(),
+      },
+      outputSchema: browserUtilityResultShape,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Using managed browser utility", "Managed browser utility finished", writeSecuritySchemes),
+    },
+    async ({ action, session, targetId, targetClaim, text, promptText, clear, limit, downloadGuid, timeoutMs, filename, pdfOptions }) => {
+      if (!hasWriteScope()) return toolAuthError(writeAuthChallenge);
+      try {
+        if (action === "clipboard_write" && text === undefined) throw new Error("clipboard_write requires text.");
+        const result = await browserSessionUtility({
+          name: session,
+          action,
+          targetId: targetId || "",
+          targetClaim: targetClaim || "",
+          text: text ?? "",
+          promptText: promptText ?? "",
+          clear: clear === true,
+          limit: limit ?? 100,
+          downloadGuid: downloadGuid || "",
+          timeoutMs: timeoutMs ?? 30_000,
+          filename: filename ?? "",
+          pdfOptions: pdfOptions ?? {},
+        });
+        const message = action === "export_pdf"
+          ? `Exported ${result.artifacts[0]?.size ?? 0} PDF bytes from managed browser target ${targetId}.`
+          : action.startsWith("export_")
+          ? `Exported ${result.text?.length ?? 0} characters from managed browser target ${targetId}.`
+          : action === "clipboard_read"
+            ? `Read ${result.text?.length ?? 0} clipboard characters from managed browser target ${targetId}.`
+            : action === "clipboard_write"
+              ? `Wrote ${String(text ?? "").length} clipboard characters for managed browser target ${targetId}.`
+              : action === "logs"
+                ? `Returned ${result.logs.length} buffered developer log entr${result.logs.length === 1 ? "y" : "ies"} for managed browser target ${targetId}.`
+                : action.startsWith("dialog_")
+                  ? `Browser dialog action ${action} completed; open=${Boolean(result.dialog)}.`
+                  : `Browser download action ${action} completed; tracked=${result.downloads.length}, files=${result.files.length}.`;
+        const structuredContent = {
+          action,
+          ...result,
+          session: publicBrowserSession(result.session),
+          target: publicBrowserTarget(result.target),
+          message,
+        };
+        return {
+          structuredContent,
+          content: [
+            { type: "text", text: message },
+            ...(result.text !== null ? [{ type: "text", text: result.text }] : []),
+          ],
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { isError: true, content: [{ type: "text", text: `Managed browser utility failed: ${message}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
+    "computer_browser_locator",
+    {
+      title: "Browser locator",
+      description: "Run declarative CSS/role/name/text locator inspection, waiting, same-origin or cross-origin frame traversal, click/double-click, form, approved-root file upload, element drag, keyboard, and scrolling steps against one exact claimed target, then return its page screenshot.",
+      inputSchema: {
+        session: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
+        targetId: z.string().min(1).max(200),
+        targetClaim: z.string().min(1).max(200),
+        steps: z.array(browserLocatorStepSchema).min(1).max(20),
+      },
+      outputSchema: browserLocatorResultShape,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Running managed browser locator", "Managed browser locator finished", writeSecuritySchemes),
+    },
+    async ({ session, targetId, targetClaim, steps }) => {
+      if (!hasWriteScope()) return toolAuthError(writeAuthChallenge);
+      try {
+        const result = await browserSessionLocator({ name: session, targetId, targetClaim, steps });
+        const message = `Executed ${result.results.length} locator step${result.results.length === 1 ? "" : "s"} on managed browser target ${targetId}.`;
+        const structuredContent = {
+          session: publicBrowserSession(result.session),
+          target: publicBrowserTarget(result.target),
+          results: result.results,
+          screenshotIncluded: Boolean(result.screenshot),
+          screenshotMimeType: result.screenshot?.mimeType ?? null,
+          message,
+        };
+        return {
+          structuredContent,
+          content: [
+            { type: "text", text: message },
+            ...(result.screenshot ? [{ type: "image", data: result.screenshot.data, mimeType: result.screenshot.mimeType }] : []),
+          ],
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { isError: true, content: [{ type: "text", text: `Managed browser locator failed: ${message}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
+    "computer_browser_cua",
+    {
+      title: "Browser page coordinate control",
+      description: "Send bounded click/double-click/move/drag/type/keypress/scroll/media-download input to one exact claimed browser tab in page CSS-pixel coordinates, with clipped or full-page capture. This coordinate space is separate from desktop computer_use coordinates.",
+      inputSchema: {
+        session: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
+        targetId: z.string().min(1).max(200),
+        targetClaim: z.string().min(1).max(200),
+        actions: z.array(browserCuaActionShape).min(1).max(20),
+      },
+      outputSchema: browserCuaResultShape,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Controlling browser page coordinates", "Browser page coordinate action finished", writeSecuritySchemes),
+    },
+    async ({ session, targetId, targetClaim, actions }) => {
+      if (!hasWriteScope()) return toolAuthError(writeAuthChallenge);
+      try {
+        const result = await browserSessionCua({ name: session, targetId, targetClaim, actions });
+        const message = `Executed ${result.actionCount} browser page-coordinate action${result.actionCount === 1 ? "" : "s"} on managed browser target ${targetId}.`;
+        const structuredContent = {
+          session: publicBrowserSession(result.session),
+          target: publicBrowserTarget(result.target),
+          actionCount: result.actionCount,
+          screenshotIncluded: Boolean(result.screenshot),
+          screenshotMimeType: result.screenshot?.mimeType ?? null,
+          message,
+        };
+        return {
+          structuredContent,
+          content: [
+            { type: "text", text: message },
+            ...(result.screenshot ? [{ type: "image", data: result.screenshot.data, mimeType: result.screenshot.mimeType }] : []),
+          ],
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { isError: true, content: [{ type: "text", text: `Browser page coordinate action failed: ${message}` }] };
       }
     }
   );
@@ -1292,6 +2250,9 @@ export function registerComputerUseTools(server, options) {
         maxElements: z.number().int().min(1).max(500).default(120).optional(),
         includeStaticText: z.boolean().default(false).optional(),
         includeContainers: z.boolean().default(false).optional(),
+        maxDepth: z.number().int().min(1).max(40).default(16).optional(),
+        maxVisitedNodes: z.number().int().min(1).max(20_000).default(3000).optional(),
+        focusedWindowOnly: z.boolean().default(false).optional(),
       },
       outputSchema: elementsResultShape,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: false },
@@ -1339,42 +2300,91 @@ export function registerComputerUseTools(server, options) {
     "computer_element_action",
     {
       title: "Computer element action",
-      description: "Operate one element from a recent computer_elements snapshot by index and return the resulting screenshot.",
+      description: "Operate one element from a recent computer_elements snapshot with semantic press/click/focus/value/text-selection/scroll behavior and return the resulting screenshot.",
       inputSchema: {
         snapshotId: z.string().min(8),
         elementIndex: z.number().int().min(0),
         action: z.enum(ELEMENT_ACTIONS),
         value: z.string().max(MAX_TEXT_CHARS).optional(),
+        text: z.string().max(MAX_TEXT_CHARS).optional(),
+        prefix: z.string().max(2000).optional(),
+        suffix: z.string().max(2000).optional(),
+        selectionType: z.enum(["text", "cursor_before", "cursor_after"]).default("text").optional(),
+        button: z.enum(["left", "right", "middle"]).default("left").optional(),
+        count: z.number().int().min(1).max(3).default(1).optional(),
+        direction: z.enum(["up", "down", "left", "right"]).default("down").optional(),
+        pages: z.number().int().min(1).max(100).default(1).optional(),
         display: z.string().min(1).max(64).optional(),
         description: z.string().max(500).optional(),
+        returnState: z.boolean().default(true).optional(),
       },
       outputSchema: elementActionResultShape,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
       securitySchemes: writeSecuritySchemes,
       _meta: toolMeta("Operating computer element", "Computer element action finished", writeSecuritySchemes),
     },
-    async ({ snapshotId, elementIndex, action, value, display }) => {
+    async ({ snapshotId, elementIndex, action, value, text, prefix, suffix, selectionType, button, count, direction, pages, display, returnState }) => {
       if (!hasWriteScope()) return toolAuthError(writeAuthChallenge);
       const started = Date.now();
       let source = "unknown";
-      const auditValue = action === "set_value" ? `(${String(value ?? "").length} chars)` : "";
+      const auditValue = action === "set_value"
+        ? `(${String(value ?? "").length} chars)`
+        : action === "select_text" ? `(${String(text ?? "").length} selected chars)` : "";
       try {
-        const { element } = getSnapshotElement(snapshotId, elementIndex);
+        const { snapshot, element } = getSnapshotElement(snapshotId, elementIndex);
         source = String(element.source ?? "unknown");
         if (Array.isArray(element.actions) && !element.actions.includes(action)) {
           throw new Error(`Element ${elementIndex} does not advertise action ${action}. Available: ${element.actions.join(", ") || "none"}.`);
         }
         if (action === "set_value" && value === undefined) throw new Error("set_value requires value.");
-        await semanticElementAction({ elementId: element.id, action, value: value ?? "" });
+        if (action === "select_text" && !text) throw new Error("select_text requires non-empty text.");
+        const actionResult = await semanticElementAction({
+          elementId: element.id,
+          action,
+          value: value ?? "",
+          text: text ?? "",
+          prefix: prefix ?? "",
+          suffix: suffix ?? "",
+          selectionType: selectionType ?? "text",
+          button: button ?? "left",
+          count: count ?? 1,
+          direction: direction ?? "down",
+          pages: pages ?? 1,
+          skipSettle: returnState === false,
+        });
         ELEMENT_SNAPSHOTS.delete(snapshotId);
-        if (DEFAULT_SETTLE_MS > 0) await sleep(DEFAULT_SETTLE_MS);
-        const state = await captureComputerAfterSemanticAction(display);
-        if (!state.screenshot) throw new Error("Post-action screenshot was not available.");
+        const eventSettled = ["ax-observer", "uia-events", "atspi-events", "macos-ax-service", "windows-uia-service", "linux-atspi-service"].includes(String(actionResult?.settleSource ?? ""));
+        const shouldReturnState = returnState !== false;
+        const refreshed = shouldReturnState ? await refreshElementState(snapshot, { waitForSettle: !eventSettled, elementSource: source }) : null;
+        let state = { display: display ?? "computer", screenshot: null, active: null };
+        if (actionResult?.screenshot) {
+          state = { display: "browser-cdp", screenshot: actionResult.screenshot, active: null };
+        } else if (refreshed?.screenshot) {
+          state = { display: source, screenshot: refreshed.screenshot, active: null };
+        } else if (shouldReturnState) {
+          try { state = await captureComputerAfterSemanticAction(display); }
+          catch {
+            // The semantic action has already succeeded. Do not invite a duplicate
+            // retry merely because screenshot permission or capture is unavailable.
+          }
+        }
         const durationMs = Date.now() - started;
         const structuredContent = {
-          snapshotId, elementIndex, source, action, durationMs, activeWindow: state.active ?? null,
-          screenshotIncluded: true, screenshotMimeType: state.screenshot.mimeType,
-          message: `Executed ${action} on ${source} element ${elementIndex}; refresh computer_elements before the next UI-dependent action.`,
+          snapshotId,
+          nextSnapshotId: refreshed?.snapshot.snapshotId ?? null,
+          nextExpiresInMs: refreshed?.snapshot.expiresInMs ?? null,
+          elementIndex, source, action, durationMs, activeWindow: state.active ?? null,
+          screenshotIncluded: Boolean(state.screenshot), screenshotMimeType: state.screenshot?.mimeType ?? null,
+          screenshotScope: state.screenshot?.scope ?? (state.screenshot ? (source === "browser-cdp" ? "browser" : "desktop") : null),
+          screenshotBounds: state.screenshot?.bounds ?? null,
+          stateIsDiff: refreshed?.rendered.isDiff ?? null,
+          stateText: refreshed?.rendered.text ?? null,
+          settleDurationMs: Math.max(Number(actionResult?.settleDurationMs) || 0, Number(refreshed?.settleDurationMs) || 0) || null,
+          settleEventCount: Number.isInteger(actionResult?.settleEventCount) ? actionResult.settleEventCount : null,
+          settleSource: actionResult?.settleSource ?? (refreshed ? "semantic-fingerprint" : null),
+          message: refreshed
+            ? `Executed ${action} on ${source} element ${elementIndex}; use fresh snapshot ${refreshed.snapshot.snapshotId} for the next UI-dependent action.`
+            : `Executed ${action} on ${source} element ${elementIndex}; refresh computer_elements before the next UI-dependent action.`,
         };
         await audit?.({
           command: `computer_element_action ${source}[${elementIndex}].${action}${auditValue}`,
@@ -1385,7 +2395,8 @@ export function registerComputerUseTools(server, options) {
           structuredContent,
           content: [
             { type: "text", text: structuredContent.message },
-            { type: "image", data: state.screenshot.data, mimeType: state.screenshot.mimeType },
+            ...(structuredContent.stateText ? [{ type: "text", text: structuredContent.stateText }] : []),
+            ...(state.screenshot ? [{ type: "image", data: state.screenshot.data, mimeType: state.screenshot.mimeType }] : []),
           ],
         };
       } catch (error) {
@@ -1412,33 +2423,58 @@ export function registerComputerUseTools(server, options) {
         nativeAction: z.string().min(1).max(MAX_NATIVE_ACTION_CHARS),
         display: z.string().min(1).max(64).optional(),
         description: z.string().max(500).optional(),
+        returnState: z.boolean().default(true).optional(),
       },
       outputSchema: elementActionResultShape,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
       securitySchemes: writeSecuritySchemes,
       _meta: toolMeta("Performing native accessibility action", "Native accessibility action finished", writeSecuritySchemes),
     },
-    async ({ snapshotId, elementIndex, nativeAction, display }) => {
+    async ({ snapshotId, elementIndex, nativeAction, display, returnState }) => {
       if (!hasWriteScope()) return toolAuthError(writeAuthChallenge);
       const started = Date.now();
       let source = "unknown";
       try {
-        const { element } = getSnapshotElement(snapshotId, elementIndex);
+        const { snapshot, element } = getSnapshotElement(snapshotId, elementIndex);
         source = String(element.source ?? "unknown");
         const advertised = Array.isArray(element.nativeActions) ? element.nativeActions.map(String) : [];
         if (!advertised.includes(nativeAction)) {
           throw new Error(`Element ${elementIndex} does not advertise native action ${nativeAction}. Available: ${advertised.join(", ") || "none"}.`);
         }
-        await semanticElementAction({ elementId: element.id, action: `native:${nativeAction}` });
+        const actionResult = await semanticElementAction({ elementId: element.id, action: `native:${nativeAction}`, skipSettle: returnState === false });
         ELEMENT_SNAPSHOTS.delete(snapshotId);
-        if (DEFAULT_SETTLE_MS > 0) await sleep(DEFAULT_SETTLE_MS);
-        const state = await captureComputerAfterSemanticAction(display);
-        if (!state.screenshot) throw new Error("Post-action screenshot was not available.");
+        const eventSettled = ["ax-observer", "uia-events", "atspi-events", "macos-ax-service", "windows-uia-service", "linux-atspi-service"].includes(String(actionResult?.settleSource ?? ""));
+        const shouldReturnState = returnState !== false;
+        const refreshed = shouldReturnState ? await refreshElementState(snapshot, { waitForSettle: !eventSettled, elementSource: source }) : null;
+        let state = { display: display ?? "computer", screenshot: null, active: null };
+        if (actionResult?.screenshot) {
+          state = { display: source, screenshot: actionResult.screenshot, active: null };
+        } else if (refreshed?.screenshot) {
+          state = { display: source, screenshot: refreshed.screenshot, active: null };
+        } else if (shouldReturnState) {
+          try { state = await captureComputerAfterSemanticAction(display); }
+          catch {
+            // The native action has already succeeded; refreshed AX state can still
+            // confirm the result when screen-capture permission is unavailable.
+          }
+        }
         const durationMs = Date.now() - started;
         const structuredContent = {
-          snapshotId, elementIndex, source, action: `native:${nativeAction}`, durationMs, activeWindow: state.active ?? null,
-          screenshotIncluded: true, screenshotMimeType: state.screenshot.mimeType,
-          message: `Executed native accessibility action ${nativeAction} on ${source} element ${elementIndex}; refresh computer_elements before the next UI-dependent action.`,
+          snapshotId,
+          nextSnapshotId: refreshed?.snapshot.snapshotId ?? null,
+          nextExpiresInMs: refreshed?.snapshot.expiresInMs ?? null,
+          elementIndex, source, action: `native:${nativeAction}`, durationMs, activeWindow: state.active ?? null,
+          screenshotIncluded: Boolean(state.screenshot), screenshotMimeType: state.screenshot?.mimeType ?? null,
+          screenshotScope: state.screenshot?.scope ?? (state.screenshot ? (source === "browser-cdp" ? "browser" : "desktop") : null),
+          screenshotBounds: state.screenshot?.bounds ?? null,
+          stateIsDiff: refreshed?.rendered.isDiff ?? null,
+          stateText: refreshed?.rendered.text ?? null,
+          settleDurationMs: Math.max(Number(actionResult?.settleDurationMs) || 0, Number(refreshed?.settleDurationMs) || 0) || null,
+          settleEventCount: Number.isInteger(actionResult?.settleEventCount) ? actionResult.settleEventCount : null,
+          settleSource: actionResult?.settleSource ?? (refreshed ? "semantic-fingerprint" : null),
+          message: refreshed
+            ? `Executed native accessibility action ${nativeAction} on ${source} element ${elementIndex}; use fresh snapshot ${refreshed.snapshot.snapshotId} for the next UI-dependent action.`
+            : `Executed native accessibility action ${nativeAction} on ${source} element ${elementIndex}; refresh computer_elements before the next UI-dependent action.`,
         };
         await audit?.({
           command: `computer_element_secondary_action ${source}[${elementIndex}].${nativeAction}`,
@@ -1447,7 +2483,11 @@ export function registerComputerUseTools(server, options) {
         });
         return {
           structuredContent,
-          content: [{ type: "text", text: structuredContent.message }, { type: "image", data: state.screenshot.data, mimeType: state.screenshot.mimeType }],
+          content: [
+            { type: "text", text: structuredContent.message },
+            ...(structuredContent.stateText ? [{ type: "text", text: structuredContent.stateText }] : []),
+            ...(state.screenshot ? [{ type: "image", data: state.screenshot.data, mimeType: state.screenshot.mimeType }] : []),
+          ],
         };
       } catch (error) {
         const durationMs = Date.now() - started;
@@ -1494,7 +2534,7 @@ export function registerComputerUseTools(server, options) {
           apiResolution: effectiveResolution.api,
           cursorPosition: state.cursor,
           activeWindow: state.active,
-          windows: state.windows,
+          windows: claimedWindows(resolvedDisplay, state.windows),
           screenshotIncluded: Boolean(state.screenshot),
           screenshotMimeType: state.screenshot?.mimeType ?? null,
           message: `Computer state captured from ${resolvedDisplay} at API resolution ${effectiveResolution.api.width}x${effectiveResolution.api.height}.`,
@@ -1513,14 +2553,103 @@ export function registerComputerUseTools(server, options) {
   );
 
   server.registerTool(
+    "computer_window",
+    {
+      title: "Computer window",
+      description: "Control an exact window from computer_state using platform-native activate, close, minimize, maximize, restore, or normalized move/resize behavior, then return refreshed state and a screenshot.",
+      inputSchema: {
+        display: z.string().min(1).max(64).optional(),
+        windowId: z.string().min(1).max(100),
+        windowClaim: z.string().min(20).max(200),
+        action: z.enum(WINDOW_ACTIONS),
+        x: z.number().int().min(0).max(10_000).optional(),
+        y: z.number().int().min(0).max(10_000).optional(),
+        width: z.number().int().min(1).max(10_000).optional(),
+        height: z.number().int().min(1).max(10_000).optional(),
+        description: z.string().max(500).optional(),
+      },
+      outputSchema: windowActionResultShape,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+      securitySchemes: writeSecuritySchemes,
+      _meta: toolMeta("Controlling window", "Window action finished", writeSecuritySchemes),
+    },
+    async ({ display, windowId, windowClaim, action, x, y, width, height, description }) => {
+      if (!hasWriteScope()) return toolAuthError(writeAuthChallenge);
+      const started = Date.now();
+      let resolvedDisplay = display ?? "computer";
+      try {
+        const native = nativeComputerBackendSupported();
+        let resolution;
+        let state;
+        let actionResult;
+        if (native) {
+          resolvedDisplay = nativeComputerBackendName();
+          const before = await nativeComputerState({ includeScreenshot: false, includeWindows: true });
+          resolution = before.resolution;
+          const claimed = resolveWindowClaim(resolvedDisplay, windowId, windowClaim);
+          if (action === "move_resize") validateWindowGeometry({ x, y, width, height }, resolution.api);
+          state = await nativeComputerWindowAction({ windowId, expectedName: claimed.name, action, x, y, width, height });
+          actionResult = state.actionResult;
+        } else {
+          resolvedDisplay = await resolveDisplay(display);
+          resolution = await detectResolution(resolvedDisplay);
+          const claimed = resolveWindowClaim(resolvedDisplay, windowId, windowClaim);
+          if (action === "move_resize") validateWindowGeometry({ x, y, width, height }, resolution.api);
+          await assertLinuxInteractiveSession([{ action: "window" }]);
+          actionResult = await linuxWindowAction(resolvedDisplay, resolution, { windowId, windowName: claimed.name, action, x, y, width, height });
+          state = await collectState(resolvedDisplay, resolution, true, true);
+        }
+        const effectiveResolution = native ? state.resolution : resolution;
+        const structuredContent = {
+          display: resolvedDisplay,
+          displayResolution: effectiveResolution.display,
+          apiResolution: effectiveResolution.api,
+          cursorPosition: state.cursor,
+          activeWindow: state.active,
+          windows: claimedWindows(resolvedDisplay, state.windows),
+          screenshotIncluded: Boolean(state.screenshot),
+          screenshotMimeType: state.screenshot?.mimeType ?? null,
+          action,
+          windowId,
+          settleDurationMs: Number.isInteger(actionResult?.settleDurationMs) ? actionResult.settleDurationMs : null,
+          settleEventCount: Number.isInteger(actionResult?.settleEventCount) ? actionResult.settleEventCount : null,
+          settleSource: actionResult?.settleSource ? String(actionResult.settleSource) : null,
+          message: `Window ${windowId} ${action} completed on ${resolvedDisplay}; returned ${state.windows.length} visible windows.`,
+        };
+        await audit?.({
+          command: `computer_window ${windowId} ${action}${description ? ` (${description})` : ""}`,
+          cwd: resolvedDisplay, status: "completed", exitCode: 0, signal: null, durationMs: Date.now() - started,
+          stdout: structuredContent.message, stderr: "", truncated: false,
+        });
+        return {
+          structuredContent,
+          content: [
+            { type: "text", text: structuredContent.message },
+            ...(state.screenshot ? [{ type: "image", data: state.screenshot.data, mimeType: state.screenshot.mimeType }] : []),
+          ],
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await audit?.({
+          command: `computer_window ${windowId} ${action}`,
+          cwd: resolvedDisplay, status: "failed", exitCode: 1, signal: null, durationMs: Date.now() - started,
+          stdout: "", stderr: message, truncated: false,
+        }).catch(() => {});
+        return { isError: true, content: [{ type: "text", text: `Computer window action failed: ${message}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
     "computer_use",
     {
       title: "Computer use",
       description:
-        `Control the local computer using Grok Bot-style actions and one final screenshot. Up to ${MAX_FOLLOW_UP_ACTIONS} follow-up actions may be batched in then.`,
+        `Control an app-scoped background window on macOS, or the foreground desktop elsewhere, using platform-native actions and one final screenshot. A named app is activated only with activateApplication=true.`,
       inputSchema: {
         display: z.string().min(1).max(64).optional(),
         application: z.string().min(1).max(500).optional(),
+        activateApplication: z.boolean().default(false).optional(),
         description: z.string().max(500).optional(),
         ...actionSchema.shape,
         then: z.array(actionSchema).min(1).max(MAX_FOLLOW_UP_ACTIONS).optional(),
@@ -1542,11 +2671,14 @@ export function registerComputerUseTools(server, options) {
         };
       }
 
-      const { display, application, description: _description, then = [], ...primary } = parsed.data;
+      const { display, application, activateApplication, description: _description, then = [], ...primary } = parsed.data;
       const actions = [primary, ...then];
       const auditSummary = actions.map(summarizeAction).join(" -> ");
 
       try {
+        if (application && activateApplication !== true && process.platform !== "darwin") {
+          throw new Error("Background raw application input is currently available on macOS only; use semantic element actions or explicitly set activateApplication=true.");
+        }
         const native = nativeComputerBackendSupported();
         let resolution;
         let screenshot;
@@ -1554,7 +2686,7 @@ export function registerComputerUseTools(server, options) {
         let active;
         if (native) {
           resolvedDisplay = nativeComputerBackendName();
-          const state = await nativeComputerUse(actions, { application });
+          const state = await nativeComputerUse(actions, { application, activateApplication: activateApplication === true });
           resolution = state.resolution;
           screenshot = state.screenshot;
           cursor = state.cursor;
@@ -1563,6 +2695,9 @@ export function registerComputerUseTools(server, options) {
         } else {
           resolvedDisplay = await resolveDisplay(display);
           resolution = await detectResolution(resolvedDisplay);
+          await assertLinuxInteractiveSession(actions);
+          if (application && activateApplication === true) await activateLinuxApplication(application);
+          else if (application) throw new Error("Background raw application input is currently available on the macOS native backend; use semantic element actions on this platform or explicitly set activateApplication=true.");
           let settleNeeded = false;
           for (const action of actions) {
             await executeAction(resolvedDisplay, resolution, action);

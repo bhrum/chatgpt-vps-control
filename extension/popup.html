@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ChatGPT Computer Control</title>
+  <style>
+    body { width: 290px; margin: 0; padding: 16px; color: #171717; font: 14px/1.45 system-ui, sans-serif; }
+    h1 { margin: 0 0 8px; font-size: 16px; }
+    p { margin: 6px 0 14px; color: #555; }
+    button { width: 100%; padding: 10px 12px; border: 0; border-radius: 8px; color: white; background: #1677ff; font-weight: 650; cursor: pointer; }
+    #bridge, #details { margin-top: 10px; font-size: 12px; overflow-wrap: anywhere; }
+    #details { color: #777; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>浏览器控制桥</h1>
+  <p>扩展会列出普通网页标签页；控制服务按实时 ID、标题和 URL 精确选择并认领目标。不会导出 Cookie。</p>
+  <button id="toggle">重新连接本机服务</button>
+  <div id="bridge"></div>
+  <div id="details"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
