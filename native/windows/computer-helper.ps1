@@ -771,18 +771,29 @@ function Run-NativeRequestServer {
       $request = $line | ConvertFrom-Json
       if ([string]$request.command -ne 'request' -or $null -eq $request.payload) { throw 'Invalid native request envelope.' }
       $payload = $request.payload | ConvertTo-Json -Depth 20 -Compress
+      $pipe = New-Object System.IO.Pipes.AnonymousPipeServerStream(
+        [System.IO.Pipes.PipeDirection]::Out,
+        [System.IO.HandleInheritability]::Inheritable
+      )
       $process = New-Object System.Diagnostics.Process
       $process.StartInfo.FileName = 'powershell.exe'
       $escapedPath = $PSCommandPath.Replace('"','\"')
-      $process.StartInfo.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$escapedPath`" --one-shot"
+      $pipeHandle = $pipe.GetClientHandleAsString()
+      $process.StartInfo.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$escapedPath`" --one-shot --request-pipe $pipeHandle"
       $process.StartInfo.UseShellExecute = $false
       $process.StartInfo.CreateNoWindow = $true
-      $process.StartInfo.RedirectStandardInput = $true
       $process.StartInfo.RedirectStandardOutput = $true
       $process.StartInfo.RedirectStandardError = $true
-      if (-not $process.Start()) { throw 'Could not start native helper child.' }
-      $process.StandardInput.Write($payload)
-      $process.StandardInput.Close()
+      if (-not $process.Start()) { $pipe.Dispose(); throw 'Could not start native helper child.' }
+      $pipe.DisposeLocalCopyOfClientHandle()
+      try {
+        $writer = New-Object System.IO.StreamWriter($pipe, (New-Object System.Text.UTF8Encoding($false)))
+        $writer.Write($payload)
+        $writer.Flush()
+        $writer.Dispose()
+      } finally {
+        $pipe.Dispose()
+      }
       $output = $process.StandardOutput.ReadToEnd()
       $errorOutput = $process.StandardError.ReadToEnd()
       $process.WaitForExit()
@@ -801,7 +812,22 @@ function Run-NativeRequestServer {
 try {
   if ($args -contains '--request-server') { Run-NativeRequestServer; exit 0 }
   if ($args -contains '--observer-server') { Run-UIAObserverServer; exit 0 }
-  $text = [Console]::In.ReadToEnd()
+  $pipeIndex = [Array]::IndexOf([string[]]$args, '--request-pipe')
+  if ($pipeIndex -ge 0 -and ($pipeIndex + 1) -lt $args.Count) {
+    $clientPipe = New-Object System.IO.Pipes.AnonymousPipeClientStream(
+      [System.IO.Pipes.PipeDirection]::In,
+      [string]$args[$pipeIndex + 1]
+    )
+    try {
+      $reader = New-Object System.IO.StreamReader($clientPipe, [System.Text.Encoding]::UTF8)
+      $text = $reader.ReadToEnd()
+      $reader.Dispose()
+    } finally {
+      $clientPipe.Dispose()
+    }
+  } else {
+    $text = [Console]::In.ReadToEnd()
+  }
   $request = $text | ConvertFrom-Json
   $apiWidth = if ($request.apiWidth) { [int]$request.apiWidth } else { 1280 }
   $res = Get-Resolution $apiWidth
