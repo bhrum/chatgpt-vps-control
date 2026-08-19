@@ -364,7 +364,7 @@ function Resolve-UIAElement($payload) {
         $nativeMatches = $true
         if ($automationId -and [string]$nativeElement.Current.AutomationId -ne $automationId) { $nativeMatches = $false }
         if ($controlType -and [string]$nativeElement.Current.ControlType.ProgrammaticName -ne $controlType) { $nativeMatches = $false }
-        if ($name -and [string]$nativeElement.Current.Name -ne $name) { $nativeMatches = $false }
+        if (-not $automationId -and $name -and [string]$nativeElement.Current.Name -ne $name) { $nativeMatches = $false }
         if ($nativeMatches) { if ($debugEnabled) { $debug.Add('native-hwnd=matched') }; return $nativeElement }
         elseif ($debugEnabled) { $debug.Add('native-hwnd=mismatch') }
       }
@@ -375,46 +375,47 @@ function Resolve-UIAElement($payload) {
     try {
       if ($automationId -and [string]$element.Current.AutomationId -ne $automationId) { $identityMatches = $false }
       if ($controlType -and [string]$element.Current.ControlType.ProgrammaticName -ne $controlType) { $identityMatches = $false }
-      if ($name -and [string]$element.Current.Name -ne $name) { $identityMatches = $false }
+      if (-not $automationId -and $name -and [string]$element.Current.Name -ne $name) { $identityMatches = $false }
     } catch { $identityMatches = $false }
     if ($identityMatches) { if ($debugEnabled) { $debug.Add('path-identity=matched') }; return $element }
     elseif ($debugEnabled) { $debug.Add('path-identity=mismatch') }
   }
 
-  # Control-view paths can move between short-lived helper processes. When the
-  # provider exposes a stable AutomationId, recover the same semantic element
-  # inside the original window instead of acting on whatever now occupies the
-  # stale path.
-  if ($automationId) {
-    $idCondition = [System.Windows.Automation.PropertyCondition]::new(
-      [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
-      $automationId
-    )
-    $matches = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $idCondition)
-    if ($debugEnabled) { $debug.Add('aid-matches=' + [string]$matches.Count) }
-    for ($i=0; $i -lt $matches.Count; $i++) {
-      $candidate = $matches.Item($i)
-      try {
-        if ((-not $controlType -or [string]$candidate.Current.ControlType.ProgrammaticName -eq $controlType) -and
-            (-not $name -or [string]$candidate.Current.Name -eq $name)) { return $candidate }
-      } catch {}
+  # Control-view paths can move between short-lived helper processes. Use the
+  # same TreeWalker view that produced the snapshot for identity recovery.
+  # Some WinForms providers return zero results for FindAll(PropertyCondition)
+  # even though ControlViewWalker can enumerate the same descendants.
+  $identityQueue = New-Object System.Collections.ArrayList
+  foreach ($child in @(Get-UIAChildren $root)) { [void]$identityQueue.Add($child) }
+  $scanned = 0
+  while ($identityQueue.Count -gt 0 -and $scanned -lt 4000) {
+    $candidate = $identityQueue[0]
+    $identityQueue.RemoveAt(0)
+    $scanned++
+    $candidateMatches = $true
+    try {
+      $candidatePid = [int]$candidate.Current.ProcessId
+      $candidateAutomationId = [string]$candidate.Current.AutomationId
+      $candidateControlType = [string]$candidate.Current.ControlType.ProgrammaticName
+      $candidateName = [string]$candidate.Current.Name
+      if ($processId -gt 0 -and $candidatePid -ne $processId) { $candidateMatches = $false }
+      if ($controlType -and $candidateControlType -ne $controlType) { $candidateMatches = $false }
+      if ($automationId) {
+        if ($candidateAutomationId -ne $automationId) { $candidateMatches = $false }
+      } elseif ($name -and $candidateName -ne $name) {
+        $candidateMatches = $false
+      }
+    } catch { $candidateMatches = $false }
+    if ($candidateMatches) {
+      if ($debugEnabled) { $debug.Add('tree-identity=matched;scanned=' + [string]$scanned) }
+      return $candidate
+    }
+    foreach ($child in @(Get-UIAChildren $candidate)) {
+      if ($identityQueue.Count -ge 4000) { break }
+      [void]$identityQueue.Add($child)
     }
   }
-  if ($name) {
-    $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
-      [System.Windows.Automation.AutomationElement]::NameProperty,
-      $name
-    )
-    $matches = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $nameCondition)
-    if ($debugEnabled) { $debug.Add('name-matches=' + [string]$matches.Count) }
-    for ($i=0; $i -lt $matches.Count; $i++) {
-      $candidate = $matches.Item($i)
-      try {
-        if ((-not $processId -or [int]$candidate.Current.ProcessId -eq $processId) -and
-            (-not $controlType -or [string]$candidate.Current.ControlType.ProgrammaticName -eq $controlType)) { return $candidate }
-      } catch {}
-    }
-  }
+  if ($debugEnabled) { $debug.Add('tree-identity=missing;scanned=' + [string]$scanned) }
 
   # Some providers reorder their ControlView tree between short-lived helper
   # processes. Recover by the snapshot point only when the element under that
@@ -434,7 +435,7 @@ function Resolve-UIAElement($payload) {
           if ($processId -gt 0 -and [int]$candidate.Current.ProcessId -ne $processId) { $matchesIdentity = $false }
           if ($automationId -and [string]$candidate.Current.AutomationId -ne $automationId) { $matchesIdentity = $false }
           if ($controlType -and [string]$candidate.Current.ControlType.ProgrammaticName -ne $controlType) { $matchesIdentity = $false }
-          if ($name -and [string]$candidate.Current.Name -ne $name) { $matchesIdentity = $false }
+          if (-not $automationId -and $name -and [string]$candidate.Current.Name -ne $name) { $matchesIdentity = $false }
         } catch { $matchesIdentity = $false }
         if ($matchesIdentity) { return $candidate }
         $candidate = $ControlWalker.GetParent($candidate)
