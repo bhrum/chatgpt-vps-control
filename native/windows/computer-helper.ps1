@@ -387,9 +387,35 @@ function Resolve-UIAElement($payload) {
     for ($i=0; $i -lt $matches.Count; $i++) {
       $candidate = $matches.Item($i)
       try {
-        if (-not $controlType -or [string]$candidate.Current.ControlType.ProgrammaticName -eq $controlType) { return $candidate }
+        if ((-not $processId -or [int]$candidate.Current.ProcessId -eq $processId) -and
+            (-not $controlType -or [string]$candidate.Current.ControlType.ProgrammaticName -eq $controlType)) { return $candidate }
       } catch {}
     }
+  }
+
+  # Some providers reorder their ControlView tree between short-lived helper
+  # processes. Recover by the snapshot point only when the element under that
+  # point (or one of its parents) still matches the encoded semantic identity.
+  $bounds = $payload.bounds
+  if ($null -ne $bounds -and [int]$bounds.width -gt 0 -and [int]$bounds.height -gt 0) {
+    try {
+      $point = New-Object System.Windows.Point(
+        ([double]$bounds.x + ([double]$bounds.width / 2)),
+        ([double]$bounds.y + ([double]$bounds.height / 2))
+      )
+      $candidate = [System.Windows.Automation.AutomationElement]::FromPoint($point)
+      for ($depth=0; $depth -lt 12 -and $null -ne $candidate; $depth++) {
+        $matchesIdentity = $true
+        try {
+          if ($processId -gt 0 -and [int]$candidate.Current.ProcessId -ne $processId) { $matchesIdentity = $false }
+          if ($automationId -and [string]$candidate.Current.AutomationId -ne $automationId) { $matchesIdentity = $false }
+          if ($controlType -and [string]$candidate.Current.ControlType.ProgrammaticName -ne $controlType) { $matchesIdentity = $false }
+          if ($name -and [string]$candidate.Current.Name -ne $name) { $matchesIdentity = $false }
+        } catch { $matchesIdentity = $false }
+        if ($matchesIdentity) { return $candidate }
+        $candidate = $ControlWalker.GetParent($candidate)
+      }
+    } catch {}
   }
   throw 'The Windows accessibility snapshot is stale; refresh computer_elements.'
 }
