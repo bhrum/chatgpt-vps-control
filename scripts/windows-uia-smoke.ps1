@@ -1,5 +1,4 @@
 $ErrorActionPreference = 'Stop'
-$env:CHATGPT_COMPUTER_UIA_DEBUG = '1'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $helper = Join-Path $root 'native\windows\computer-helper.ps1'
 $observerPing = '{"id":1,"command":"ping"}' | powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $helper --observer-server | ConvertFrom-Json

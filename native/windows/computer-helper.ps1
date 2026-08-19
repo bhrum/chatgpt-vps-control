@@ -396,7 +396,7 @@ function Resolve-UIAElement($payload) {
   $automationId = [string]$payload.automationId
   $controlType = [string]$payload.controlType
   $name = [string]$payload.name
-  if ($debugEnabled) { $debug.Add("identity=aid:$automationId|type:$controlType|name:$name") }
+  if ($debugEnabled) { $debug.Add("identity=aid:$([bool]$automationId)|type:$controlType|name:$([bool]$name)") }
   $nativeHwnd = [long]$payload.nativeHwnd
   if ($nativeHwnd -ne 0) {
     try {
@@ -447,7 +447,9 @@ function Resolve-UIAElement($payload) {
       $candidateAutomationId = [string]$candidate.Current.AutomationId
       $candidateControlType = [string]$candidate.Current.ControlType.ProgrammaticName
       $candidateName = [string]$candidate.Current.Name
-      if ($debugEnabled -and $scanned -le 6) { $debug.Add("candidate$scanned=pid:$candidatePid|aid:$candidateAutomationId|type:$candidateControlType|name:$candidateName") }
+      if ($debugEnabled -and $scanned -le 6) {
+        $debug.Add("candidate$scanned=pidMatch:$($processId -le 0 -or $candidatePid -eq $processId)|aidMatch:$(-not $automationId -or $candidateAutomationId -eq $automationId)|type:$candidateControlType|namePresent:$([bool]$candidateName)")
+      }
       if ($processId -gt 0 -and $candidatePid -ne $processId) { $candidateMatches = $false }
       if ($controlType -and $candidateControlType -ne $controlType) { $candidateMatches = $false }
       if ($automationId) {
