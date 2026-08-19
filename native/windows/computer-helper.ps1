@@ -28,6 +28,7 @@ public static class NativeComputer {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
   [DllImport("user32.dll", SetLastError=true)] public static extern bool MoveWindow(IntPtr hWnd, int x, int y, int width, int height, bool repaint);
   [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
@@ -49,6 +50,8 @@ public static class NativeComputer {
   public const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
   public const uint MOUSEEVENTF_WHEEL = 0x0800;
   public const uint MOUSEEVENTF_HWHEEL = 0x01000;
+  public const uint EM_SETSEL = 0x00B1;
+  public const uint EM_SCROLLCARET = 0x00B7;
 
   [StructLayout(LayoutKind.Sequential)] public struct INPUT { public int type; public InputUnion U; }
   [StructLayout(LayoutKind.Explicit)] public struct InputUnion {
@@ -514,7 +517,9 @@ function Get-UIAElementInfo($element, [long]$hwnd, [int[]]$path, [int]$depth, $r
   if ($null -ne $invoke -or $null -ne $selection -or $null -ne $toggle -or $null -ne $expand) { [void]$actions.Add('press'); [void]$actions.Add('click') }
   if ($element.Current.IsKeyboardFocusable) { [void]$actions.Add('focus') }
   if (($null -ne $valuePattern -and -not $valuePattern.Current.IsReadOnly) -or $type -eq 'Edit') { [void]$actions.Add('set_value') }
-  if ($null -ne $textPattern) { [void]$actions.Add('select_text') }
+  $nativeTextHwnd = 0
+  try { $nativeTextHwnd = [long]$element.Current.NativeWindowHandle } catch {}
+  if ($null -ne $textPattern -or ($type -eq 'Edit' -and $nativeTextHwnd -ne 0 -and $null -ne $valuePattern)) { [void]$actions.Add('select_text') }
   if ($null -ne $toggle) { [void]$actions.Add('toggle') }
   if ($null -ne $range -and -not $range.Current.IsReadOnly) { [void]$actions.Add('increment'); [void]$actions.Add('decrement') }
   if ($null -ne $scrollItem) { [void]$actions.Add('scroll_into_view') }
@@ -745,24 +750,62 @@ function Invoke-UIAElementAction($request) {
       $needle = [string]$request.text
       if (-not $needle) { throw 'select_text requires non-empty text.' }
       $pattern = Try-Pattern $element ([System.Windows.Automation.TextPattern]::Pattern)
-      if ($null -eq $pattern) { throw 'Element does not support UI Automation text selection.' }
-      $document = $pattern.DocumentRange
-      $remaining = $document.Clone()
-      $match = $null
-      while ($null -ne $remaining) {
-        $candidate = $remaining.FindText($needle, $false, $false)
-        if ($null -eq $candidate) { break }
-        $before = $document.Clone(); $before.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::End, $candidate, [System.Windows.Automation.TextPatternRangeEndpoint]::Start) | Out-Null
-        $after = $document.Clone(); $after.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::Start, $candidate, [System.Windows.Automation.TextPatternRangeEndpoint]::End) | Out-Null
-        $prefix = [string]$request.prefix; $suffix = [string]$request.suffix
-        if ((-not $prefix -or $before.GetText(-1).EndsWith($prefix)) -and (-not $suffix -or $after.GetText(-1).StartsWith($suffix))) { $match = $candidate; break }
+      if ($null -ne $pattern) {
+        $document = $pattern.DocumentRange
         $remaining = $document.Clone()
-        $remaining.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::Start, $candidate, [System.Windows.Automation.TextPatternRangeEndpoint]::End) | Out-Null
+        $match = $null
+        while ($null -ne $remaining) {
+          $candidate = $remaining.FindText($needle, $false, $false)
+          if ($null -eq $candidate) { break }
+          $before = $document.Clone(); $before.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::End, $candidate, [System.Windows.Automation.TextPatternRangeEndpoint]::Start) | Out-Null
+          $after = $document.Clone(); $after.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::Start, $candidate, [System.Windows.Automation.TextPatternRangeEndpoint]::End) | Out-Null
+          $prefix = [string]$request.prefix; $suffix = [string]$request.suffix
+          if ((-not $prefix -or $before.GetText(-1).EndsWith($prefix)) -and (-not $suffix -or $after.GetText(-1).StartsWith($suffix))) { $match = $candidate; break }
+          $remaining = $document.Clone()
+          $remaining.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::Start, $candidate, [System.Windows.Automation.TextPatternRangeEndpoint]::End) | Out-Null
+        }
+        if ($null -eq $match) { throw 'Text was not found in the Windows UI Automation element.' }
+        if ([string]$request.selectionType -eq 'cursor_before') { $match.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::End, $match, [System.Windows.Automation.TextPatternRangeEndpoint]::Start) | Out-Null }
+        elseif ([string]$request.selectionType -eq 'cursor_after') { $match.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::Start, $match, [System.Windows.Automation.TextPatternRangeEndpoint]::End) | Out-Null }
+        $match.Select()
+        break
       }
-      if ($null -eq $match) { throw 'Text was not found in the Windows UI Automation element.' }
-      if ([string]$request.selectionType -eq 'cursor_before') { $match.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::End, $match, [System.Windows.Automation.TextPatternRangeEndpoint]::Start) | Out-Null }
-      elseif ([string]$request.selectionType -eq 'cursor_after') { $match.MoveEndpointByRange([System.Windows.Automation.TextPatternRangeEndpoint]::Start, $match, [System.Windows.Automation.TextPatternRangeEndpoint]::End) | Out-Null }
-      $match.Select()
+
+      # Standard Win32/WinForms Edit providers can expose ValuePattern without
+      # TextPattern. Use their real child HWND for EM_SETSEL rather than global
+      # keyboard emulation. The opaque element id supplies that HWND, and the
+      # resolver has already verified the semantic UIA element identity.
+      $valuePattern = Try-Pattern $element ([System.Windows.Automation.ValuePattern]::Pattern)
+      $nativeTextHwnd = [IntPtr][long]$payload.nativeHwnd
+      $controlTypeName = Get-ControlTypeName $element
+      if ($controlTypeName -ne 'Edit' -or $nativeTextHwnd -eq [IntPtr]::Zero -or $null -eq $valuePattern) {
+        throw 'Element does not support UI Automation text selection.'
+      }
+      $textValue = [string]$valuePattern.Current.Value
+      $prefix = [string]$request.prefix
+      $suffix = [string]$request.suffix
+      $matchStart = -1
+      $searchFrom = 0
+      while ($searchFrom -le $textValue.Length) {
+        $index = $textValue.IndexOf($needle, $searchFrom, [StringComparison]::Ordinal)
+        if ($index -lt 0) { break }
+        $beforeText = $textValue.Substring(0, $index)
+        $afterIndex = $index + $needle.Length
+        $afterText = $textValue.Substring($afterIndex)
+        if ((-not $prefix -or $beforeText.EndsWith($prefix, [StringComparison]::Ordinal)) -and
+            (-not $suffix -or $afterText.StartsWith($suffix, [StringComparison]::Ordinal))) {
+          $matchStart = $index
+          break
+        }
+        $searchFrom = $index + [Math]::Max(1, $needle.Length)
+      }
+      if ($matchStart -lt 0) { throw 'Text was not found in the Windows UI Automation element.' }
+      $selectionStart = $matchStart
+      $selectionEnd = $matchStart + $needle.Length
+      if ([string]$request.selectionType -eq 'cursor_before') { $selectionEnd = $selectionStart }
+      elseif ([string]$request.selectionType -eq 'cursor_after') { $selectionStart = $selectionEnd }
+      [NativeComputer]::SendMessage($nativeTextHwnd, [NativeComputer]::EM_SETSEL, [IntPtr]$selectionStart, [IntPtr]$selectionEnd) | Out-Null
+      [NativeComputer]::SendMessage($nativeTextHwnd, [NativeComputer]::EM_SCROLLCARET, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
     }
     'press' {
       $pattern = Try-Pattern $element ([System.Windows.Automation.InvokePattern]::Pattern)
