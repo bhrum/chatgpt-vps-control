@@ -4,7 +4,7 @@ $helper = Join-Path $root 'native\windows\computer-helper.ps1'
 $observerPing = '{"id":1,"command":"ping"}' | powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $helper --observer-server | ConvertFrom-Json
 if (-not $observerPing.ok -or $observerPing.source -ne 'windows-uia-service') { throw 'Windows UIA observer service ping failed.' }
 $requestProbe = '{"id":2,"command":"request","payload":{"apiWidth":1280,"actions":[],"includeScreenshot":false,"includeWindows":false}}' | powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $helper --request-server | ConvertFrom-Json
-if (-not $requestProbe.ok -or -not $requestProbe.result.ok) { throw 'Windows native request service probe failed.' }
+if (-not $requestProbe.ok -or -not $requestProbe.result.ok) { throw "Windows native request service probe failed: $($requestProbe | ConvertTo-Json -Depth 8 -Compress)" }
 $appScript = Join-Path $env:RUNNER_TEMP 'chatgpt-computer-uia-test-app.ps1'
 if (-not $env:RUNNER_TEMP) { $appScript = Join-Path $env:TEMP 'chatgpt-computer-uia-test-app.ps1' }
 
