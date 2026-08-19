@@ -207,7 +207,7 @@ async function secondaryAction(snapshot, element, nativeAction) {
 try {
   const tools = await client.listTools();
   const names = new Set(tools.tools.map((tool) => tool.name));
-  for (const name of ["computer_applications", "computer_app_state", "computer_browser_session", "computer_browser_utility", "computer_browser_locator", "computer_browser_cua", "computer_elements", "computer_element_action", "computer_element_secondary_action", "computer_window"]) assert.ok(names.has(name), `missing ${name}`);
+  for (const name of ["computer_applications", "computer_app_state", "computer_browser_session", "computer_browser_utility", "computer_browser_locator", "computer_browser_cua", "computer_elements", "computer_element_action", "computer_element_secondary_action", "computer_use_bridge", "computer_window"]) assert.ok(names.has(name), `missing ${name}`);
   const applications = await client.callTool({ name: "computer_applications", arguments: {} });
   assert.equal(applications.isError, undefined, applications.content?.[0]?.text);
   assert.ok(Array.isArray(applications.structuredContent.applications));
@@ -470,6 +470,38 @@ try {
       assert.equal(applicationState.structuredContent.screenshotScope, "application");
       assert.ok(applicationState.structuredContent.screenshotBounds?.width > 0);
       assert.ok(applicationState.content.some((item) => item.type === "image"), "application state should return a scoped screenshot");
+
+      const bridgeApps = await client.callTool({ name: "computer_use_bridge", arguments: { operation: "list_apps" } });
+      assert.equal(bridgeApps.isError, undefined, bridgeApps.content?.[0]?.text);
+      assert.ok(bridgeApps.structuredContent.applications.some((application) => application.id === "atspi:chatgpt-computer-semantic-test"));
+      const bridgeState = await client.callTool({
+        name: "computer_use_bridge",
+        arguments: { operation: "get_app_state", app: "atspi:chatgpt-computer-semantic-test", disableDiff: true },
+      });
+      assert.equal(bridgeState.isError, undefined, bridgeState.content?.[0]?.text);
+      assert.equal(bridgeState.structuredContent.screenshotScope, "application");
+      assert.ok(bridgeState.structuredContent.snapshotId);
+      const bridgeFieldLine = bridgeState.structuredContent.text.split("\n").find((line) => /\b(?:entry|text)\b.*Semantic entry/i.test(line));
+      const bridgeFieldIndex = Number(/^\s*(\d+)/.exec(bridgeFieldLine ?? "")?.[1]);
+      assert.ok(Number.isInteger(bridgeFieldIndex), `bridge field index missing from ${bridgeState.structuredContent.text}`);
+      const bridgeSetValue = await client.callTool({
+        name: "computer_use_bridge",
+        arguments: { operation: "set_value", app: "atspi:chatgpt-computer-semantic-test", snapshot_id: bridgeState.structuredContent.snapshotId, element_index: bridgeFieldIndex, value: "bridge-atspi-ok" },
+      });
+      assert.equal(bridgeSetValue.isError, undefined, bridgeSetValue.content?.[0]?.text);
+      assert.ok(bridgeSetValue.structuredContent.snapshotId, "bridge write should return replacement state");
+      const bridgeBounds = bridgeSetValue.structuredContent.screenshotBounds;
+      assert.ok(bridgeBounds?.width > 0 && button.bounds?.width > 0, "bridge coordinate test requires app and button bounds");
+      const localButtonX = button.bounds.x - bridgeBounds.x + button.bounds.width / 2;
+      const localButtonY = button.bounds.y - bridgeBounds.y + button.bounds.height / 2;
+      const bridgeClick = await client.callTool({
+        name: "computer_use_bridge",
+        arguments: { operation: "click", app: "atspi:chatgpt-computer-semantic-test", snapshot_id: bridgeSetValue.structuredContent.snapshotId, x: localButtonX, y: localButtonY, mouse_button: "left", click_count: 1 },
+      });
+      assert.equal(bridgeClick.isError, undefined, bridgeClick.content?.[0]?.text);
+      assert.match(bridgeClick.structuredContent.text, /clicked:bridge-atspi-ok/);
+      console.log("Computer Use-compatible remote bridge smoke passed.");
+
       const desktopState = await client.callTool({ name: "computer_state", arguments: { includeScreenshot: false, includeWindows: true } });
       const testWindow = desktopState.structuredContent.windows.find((window) => /ChatGPT Computer Semantic Test/i.test(window.name));
       assert.ok(testWindow?.id, `AT-SPI test window was not listed: ${JSON.stringify(desktopState.structuredContent.windows)}`);

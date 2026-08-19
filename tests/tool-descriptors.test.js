@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildComputerToolDescriptors } from "../computer-use.js";
+import { buildComputerToolDescriptors, pruneComputerUseBridgeElements } from "../computer-use.js";
 import { buildDeviceToolDescriptors } from "../lib/device-gateway.js";
 
 test("computer tools advertise cross-platform read/write capabilities", () => {
@@ -20,6 +20,7 @@ test("computer tools advertise cross-platform read/write capabilities", () => {
     "computer_state",
     "computer_window",
     "computer_use",
+    "computer_use_bridge",
     "computer_browser_cua",
   ]);
   assert.equal(tools[0].annotations.readOnlyHint, true);
@@ -34,6 +35,7 @@ test("computer tools advertise cross-platform read/write capabilities", () => {
   assert.equal(tools[9].annotations.readOnlyHint, true);
   assert.equal(tools[10].annotations.readOnlyHint, false);
   assert.equal(tools[11].annotations.readOnlyHint, false);
+  assert.equal(tools[12].annotations.readOnlyHint, false);
   assert.deepEqual(tools[2].securitySchemes, write);
   assert.deepEqual(tools[3].securitySchemes, write);
   assert.match(tools[1].description, /platform identifiers/i);
@@ -110,18 +112,53 @@ test("computer tools advertise cross-platform read/write capabilities", () => {
   assert.match(tools[11].description, /locked.*secure desktops/i);
   assert.ok(tools[11].inputSchema.properties.application);
   assert.equal(tools[11].inputSchema.properties.activateApplication.default, false);
-  assert.match(tools[12].description, /page CSS-pixel coordinates/i);
-  assert.match(tools[12].description, /separate from desktop/i);
-  assert.deepEqual(tools[12].inputSchema.properties.actions.items.properties.action.enum, [
+  assert.match(tools[12].description, /Computer Use contract/i);
+  assert.match(tools[12].description, /application screenshot itself/i);
+  assert.deepEqual(tools[12].inputSchema.properties.operation.enum, [
+    "list_apps", "get_app_state", "click", "drag", "perform_secondary_action", "press_key", "scroll", "select_text", "set_value", "type_text",
+  ]);
+  assert.ok(tools[12].inputSchema.properties.elementIndex);
+  assert.equal(tools[12].inputSchema.properties.focusedWindowOnly.default, false);
+  assert.ok(tools[12].inputSchema.properties.snapshotId);
+  assert.ok(tools[12].inputSchema.properties.snapshot_id);
+  assert.ok(tools[12].inputSchema.properties.element_index);
+  assert.ok(tools[12].inputSchema.properties.mouse_button);
+  assert.ok(tools[12].inputSchema.properties.click_count);
+  assert.ok(tools[12].inputSchema.properties.from_x);
+  assert.ok(tools[12].inputSchema.properties.selection_type);
+  assert.ok(tools[12].inputSchema.properties.action);
+  assert.ok(tools[12].inputSchema.properties.nativeAction);
+  assert.deepEqual(tools[12].outputSchema.properties.coordinateSpace.enum, ["application_screenshot", "semantic_element", "none"]);
+  assert.match(tools[13].description, /page CSS-pixel coordinates/i);
+  assert.match(tools[13].description, /separate from desktop/i);
+  assert.deepEqual(tools[13].inputSchema.properties.actions.items.properties.action.enum, [
     "screenshot", "click", "double_click", "move", "drag", "type", "key", "keypress", "scroll", "download_media", "wait",
   ]);
-  assert.equal(tools[12].inputSchema.properties.actions.maxItems, 20);
-  assert.ok(tools[12].inputSchema.properties.targetClaim);
-  assert.ok(tools[12].inputSchema.properties.actions.items.properties.path);
-  assert.ok(tools[12].inputSchema.properties.actions.items.properties.clip);
-  assert.ok(tools[12].inputSchema.properties.actions.items.properties.scrollX);
-  assert.ok(tools[12].inputSchema.properties.actions.items.properties.keypress);
-  assert.ok(tools[12].outputSchema.properties.screenshotIncluded);
+  assert.equal(tools[13].inputSchema.properties.actions.maxItems, 20);
+  assert.ok(tools[13].inputSchema.properties.targetClaim);
+  assert.ok(tools[13].inputSchema.properties.actions.items.properties.path);
+  assert.ok(tools[13].inputSchema.properties.actions.items.properties.clip);
+  assert.ok(tools[13].inputSchema.properties.actions.items.properties.scrollX);
+  assert.ok(tools[13].inputSchema.properties.actions.items.properties.keypress);
+  assert.ok(tools[13].outputSchema.properties.screenshotIncluded);
+});
+
+test("Computer Use bridge keeps macOS menu headings without closed-menu history", () => {
+  const elements = [
+    { id: "window", role: "AXWindow" },
+    { id: "bar", role: "AXMenuBar" },
+    { id: "apple", role: "AXMenuBarItem", name: "Apple" },
+    { id: "app", role: "AXMenuBarItem", name: "Fabushi" },
+    { id: "app-menu", role: "AXMenu" },
+    { id: "about", role: "AXMenuItem", name: "About" },
+    { id: "file", role: "AXMenuBarItem", name: "File" },
+  ];
+  assert.deepEqual(
+    pruneComputerUseBridgeElements(elements, { source: "macos-ax", focusedWindowOnly: false }).map(({ id }) => id),
+    ["window", "bar", "app", "file"],
+  );
+  assert.equal(pruneComputerUseBridgeElements(elements, { source: "macos-ax", focusedWindowOnly: true }), elements);
+  assert.equal(pruneComputerUseBridgeElements(elements, { source: "windows-uia" }), elements);
 });
 
 test("device gateway exposes a stable dynamic-device tool surface", () => {

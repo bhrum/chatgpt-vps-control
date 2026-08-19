@@ -69,6 +69,7 @@ async function browserExtension(command) {
     const result = await installBrowserExtension();
     console.log("Browser bridge installed.");
     console.log(`Extension ID: ${result.extensionId}`);
+    if (result.runtime) console.log(`Private runtime: ${result.runtime}`);
     console.log("1. Open chrome://extensions and enable Developer mode.");
     console.log(`2. Choose Load unpacked and select: ${result.extension}`);
     console.log("3. Keep the local service running. The MCP can now enumerate ordinary tabs and atomically claim the exact selected tab.");
@@ -97,6 +98,7 @@ async function main() {
     await applyLocalConfig();
     const result = await installService();
     console.log(`Installed and started service using ${result.manager}.`);
+    console.log(`Private runtime: ${result.runtime}`);
     return;
   }
   if (command === "service" && args[1] === "remove") {

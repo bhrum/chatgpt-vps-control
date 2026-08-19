@@ -709,12 +709,47 @@ def activate_application(request):
 
     xdotool = shutil.which("xdotool")
     if xdotool:
+        candidate_window_ids = []
+        seen_window_ids = set()
+
+        def add_window_id(window_id):
+            window_id = str(window_id or "").strip()
+            if window_id and window_id not in seen_window_ids:
+                seen_window_ids.add(window_id)
+                candidate_window_ids.append(window_id)
+
         found = subprocess.run(
             [xdotool, "search", "--onlyvisible", "--name", re.escape(matched_name or display_name)],
             capture_output=True, text=True, timeout=4, check=False,
         )
-        window_id = next((line.strip() for line in found.stdout.splitlines() if line.strip()), "")
-        if window_id:
+        for line in found.stdout.splitlines():
+            add_window_id(line)
+
+        # AT-SPI application names are not guaranteed to equal X11 window
+        # titles. For example, an application exposed as
+        # "chatgpt-computer-semantic-test" may own a window titled
+        # "ChatGPT Computer Semantic Test". Fall back to the visible-window
+        # list and compare normalized titles so activation remains pinned to
+        # the same observed application instead of clicking an arbitrary
+        # foreground window.
+        wmctrl = shutil.which("wmctrl")
+        expected_title = re.sub(r"[^a-z0-9]+", "", (matched_name or display_name).lower())
+        if wmctrl and expected_title:
+            listed = subprocess.run([wmctrl, "-l"], capture_output=True, text=True, timeout=4, check=False)
+            for line in listed.stdout.splitlines():
+                parts = line.split(None, 3)
+                if len(parts) < 4:
+                    continue
+                actual_title = re.sub(r"[^a-z0-9]+", "", parts[3].lower())
+                if not actual_title:
+                    continue
+                if actual_title == expected_title or expected_title in actual_title or actual_title in expected_title:
+                    try:
+                        add_window_id(str(int(parts[0], 16)))
+                    except ValueError:
+                        add_window_id(parts[0])
+
+        for window_id in candidate_window_ids:
             activated = subprocess.run([xdotool, "windowactivate", "--sync", window_id], timeout=5, check=False)
             if activated.returncode == 0:
                 return {"ok": True, "source": "linux-atspi", "application": matched_name, "applicationId": requested, "launched": launched}
