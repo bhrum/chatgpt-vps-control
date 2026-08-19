@@ -66,19 +66,16 @@ jobs:
           set -euo pipefail
           packages=(xdotool wmctrl ffmpeg x11-utils x11-xserver-utils xvfb x11vnc xfwm4 dbus-x11 at-spi2-core python3-pyatspi gir1.2-atspi-2.0 libglib2.0-bin python3-gi gir1.2-gtk-3.0)
           apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
-          sudo apt-get "${apt_opts[@]}" update
 
-          # GitHub's Ubuntu image ships aria2. Ask apt for the exact official
-          # package URIs, fetch them concurrently into apt's cache, then let
-          # apt perform the normal verified install from that cache.
-          apt-get "${apt_opts[@]}" --print-uris --yes --no-install-recommends install "${packages[@]}" \
-            | python3 -c 'import pathlib,re,sys; mirrors=[x.strip().split()[0].rstrip("/") for x in pathlib.Path("/etc/apt/apt-mirrors.txt").read_text().splitlines() if x.strip().startswith(("http://","https://"))]; prefix="mirror+file:/etc/apt/apt-mirrors.txt/"; [(print((mirrors[0]+"/"+m.group(1)[len(prefix):]) if m.group(1).startswith(prefix) and mirrors else m.group(1)), print("  out="+m.group(2))) for line in sys.stdin if (m:=re.match(r"^\x27([^\x27]+)\x27\s+(\S+)",line))]' \
-            > "$RUNNER_TEMP/apt-aria2.txt"
-          if [[ -s "$RUNNER_TEMP/apt-aria2.txt" ]] && command -v aria2c >/dev/null; then
-            sudo aria2c --input-file="$RUNNER_TEMP/apt-aria2.txt" --dir=/var/cache/apt/archives \
-              --max-concurrent-downloads=8 --max-connection-per-server=2 --split=2 --min-split-size=1M \
-              --max-tries=3 --timeout=30 --continue=true --allow-overwrite=true --auto-file-renaming=false --summary-interval=0 || true
+          # GitHub's Ubuntu mirror list can prefer an Azure mirror that accepts
+          # the TCP connection but stops serving package indexes. The official
+          # archive endpoint is already the runner image's fallback; make it the
+          # only Ubuntu mirror for this ephemeral CI host so apt's own verified
+          # download/install path remains bounded and deterministic.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
           fi
+          sudo apt-get "${apt_opts[@]}" update
           sudo env DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y --no-install-recommends "${packages[@]}"
           google-chrome --version
       - name: Configure managed headless desktop
