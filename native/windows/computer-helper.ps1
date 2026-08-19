@@ -306,7 +306,7 @@ function Resolve-UIAElement($payload) {
     try { $rootProcessId = [int]$root.Current.ProcessId } catch {}
     if ($rootProcessId -ne $processId) {
       try {
-        $processCondition = New-Object System.Windows.Automation.PropertyCondition(
+        $processCondition = [System.Windows.Automation.PropertyCondition]::new(
           [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
           $processId
         )
@@ -365,7 +365,7 @@ function Resolve-UIAElement($payload) {
   # inside the original window instead of acting on whatever now occupies the
   # stale path.
   if ($automationId) {
-    $idCondition = New-Object System.Windows.Automation.PropertyCondition(
+    $idCondition = [System.Windows.Automation.PropertyCondition]::new(
       [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
       $automationId
     )
@@ -379,7 +379,7 @@ function Resolve-UIAElement($payload) {
     }
   }
   if ($name) {
-    $nameCondition = New-Object System.Windows.Automation.PropertyCondition(
+    $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
       [System.Windows.Automation.AutomationElement]::NameProperty,
       $name
     )
@@ -399,7 +399,7 @@ function Resolve-UIAElement($payload) {
   $bounds = $payload.bounds
   if ($null -ne $bounds -and [int]$bounds.width -gt 0 -and [int]$bounds.height -gt 0) {
     try {
-      $point = New-Object System.Windows.Point(
+      $point = [System.Windows.Point]::new(
         ([double]$bounds.x + ([double]$bounds.width / 2)),
         ([double]$bounds.y + ([double]$bounds.height / 2))
       )
