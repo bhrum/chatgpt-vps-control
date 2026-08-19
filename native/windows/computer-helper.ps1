@@ -265,16 +265,18 @@ function Encode-ElementId([long]$hwnd, [int[]]$path, $element) {
   $controlType = ''
   $name = ''
   $nativeHwnd = 0
+  $processId = 0
   $bounds = $null
   try { $automationId = [string]$element.Current.AutomationId } catch {}
   try { $controlType = [string]$element.Current.ControlType.ProgrammaticName } catch {}
   try { $name = [string]$element.Current.Name } catch {}
   try { $nativeHwnd = [long]$element.Current.NativeWindowHandle } catch {}
+  try { $processId = [int]$element.Current.ProcessId } catch {}
   try {
     $rect = $element.Current.BoundingRectangle
     if (-not $rect.IsEmpty) { $bounds = @{ x=[int]$rect.X; y=[int]$rect.Y; width=[int]$rect.Width; height=[int]$rect.Height } }
   } catch {}
-  $json = @{ source='windows-uia'; hwnd=$hwnd; path=@($path); automationId=$automationId; controlType=$controlType; name=$name; nativeHwnd=$nativeHwnd; bounds=$bounds } | ConvertTo-Json -Compress
+  $json = @{ source='windows-uia'; hwnd=$hwnd; processId=$processId; path=@($path); automationId=$automationId; controlType=$controlType; name=$name; nativeHwnd=$nativeHwnd; bounds=$bounds } | ConvertTo-Json -Compress
   return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+','-').Replace('/','_')
 }
 function Decode-ElementId([string]$value) {
@@ -298,6 +300,30 @@ function Get-UIAChildren($element) {
 }
 function Resolve-UIAElement($payload) {
   $root = Get-RootElement ([long]$payload.hwnd)
+  $processId = [int]$payload.processId
+  if ($processId -gt 0) {
+    $rootProcessId = 0
+    try { $rootProcessId = [int]$root.Current.ProcessId } catch {}
+    if ($rootProcessId -ne $processId) {
+      try {
+        $processCondition = New-Object System.Windows.Automation.PropertyCondition(
+          [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
+          $processId
+        )
+        $processRoot = [System.Windows.Automation.AutomationElement]::RootElement.FindFirst(
+          [System.Windows.Automation.TreeScope]::Children,
+          $processCondition
+        )
+        if ($null -eq $processRoot) {
+          $processRoot = [System.Windows.Automation.AutomationElement]::RootElement.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $processCondition
+          )
+        }
+        if ($null -ne $processRoot) { $root = $processRoot }
+      } catch {}
+    }
+  }
   $element = $root
   $pathResolved = $true
   try {
