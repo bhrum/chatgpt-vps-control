@@ -13,6 +13,7 @@ test("computer tools advertise cross-platform read/write capabilities", () => {
     "computer_app_state",
     "computer_browser_session",
     "computer_browser_utility",
+    "computer_browser_snapshot",
     "computer_browser_locator",
     "computer_elements",
     "computer_element_action",
@@ -28,12 +29,12 @@ test("computer tools advertise cross-platform read/write capabilities", () => {
   assert.equal(tools[2].annotations.readOnlyHint, false);
   assert.equal(tools[3].annotations.readOnlyHint, false);
   assert.equal(tools[4].annotations.readOnlyHint, false);
-  assert.equal(tools[5].annotations.readOnlyHint, false);
-  assert.equal(tools[6].annotations.readOnlyHint, true);
-  assert.equal(tools[7].annotations.readOnlyHint, false);
+  assert.equal(tools[5].annotations.readOnlyHint, true);
+  assert.equal(tools[6].annotations.readOnlyHint, false);
+  assert.equal(tools[7].annotations.readOnlyHint, true);
   assert.equal(tools[8].annotations.readOnlyHint, false);
-  assert.equal(tools[9].annotations.readOnlyHint, true);
-  assert.equal(tools[10].annotations.readOnlyHint, false);
+  assert.equal(tools[9].annotations.readOnlyHint, false);
+  assert.equal(tools[10].annotations.readOnlyHint, true);
   assert.equal(tools[11].annotations.readOnlyHint, false);
   assert.equal(tools[12].annotations.readOnlyHint, false);
   assert.deepEqual(tools[2].securitySchemes, write);
@@ -70,77 +71,75 @@ test("computer tools advertise cross-platform read/write capabilities", () => {
   assert.ok(tools[4].outputSchema.properties.artifacts);
   assert.ok(tools[4].inputSchema.properties.pdfOptions);
   assert.ok(tools[4].inputSchema.properties.targetClaim);
-  assert.match(tools[5].description, /arbitrary JavaScript evaluation is not exposed/i);
-  assert.deepEqual(tools[5].inputSchema.properties.steps.items.properties.action.enum, [
+  const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
+  const snapshot = byName.computer_browser_snapshot;
+  const locator = byName.computer_browser_locator;
+  const elements = byName.computer_elements;
+  const elementAction = byName.computer_element_action;
+  const secondaryAction = byName.computer_element_secondary_action;
+  const state = byName.computer_state;
+  const window = byName.computer_window;
+  const use = byName.computer_use;
+  const bridge = byName.computer_use_bridge;
+  const cua = byName.computer_browser_cua;
+  assert.equal(snapshot.annotations.readOnlyHint, true);
+  assert.ok(snapshot.outputSchema.properties.snapshotId);
+  assert.ok(snapshot.outputSchema.properties.refs);
+  assert.match(snapshot.description, /short-lived @refs/i);
+  assert.match(locator.description, /arbitrary JavaScript evaluation is not exposed/i);
+  assert.ok(locator.inputSchema.properties.steps.items.properties.locator.properties.ref);
+  assert.ok(locator.inputSchema.properties.steps.items.properties.locator.properties.snapshotId);
+  assert.deepEqual(locator.inputSchema.properties.steps.items.properties.action.enum, [
     "inspect", "wait_for", "click", "double_click", "hover", "focus", "fill", "type", "check", "uncheck", "select_option", "set_files", "drag_to", "press_key", "scroll_into_view", "scroll", "get_attribute",
   ]);
-  assert.equal(tools[5].inputSchema.properties.steps.items.properties.files.maxItems, 20);
-  assert.equal(tools[5].inputSchema.properties.steps.items.properties.frames.maxItems, 8);
-  assert.equal(tools[5].inputSchema.properties.steps.items.properties.target.additionalProperties, false);
-  assert.ok(tools[5].inputSchema.properties.targetClaim);
-  assert.match(tools[6].description, /semantic accessibility tree/i);
-  assert.ok(tools[6].inputSchema.properties.includeContainers);
-  assert.ok(tools[6].inputSchema.properties.maxDepth);
-  assert.ok(tools[6].inputSchema.properties.maxVisitedNodes);
-  assert.ok(tools[6].inputSchema.properties.focusedWindowOnly);
-  assert.ok(tools[6].outputSchema.properties.elements.items.properties.nativeActions);
-  assert.match(tools[7].description, /snapshot/i);
-  assert.deepEqual(tools[7].inputSchema.properties.action.enum, [
+  assert.equal(locator.inputSchema.properties.steps.items.properties.files.maxItems, 20);
+  assert.equal(locator.inputSchema.properties.steps.items.properties.frames.maxItems, 8);
+  assert.equal(locator.inputSchema.properties.steps.items.properties.target.additionalProperties, false);
+  assert.ok(locator.inputSchema.properties.targetClaim);
+  assert.match(elements.description, /semantic accessibility tree/i);
+  assert.ok(elements.inputSchema.properties.includeContainers);
+  assert.ok(elements.inputSchema.properties.maxDepth);
+  assert.ok(elements.inputSchema.properties.maxVisitedNodes);
+  assert.ok(elements.inputSchema.properties.focusedWindowOnly);
+  assert.ok(elements.outputSchema.properties.elements.items.properties.nativeActions);
+  assert.match(elementAction.description, /snapshot/i);
+  assert.deepEqual(elementAction.inputSchema.properties.action.enum, [
     "press", "click", "focus", "set_value", "select_text", "toggle", "increment", "decrement", "scroll_into_view", "scroll",
   ]);
-  assert.ok(tools[7].inputSchema.properties.selectionType);
-  assert.ok(tools[7].inputSchema.properties.button);
-  assert.ok(tools[7].inputSchema.properties.pages);
-  assert.ok(tools[7].inputSchema.properties.returnState);
-  assert.ok(tools[7].outputSchema.properties.settleDurationMs);
-  assert.ok(tools[7].outputSchema.properties.settleEventCount);
-  assert.ok(tools[7].outputSchema.properties.settleSource);
-  assert.ok(tools[7].outputSchema.properties.screenshotScope);
-  assert.ok(tools[7].outputSchema.properties.screenshotBounds);
-  assert.match(tools[8].description, /native accessibility action/i);
-  assert.ok(tools[8].inputSchema.properties.returnState);
-  assert.ok(tools[8].outputSchema.properties.screenshotScope);
-  assert.match(tools[9].description, /local computer/i);
-  assert.match(tools[9].description, /macOS/i);
-  assert.match(tools[10].description, /activate.*close.*minimize.*maximize.*restore/i);
-  assert.deepEqual(tools[10].inputSchema.properties.action.enum, ["activate", "close", "minimize", "maximize", "restore", "move_resize"]);
-  assert.ok(tools[10].inputSchema.required.includes("windowClaim"));
-  assert.ok(tools[9].outputSchema.properties.windows.items.required.includes("claim"));
-  assert.ok(tools[10].outputSchema.properties.windows);
-  assert.ok(tools[10].outputSchema.properties.screenshotIncluded);
-  assert.match(tools[11].description, /platform-native/i);
-  assert.match(tools[11].description, /locked.*secure desktops/i);
-  assert.ok(tools[11].inputSchema.properties.application);
-  assert.equal(tools[11].inputSchema.properties.activateApplication.default, false);
-  assert.match(tools[12].description, /Computer Use contract/i);
-  assert.match(tools[12].description, /application screenshot itself/i);
-  assert.deepEqual(tools[12].inputSchema.properties.operation.enum, [
+  for (const property of ["selectionType", "button", "pages", "returnState"]) assert.ok(elementAction.inputSchema.properties[property]);
+  for (const property of ["settleDurationMs", "settleEventCount", "settleSource", "screenshotScope", "screenshotBounds"]) assert.ok(elementAction.outputSchema.properties[property]);
+  assert.match(secondaryAction.description, /native accessibility action/i);
+  assert.ok(secondaryAction.inputSchema.properties.returnState);
+  assert.ok(secondaryAction.outputSchema.properties.screenshotScope);
+  assert.match(state.description, /local computer/i);
+  assert.match(state.description, /macOS/i);
+  assert.match(window.description, /activate.*close.*minimize.*maximize.*restore/i);
+  assert.deepEqual(window.inputSchema.properties.action.enum, ["activate", "close", "minimize", "maximize", "restore", "move_resize"]);
+  assert.ok(window.inputSchema.required.includes("windowClaim"));
+  assert.ok(state.outputSchema.properties.windows.items.required.includes("claim"));
+  assert.ok(window.outputSchema.properties.windows);
+  assert.ok(window.outputSchema.properties.screenshotIncluded);
+  assert.match(use.description, /platform-native/i);
+  assert.match(use.description, /locked.*secure desktops/i);
+  assert.ok(use.inputSchema.properties.application);
+  assert.equal(use.inputSchema.properties.activateApplication.default, false);
+  assert.match(bridge.description, /Computer Use contract/i);
+  assert.match(bridge.description, /application screenshot itself/i);
+  assert.deepEqual(bridge.inputSchema.properties.operation.enum, [
     "list_apps", "get_app_state", "click", "drag", "perform_secondary_action", "press_key", "scroll", "select_text", "set_value", "type_text",
   ]);
-  assert.ok(tools[12].inputSchema.properties.elementIndex);
-  assert.equal(tools[12].inputSchema.properties.focusedWindowOnly.default, false);
-  assert.ok(tools[12].inputSchema.properties.snapshotId);
-  assert.ok(tools[12].inputSchema.properties.snapshot_id);
-  assert.ok(tools[12].inputSchema.properties.element_index);
-  assert.ok(tools[12].inputSchema.properties.mouse_button);
-  assert.ok(tools[12].inputSchema.properties.click_count);
-  assert.ok(tools[12].inputSchema.properties.from_x);
-  assert.ok(tools[12].inputSchema.properties.selection_type);
-  assert.ok(tools[12].inputSchema.properties.action);
-  assert.ok(tools[12].inputSchema.properties.nativeAction);
-  assert.deepEqual(tools[12].outputSchema.properties.coordinateSpace.enum, ["application_screenshot", "semantic_element", "none"]);
-  assert.match(tools[13].description, /page CSS-pixel coordinates/i);
-  assert.match(tools[13].description, /separate from desktop/i);
-  assert.deepEqual(tools[13].inputSchema.properties.actions.items.properties.action.enum, [
+  for (const property of ["elementIndex", "snapshotId", "snapshot_id", "element_index", "mouse_button", "click_count", "from_x", "selection_type", "action", "nativeAction"]) assert.ok(bridge.inputSchema.properties[property]);
+  assert.equal(bridge.inputSchema.properties.focusedWindowOnly.default, false);
+  assert.deepEqual(bridge.outputSchema.properties.coordinateSpace.enum, ["application_screenshot", "semantic_element", "none"]);
+  assert.match(cua.description, /page CSS-pixel coordinates/i);
+  assert.match(cua.description, /separate from desktop/i);
+  assert.deepEqual(cua.inputSchema.properties.actions.items.properties.action.enum, [
     "screenshot", "click", "double_click", "move", "drag", "type", "key", "keypress", "scroll", "download_media", "wait",
   ]);
-  assert.equal(tools[13].inputSchema.properties.actions.maxItems, 20);
-  assert.ok(tools[13].inputSchema.properties.targetClaim);
-  assert.ok(tools[13].inputSchema.properties.actions.items.properties.path);
-  assert.ok(tools[13].inputSchema.properties.actions.items.properties.clip);
-  assert.ok(tools[13].inputSchema.properties.actions.items.properties.scrollX);
-  assert.ok(tools[13].inputSchema.properties.actions.items.properties.keypress);
-  assert.ok(tools[13].outputSchema.properties.screenshotIncluded);
+  assert.equal(cua.inputSchema.properties.actions.maxItems, 20);
+  assert.ok(cua.inputSchema.properties.targetClaim);
+  for (const property of ["path", "clip", "scrollX", "keypress"]) assert.ok(cua.inputSchema.properties.actions.items.properties[property]);
+  assert.ok(cua.outputSchema.properties.screenshotIncluded);
 });
 
 test("Computer Use bridge keeps macOS menu headings without closed-menu history", () => {

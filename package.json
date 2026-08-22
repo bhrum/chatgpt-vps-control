@@ -8,7 +8,7 @@
     "check": "node scripts/check.mjs",
     "doctor": "node bin/chatgpt-computer-control.js doctor",
     "setup": "node bin/chatgpt-computer-control.js setup",
-    "test": "node --test tests/install.test.js tests/runtime-install.test.js tests/macos-helper-source.test.js tests/linux-helper-source.test.js tests/tool-descriptors.test.js tests/secure-input.test.js tests/browser-extension.test.js tests/browser-session.test.js tests/native-event-observer.test.js tests/native-request-service.test.js tests/semantic-computer.test.js"
+    "test": "node --test tests/install.test.js tests/runtime-install.test.js tests/macos-helper-source.test.js tests/linux-helper-source.test.js tests/tool-descriptors.test.js tests/secure-input.test.js tests/browser-extension.test.js tests/browser-session.test.js tests/native-event-observer.test.js tests/native-request-service.test.js tests/semantic-computer.test.js tests/ego-snapshot.test.js tests/skill-install.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.2",
@@ -28,6 +28,7 @@
     "native/",
     "extension/",
     "scripts/",
+    "skills/",
     "server.js",
     "computer-use.js",
     "README.md",

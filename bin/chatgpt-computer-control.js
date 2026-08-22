@@ -4,9 +4,11 @@ import { applyLocalConfig, doctorLocalComputer, readLocalConfig, setupLocalCompu
 import { installService, removeService } from "../lib/service-manager.js";
 import { ensureLinuxDesktop } from "../lib/linux-desktop.js";
 import { browserExtensionStatus, installBrowserExtension } from "../lib/browser-extension-install.js";
+import { startMacPresenceAgent } from "../lib/macos-presence-agent.js";
+import { installUnifiedDeviceSkill } from "../lib/skill-install.js";
 
 function printUsage() {
-  console.log(`ChatGPT Computer Control\n\nUsage:\n  chatgpt-computer-control setup [--no-deps] [--host 127.0.0.1] [--port 8787]\n  chatgpt-computer-control doctor\n  chatgpt-computer-control serve\n  chatgpt-computer-control service install\n  chatgpt-computer-control service remove\n  chatgpt-computer-control browser-extension install\n  chatgpt-computer-control browser-extension status\n  chatgpt-computer-control url\n\nThe MCP server binds to loopback by default. Expose it only through an authenticated HTTPS tunnel or another trusted transport.`);
+  console.log(`ChatGPT Computer Control\n\nUsage:\n  chatgpt-computer-control setup [--no-deps] [--host 127.0.0.1] [--port 8787]\n  chatgpt-computer-control doctor\n  chatgpt-computer-control serve\n  chatgpt-computer-control presence\n  chatgpt-computer-control service install\n  chatgpt-computer-control service remove\n  chatgpt-computer-control browser-extension install\n  chatgpt-computer-control browser-extension status\n  chatgpt-computer-control skill install\n  chatgpt-computer-control url\n\nThe MCP server binds to loopback by default. Expose it only through an authenticated HTTPS tunnel or another trusted transport.`);
 }
 
 function valueAfter(args, flag, fallback) {
@@ -20,9 +22,11 @@ async function setup(args) {
   const port = Number(valueAfter(args, "--port", "8787"));
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("--port must be between 1 and 65535.");
   const result = await setupLocalComputer({ installDependencies: !args.includes("--no-deps"), host, port });
+  const skill = await installUnifiedDeviceSkill();
   console.log(`Configured ChatGPT Computer Control for ${result.platform}.`);
   console.log(`Home: ${result.home}`);
   console.log(`MCP URL (local): ${result.mcpUrl}`);
+  console.log(`Codex Skill: ${skill.destination}`);
   if (platform() === "darwin") {
     console.log("macOS requires Accessibility and Screen Recording permission for the installed ChatGPT Computer Control app. Run doctor, then grant that named app in System Settings.");
   }
@@ -53,6 +57,17 @@ async function serve() {
     console.log(`Computer desktop backend: ${desktop.mode}${desktop.display ? ` (${desktop.display})` : ""}`);
   }
   await import("../server.js");
+}
+
+async function presence() {
+  await applyLocalConfig();
+  const agent = startMacPresenceAgent();
+  const stop = () => {
+    agent.stop();
+    process.exit(0);
+  };
+  process.once("SIGTERM", stop);
+  process.once("SIGINT", stop);
 }
 
 async function printUrl() {
@@ -92,8 +107,14 @@ async function main() {
   if (command === "setup") return setup(args.slice(1));
   if (command === "doctor") return doctor();
   if (command === "serve") return serve();
+  if (command === "presence") return presence();
   if (command === "url") return printUrl();
   if (command === "browser-extension") return browserExtension(args[1]);
+  if (command === "skill" && args[1] === "install") {
+    const result = await installUnifiedDeviceSkill();
+    console.log(`Installed Codex Skill: ${result.destination}`);
+    return;
+  }
   if (command === "service" && args[1] === "install") {
     await applyLocalConfig();
     const result = await installService();

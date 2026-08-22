@@ -11,7 +11,7 @@ async function writeFixture(path, value = "fixture\n") {
 }
 
 async function createRuntimeSource(root) {
-  const directoryEntries = new Set(["bin", "extension", "lib", "native", "scripts", "node_modules"]);
+  const directoryEntries = new Set(["bin", "extension", "lib", "native", "scripts", "skills", "node_modules"]);
   for (const entry of privateRuntimeEntries) {
     if (directoryEntries.has(entry)) await mkdir(join(root, entry), { recursive: true });
     else await writeFixture(join(root, entry), entry === "package.json" ? '{"name":"fixture","version":"1.0.0"}\n' : `${entry}\n`);
@@ -21,6 +21,7 @@ async function createRuntimeSource(root) {
   await writeFixture(join(root, "lib", "entry.js"), "export const fixture = true;\n");
   await writeFixture(join(root, "native", "helper.txt"));
   await writeFixture(join(root, "extension", "manifest.json"), "{}\n");
+  await writeFixture(join(root, "skills", "unified-device-control", "SKILL.md"), "---\nname: unified-device-control\n---\n");
   await writeFixture(join(root, "node_modules", ".package-lock.json"), "{}\n");
   for (const dependency of ["@modelcontextprotocol/sdk", "ws", "zod"]) {
     await writeFixture(join(root, "node_modules", dependency, "package.json"), `{"name":"${dependency}"}\n`);

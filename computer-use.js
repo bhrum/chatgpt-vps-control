@@ -10,7 +10,7 @@ import {
   nativeComputerWindowAction,
 } from "./lib/native-computer-backend.js";
 import { listSemanticApplications, listSemanticElements, semanticElementAction } from "./lib/semantic-computer.js";
-import { browserSessionCua, browserSessionLocator, browserSessionTabAction, browserSessionUtility, listBrowserSessions, navigateBrowserSession, startBrowserSession, stopBrowserSession } from "./lib/browser-session.js";
+import { browserSessionCua, browserSessionLocator, browserSessionSnapshot, browserSessionTabAction, browserSessionUtility, listBrowserSessions, navigateBrowserSession, startBrowserSession, stopBrowserSession } from "./lib/browser-session.js";
 import { activateLinuxApplication } from "./lib/linux-accessibility.js";
 
 const API_WIDTH = 1280;
@@ -91,13 +91,16 @@ const computerUseArgsSchema = actionSchema.extend({
 });
 
 const browserLocatorSchema = z.object({
+  ref: z.string().regex(/^@?\d+$/).optional(),
+  snapshotId: z.string().min(8).max(128).optional(),
   css: z.string().max(2000).optional(),
   role: z.string().max(200).optional(),
   name: z.string().max(2000).optional(),
   text: z.string().max(5000).optional(),
   exact: z.boolean().default(false).optional(),
   nth: z.number().int().min(0).max(10_000).default(0).optional(),
-}).refine((locator) => Boolean(locator.css || locator.role || locator.name || locator.text), "Locator requires css, role, name, or text.");
+}).refine((locator) => Boolean(locator.ref || locator.css || locator.role || locator.name || locator.text), "Locator requires ref, css, role, name, or text.")
+  .refine((locator) => !locator.ref || Boolean(locator.snapshotId), "A ref locator requires snapshotId.");
 
 const browserLocatorStepSchema = z.object({
   action: z.enum(BROWSER_LOCATOR_ACTIONS),
@@ -291,6 +294,18 @@ const browserLocatorResultShape = {
   results: z.array(browserLocatorStepResultShape),
   screenshotIncluded: z.boolean(),
   screenshotMimeType: z.string().nullable(),
+  message: z.string(),
+};
+const browserSnapshotRefShape = z.object({ ref: z.string(), role: z.string(), name: z.string(), value: z.string() });
+const browserSnapshotResultShape = {
+  session: browserSessionShape,
+  target: managedBrowserTargetShape.nullable(),
+  snapshotId: z.string(),
+  expiresInMs: z.number().int(),
+  content: z.string(),
+  refs: z.array(browserSnapshotRefShape),
+  nodeCount: z.number().int(),
+  truncated: z.boolean(),
   message: z.string(),
 };
 const browserCuaPointShape = z.object({
@@ -602,6 +617,18 @@ const browserLocatorResultJsonSchema = {
     screenshotMimeType: { type: ["string", "null"] }, message: { type: "string" },
   },
   required: ["session", "target", "results", "screenshotIncluded", "screenshotMimeType", "message"],
+  additionalProperties: false,
+};
+const browserSnapshotResultJsonSchema = {
+  type: "object",
+  properties: {
+    session: browserSessionJsonSchema,
+    target: { anyOf: [browserTargetJsonSchema, { type: "null" }] },
+    snapshotId: { type: "string" }, expiresInMs: { type: "integer" }, content: { type: "string" },
+    refs: { type: "array", items: { type: "object", properties: { ref: { type: "string" }, role: { type: "string" }, name: { type: "string" }, value: { type: "string" } }, required: ["ref", "role", "name", "value"], additionalProperties: false } },
+    nodeCount: { type: "integer" }, truncated: { type: "boolean" }, message: { type: "string" },
+  },
+  required: ["session", "target", "snapshotId", "expiresInMs", "content", "refs", "nodeCount", "truncated", "message"],
   additionalProperties: false,
 };
 const browserCuaActionJsonSchema = {
@@ -1851,9 +1878,30 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
       _meta: toolMeta("Using managed browser utility", "Managed browser utility finished", writeSecuritySchemes),
     },
     {
+      name: "computer_browser_snapshot",
+      title: "Browser semantic snapshot",
+      description: "Return a compact accessibility snapshot for one exact claimed browser tab. Actionable nodes receive short-lived @refs that can be used with computer_browser_locator together with the returned snapshotId.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session: { type: "string", minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+          targetId: { type: "string", minLength: 1, maxLength: 200 },
+          targetClaim: { type: "string", minLength: 1, maxLength: 200 },
+          maxNodes: { type: "integer", minimum: 1, maximum: 1000, default: 500 },
+          includeText: { type: "boolean", default: true },
+        },
+        required: ["session", "targetId", "targetClaim"],
+        additionalProperties: false,
+      },
+      outputSchema: browserSnapshotResultJsonSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: false },
+      securitySchemes: readSecuritySchemes,
+      _meta: toolMeta("Reading browser semantic snapshot", "Browser semantic snapshot ready", readSecuritySchemes),
+    },
+    {
       name: "computer_browser_locator",
       title: "Browser locator",
-      description: "Run one to twenty declarative visible-DOM locator steps against an exact claimed target in a managed, attached, or extension-connected browser session. Locators use CSS, role, accessible name, or text, can enter up to eight same-origin or cross-origin frames through isolated CDP worlds, and support click/double-click, approved-root file inputs, and element drag; arbitrary JavaScript evaluation is not exposed.",
+      description: "Run one to twenty declarative visible-DOM locator steps against an exact claimed target. Locators use a short-lived snapshot @ref, CSS, role, accessible name, or text; arbitrary JavaScript evaluation is not exposed.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1869,6 +1917,8 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
                 locator: {
                   type: "object",
                   properties: {
+                    ref: { type: "string", pattern: "^@?[0-9]+$", description: "Short-lived ref returned by computer_browser_snapshot." },
+                    snapshotId: { type: "string", minLength: 8, maxLength: 128, description: "Required with ref and must belong to this exact target claim." },
                     css: { type: "string", maxLength: 2000 }, role: { type: "string", maxLength: 200 },
                     name: { type: "string", maxLength: 2000 }, text: { type: "string", maxLength: 5000 },
                     exact: { type: "boolean", default: false }, nth: { type: "integer", minimum: 0, maximum: 10_000, default: 0 },
@@ -1890,6 +1940,7 @@ export function buildComputerToolDescriptors({ readSecuritySchemes, writeSecurit
                 target: {
                   type: "object",
                   properties: {
+                    ref: { type: "string", pattern: "^@?[0-9]+$" }, snapshotId: { type: "string", minLength: 8, maxLength: 128 },
                     css: { type: "string", maxLength: 2000 }, role: { type: "string", maxLength: 200 },
                     name: { type: "string", maxLength: 2000 }, text: { type: "string", maxLength: 5000 },
                     exact: { type: "boolean", default: false }, nth: { type: "integer", minimum: 0, maximum: 10_000, default: 0 },
@@ -2484,10 +2535,46 @@ export function registerComputerUseTools(server, options) {
   );
 
   server.registerTool(
+    "computer_browser_snapshot",
+    {
+      title: "Browser semantic snapshot",
+      description: "Return a compact accessibility snapshot whose short-lived @refs are bound to one exact claimed browser target.",
+      inputSchema: {
+        session: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
+        targetId: z.string().min(1).max(200),
+        targetClaim: z.string().min(1).max(200),
+        maxNodes: z.number().int().min(1).max(1000).default(500).optional(),
+        includeText: z.boolean().default(true).optional(),
+      },
+      outputSchema: browserSnapshotResultShape,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: false },
+      securitySchemes: readSecuritySchemes,
+      _meta: toolMeta("Reading browser semantic snapshot", "Browser semantic snapshot ready", readSecuritySchemes),
+    },
+    async ({ session, targetId, targetClaim, maxNodes, includeText }) => {
+      if (!hasReadScope()) return toolAuthError(readAuthChallenge);
+      try {
+        const result = await browserSessionSnapshot({ name: session, targetId, targetClaim, maxNodes, includeText });
+        const message = `Returned ${result.nodeCount} semantic browser nodes and ${result.refs.length} short-lived refs for target ${targetId}.`;
+        const structuredContent = {
+          ...result,
+          session: publicBrowserSession(result.session),
+          target: publicBrowserTarget(result.target),
+          message,
+        };
+        return { structuredContent, content: [{ type: "text", text: `${message}\n${result.content}` }] };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { isError: true, content: [{ type: "text", text: `Managed browser snapshot failed: ${message}` }] };
+      }
+    }
+  );
+
+  server.registerTool(
     "computer_browser_locator",
     {
       title: "Browser locator",
-      description: "Run declarative CSS/role/name/text locator inspection, waiting, same-origin or cross-origin frame traversal, click/double-click, form, approved-root file upload, element drag, keyboard, and scrolling steps against one exact claimed target, then return its page screenshot.",
+      description: "Run declarative @ref/CSS/role/name/text locator inspection, waiting, frame traversal, click, form, approved-root file upload, drag, keyboard, and scrolling steps against one exact claimed target, then return its screenshot.",
       inputSchema: {
         session: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
         targetId: z.string().min(1).max(200),

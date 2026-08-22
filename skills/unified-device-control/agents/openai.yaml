@@ -1,0 +1,7 @@
+interface:
+  display_name: "统一设备控制"
+  short_description: "通过应用内与语义能力低干扰地控制在线电脑和浏览器"
+  default_prompt: "Use $unified-device-control to operate an online device with background semantic controls first."
+
+policy:
+  allow_implicit_invocation: true
