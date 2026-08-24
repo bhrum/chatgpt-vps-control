@@ -4,8 +4,17 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { windowsRunCommand } from "../lib/service-manager.js";
 
 const cli = resolve("bin/chatgpt-computer-control.js");
+
+test("Windows startup command keeps executable and CLI paths with spaces intact", () => {
+  const command = windowsRunCommand(
+    "C:\\Program Files\\nodejs\\node.exe",
+    "C:\\Users\\Example User\\control\\chatgpt-computer-control.js",
+  );
+  assert.equal(command, '"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\Example User\\control\\chatgpt-computer-control.js" serve');
+});
 
 test("macOS helper has a stable named app-bundle identity", async () => {
   const [plist, servicePlist] = await Promise.all([
