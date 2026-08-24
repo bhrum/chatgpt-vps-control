@@ -7,6 +7,16 @@ description: Control online computers through the Unified Device Control MCP wit
 
 Use the Unified Device Control MCP as the transport. Call `list_devices` first, select one online device explicitly, and only call capabilities advertised by that device.
 
+## Add a device
+
+When the user asks to add or enroll a new computer, call `list_devices` first to
+avoid reusing an existing device ID. Then call `create_device_enrollment`,
+optionally reserving the requested `deviceId` and `deviceName`. Give the returned
+command only to the computer being added and state that it expires after 10
+minutes. After the user or local installer runs it and installs the background
+service, call `list_devices` again and verify the exact device is online. Never
+request, reveal, or copy the legacy shared gateway token.
+
 ## Route each task
 
 Choose the least disruptive capable surface in this order:

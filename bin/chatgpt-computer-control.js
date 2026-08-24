@@ -6,9 +6,10 @@ import { ensureLinuxDesktop } from "../lib/linux-desktop.js";
 import { browserExtensionStatus, installBrowserExtension } from "../lib/browser-extension-install.js";
 import { startMacPresenceAgent } from "../lib/macos-presence-agent.js";
 import { installUnifiedDeviceSkill } from "../lib/skill-install.js";
+import { enrollDevice } from "../lib/device-enrollment.js";
 
 function printUsage() {
-  console.log(`ChatGPT Computer Control\n\nUsage:\n  chatgpt-computer-control setup [--no-deps] [--host 127.0.0.1] [--port 8787]\n  chatgpt-computer-control doctor\n  chatgpt-computer-control serve\n  chatgpt-computer-control presence\n  chatgpt-computer-control service install\n  chatgpt-computer-control service remove\n  chatgpt-computer-control browser-extension install\n  chatgpt-computer-control browser-extension status\n  chatgpt-computer-control skill install\n  chatgpt-computer-control url\n\nThe MCP server binds to loopback by default. Expose it only through an authenticated HTTPS tunnel or another trusted transport.`);
+  console.log(`ChatGPT Computer Control\n\nUsage:\n  chatgpt-computer-control setup [--no-deps] [--host 127.0.0.1] [--port 8787]\n  chatgpt-computer-control enroll --server https://control.example.com --code <one-time-code> [--id device-id] [--name "Device name"] [--ip-family 4]\n  chatgpt-computer-control doctor\n  chatgpt-computer-control serve\n  chatgpt-computer-control presence\n  chatgpt-computer-control service install\n  chatgpt-computer-control service remove\n  chatgpt-computer-control browser-extension install\n  chatgpt-computer-control browser-extension status\n  chatgpt-computer-control skill install\n  chatgpt-computer-control url\n\nThe MCP server binds to loopback by default. Expose it only through an authenticated HTTPS tunnel or another trusted transport.`);
 }
 
 function valueAfter(args, flag, fallback) {
@@ -35,6 +36,24 @@ async function setup(args) {
   }
   console.log("Next: chatgpt-computer-control doctor");
   console.log("Then: chatgpt-computer-control service install");
+}
+
+async function enroll(args) {
+  const server = valueAfter(args, "--server", "");
+  const code = valueAfter(args, "--code", "");
+  if (!server || !code) throw new Error("Use: chatgpt-computer-control enroll --server <https-url> --code <one-time-code>");
+  const existing = await readLocalConfig();
+  if (!existing.VPS_APP_TOKEN) await setupLocalComputer({ installDependencies: false });
+  const result = await enrollDevice({
+    server,
+    code,
+    deviceId: valueAfter(args, "--id", ""),
+    deviceName: valueAfter(args, "--name", ""),
+    ipFamily: valueAfter(args, "--ip-family", ""),
+  });
+  console.log(`Enrolled ${result.deviceName} (${result.deviceId}) with ${new URL(result.gatewayUrl).host}.`);
+  console.log("The per-device credential was stored in the private local configuration and was not printed.");
+  console.log("Next: chatgpt-computer-control service install");
 }
 
 async function doctor() {
@@ -105,6 +124,7 @@ async function main() {
   const command = args[0] || "help";
   if (["help", "-h", "--help"].includes(command)) return printUsage();
   if (command === "setup") return setup(args.slice(1));
+  if (command === "enroll") return enroll(args.slice(1));
   if (command === "doctor") return doctor();
   if (command === "serve") return serve();
   if (command === "presence") return presence();

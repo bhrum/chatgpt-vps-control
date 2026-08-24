@@ -242,6 +242,30 @@ gateway connection and does not expose an inbound port.
 
 The central MCP keeps a stable gateway surface: `list_devices` returns the live registry plus a compact tool-schema count/version, `describe_device_tool` returns the current MCP title/description/input/output schema for one advertised device tool, and `device_call` forwards a named MCP tool plus JSON arguments to a connected device. Device agents upload bounded, sanitized tool descriptors when they register, so ChatGPT can discover newly added local capabilities without hard-coding their arguments or reinstalling the plugin. Adding another computer still does not change the central tool list. Agents make outbound WebSocket connections, so individual computers do not need public inbound ports.
 
+### Fast, per-device enrollment
+
+The public MCP exposes `create_device_enrollment`. It creates a single-use code
+that expires after 10 minutes and may optionally be locked to a device ID and
+display name. The shared `DEVICE_GATEWAY_TOKEN` is never returned to ChatGPT or
+copied to the new computer.
+
+On a computer where `chatgpt-computer-control setup` has already been run, use
+the command returned by the MCP:
+
+```bash
+chatgpt-computer-control enroll \
+  --server https://chatgpt-mcp.371080.xyz \
+  --code <one-time-code> \
+  --id my-computer \
+  --name "My Computer"
+chatgpt-computer-control service install
+```
+
+The enrollment endpoint exchanges the one-time code directly for a unique
+device credential, stores it only in the private local configuration, and does
+not print it. Reusing an enrollment code fails. Existing agents using the legacy
+shared gateway token remain compatible during migration.
+
 ## Security properties
 
 - Default bind address is loopback.

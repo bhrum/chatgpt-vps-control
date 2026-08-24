@@ -46,6 +46,16 @@ gateway operations: `list_devices`, `describe_device_tool`, and `device_call`.
 annotations on demand. This lets ChatGPT learn newly deployed device capabilities
 without expanding every device tool into the public Worker tool list.
 
+## One-time device enrollment
+
+Call the authenticated MCP tool `create_device_enrollment` to generate a
+single-use setup command. The code expires after 10 minutes. The new device
+posts the code, its ID, and its display name to `/agent/enroll`, receives an
+independent device credential over HTTPS, and then connects to `/agent` with
+that credential and `X-Device-Id`. The Durable Object stores only SHA-256
+digests of device credentials. The legacy shared `DEVICE_GATEWAY_TOKEN` remains
+accepted so already-installed devices can be migrated without downtime.
+
 ## Private user input
 
 The MCP exposes an MCP Apps card for passwords, OTPs, API keys, personal data,

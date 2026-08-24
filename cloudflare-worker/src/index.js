@@ -9,6 +9,7 @@ const SENSITIVE_INPUT_RESOURCE_URI = "ui://widget/sensitive-input-v1.html";
 const MAX_DEVICE_TOOLS = 100;
 const MAX_TOOL_DESCRIPTOR_BYTES = 64 * 1024;
 const MAX_TOOL_CATALOG_BYTES = 512 * 1024;
+const DEVICE_ENROLLMENT_TTL_SECONDS = 10 * 60;
 
 function json(value, status = 200, headers = {}) {
   return new Response(JSON.stringify(value), {
@@ -27,6 +28,21 @@ function rpcError(id, code, message, data) {
 
 function validDeviceId(value) {
   return typeof value === "string" && /^[a-zA-Z0-9._-]{1,128}$/.test(value);
+}
+
+function validDeviceName(value) {
+  return typeof value === "string" && /^[\p{L}\p{N} ._()-]{1,200}$/u.test(value);
+}
+
+function randomToken(bytes = 32) {
+  const value = new Uint8Array(bytes);
+  crypto.getRandomValues(value);
+  return btoa(String.fromCharCode(...value)).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/gu, "");
+}
+
+async function tokenDigest(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function publicToolDescriptor(tool) {
@@ -77,7 +93,36 @@ function publicDevice(value) {
   };
 }
 
-const TOOLS = [
+export const TOOLS = [
+  {
+    name: "create_device_enrollment",
+    title: "Create a one-time device enrollment",
+    description: "Create a single-use, 10-minute enrollment code for adding a computer to this MCP. The new computer exchanges the code directly for its own device credential; the shared gateway secret is never revealed. Return the generated setup command to the user and never run it on a different computer without their request.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        deviceId: { type: "string", minLength: 1, maxLength: 128, pattern: "^[a-zA-Z0-9._-]+$" },
+        deviceName: { type: "string", minLength: 1, maxLength: 200 },
+      },
+      additionalProperties: false,
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        enrollmentCode: { type: "string" },
+        enrollmentEndpoint: { type: "string" },
+        expiresAt: { type: "string" },
+        deviceId: { anyOf: [{ type: "string" }, { type: "null" }] },
+        deviceName: { anyOf: [{ type: "string" }, { type: "null" }] },
+        command: { type: "string" },
+      },
+      required: ["enrollmentCode", "enrollmentEndpoint", "expiresAt", "deviceId", "deviceName", "command"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    securitySchemes: [{ type: "oauth2", scopes: ["device.control"] }],
+    _meta: { securitySchemes: [{ type: "oauth2", scopes: ["device.control"] }] },
+  },
   {
     name: "list_devices",
     title: "List controllable devices",
@@ -288,12 +333,28 @@ export class DeviceRegistry {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       this.ctx.acceptWebSocket(server);
-      server.serializeAttachment({ deviceId: null, registered: false });
+      server.serializeAttachment({
+        deviceId: null,
+        registered: false,
+        authorizedDeviceId: request.headers.get("x-authorized-device-id") || "",
+      });
       return new Response(null, { status: 101, webSocket: client });
     }
 
     if (url.pathname === "/devices" && request.method === "GET") {
       return json({ devices: await this.listDevices() });
+    }
+
+    if (url.pathname === "/enroll/create" && request.method === "POST") {
+      return json(await this.createEnrollment(await request.json()));
+    }
+
+    if (url.pathname === "/enroll/redeem" && request.method === "POST") {
+      return json(await this.redeemEnrollment(await request.json()));
+    }
+
+    if (url.pathname === "/agent/authorize" && request.method === "POST") {
+      return json(await this.authorizeAgent(await request.json()));
     }
 
     if (url.pathname === "/describe" && request.method === "POST") {
@@ -331,6 +392,59 @@ export class DeviceRegistry {
       devices.set(attachment.deviceId, publicDevice({ ...attachment, id: attachment.deviceId, status: "online" }));
     }
     return [...devices.values()].sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  async createEnrollment(body) {
+    const deviceId = body?.deviceId ? String(body.deviceId) : "";
+    const deviceName = body?.deviceName ? String(body.deviceName).trim().slice(0, 200) : "";
+    if (deviceId && !validDeviceId(deviceId)) throw new Error("Invalid deviceId.");
+    if (body?.deviceName && !validDeviceName(deviceName)) throw new Error("Invalid deviceName.");
+    const existing = await this.ctx.storage.list({ prefix: "enrollment:", limit: 100 });
+    for (const [key, value] of existing) {
+      if (Number(value?.expiresAt) <= Date.now()) await this.ctx.storage.delete(key);
+    }
+    const code = randomToken(32);
+    const expiresAt = Date.now() + DEVICE_ENROLLMENT_TTL_SECONDS * 1000;
+    await this.ctx.storage.put(`enrollment:${await tokenDigest(code)}`, {
+      deviceId: deviceId || null,
+      deviceName: deviceName || null,
+      expiresAt,
+      createdAt: new Date().toISOString(),
+    });
+    return { code, expiresAt, deviceId: deviceId || null, deviceName: deviceName || null };
+  }
+
+  async redeemEnrollment(body) {
+    const code = String(body?.code || "");
+    const deviceId = String(body?.deviceId || "");
+    const deviceName = String(body?.deviceName || deviceId).trim().slice(0, 200);
+    if (code.length < 32 || !validDeviceId(deviceId) || !validDeviceName(deviceName)) throw new Error("Invalid device enrollment request.");
+    const key = `enrollment:${await tokenDigest(code)}`;
+    const enrollment = await this.ctx.storage.transaction(async (transaction) => {
+      const record = await transaction.get(key);
+      if (record) await transaction.delete(key);
+      return record;
+    });
+    if (!enrollment || Number(enrollment.expiresAt) <= Date.now()) {
+      throw new Error("The device enrollment code is invalid or expired.");
+    }
+    if (enrollment.deviceId && enrollment.deviceId !== deviceId) throw new Error("This enrollment code is reserved for a different device ID.");
+    if (enrollment.deviceName && enrollment.deviceName !== deviceName) throw new Error("This enrollment code is reserved for a different device name.");
+    const deviceToken = randomToken(32);
+    await this.ctx.storage.put(`agent-token:${deviceId}`, {
+      digest: await tokenDigest(deviceToken),
+      deviceName,
+      createdAt: new Date().toISOString(),
+    });
+    return { deviceId, deviceName, deviceToken };
+  }
+
+  async authorizeAgent(body) {
+    const deviceId = String(body?.deviceId || "");
+    const token = String(body?.token || "");
+    if (!validDeviceId(deviceId) || token.length < 32) return { authorized: false };
+    const record = await this.ctx.storage.get(`agent-token:${deviceId}`);
+    return { authorized: Boolean(record?.digest && record.digest === await tokenDigest(token)) };
   }
 
   async describeDeviceTool(body) {
@@ -401,7 +515,8 @@ export class DeviceRegistry {
     if (payload.type === "register") {
       const deviceId = String(payload.deviceId || "");
       const name = String(payload.name || deviceId).slice(0, 200);
-      if (!validDeviceId(deviceId) || !name) {
+      const authorizedDeviceId = String(socket.deserializeAttachment()?.authorizedDeviceId || "");
+      if (!validDeviceId(deviceId) || !name || (authorizedDeviceId && authorizedDeviceId !== deviceId)) {
         socket.close(1008, "invalid registration");
         return;
       }
@@ -553,6 +668,30 @@ async function handleToolCall(params, env) {
   const name = String(params?.name || "");
   const args = params?.arguments || {};
   const stub = registry(env);
+
+  if (name === "create_device_enrollment") {
+    const response = await stub.fetch("https://registry/enroll/create", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ deviceId: args.deviceId, deviceName: args.deviceName }),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const enrollment = await response.json();
+    const origin = String(env.PUBLIC_ORIGIN || "").replace(/\/$/u, "");
+    const enrollmentEndpoint = `${origin}/agent/enroll`;
+    const command = `chatgpt-computer-control enroll --server ${origin} --code ${enrollment.code}`
+      + (enrollment.deviceId ? ` --id ${enrollment.deviceId}` : "")
+      + (enrollment.deviceName ? ` --name ${JSON.stringify(enrollment.deviceName)}` : "");
+    const result = {
+      enrollmentCode: enrollment.code,
+      enrollmentEndpoint,
+      expiresAt: new Date(enrollment.expiresAt).toISOString(),
+      deviceId: enrollment.deviceId,
+      deviceName: enrollment.deviceName,
+      command,
+    };
+    return { content: [{ type: "text", text: `One-time device enrollment created. It expires at ${result.expiresAt}. Run the returned command on the computer being added.` }], structuredContent: result };
+  }
 
   if (name === "list_devices") {
     const response = await stub.fetch("https://registry/devices");
@@ -867,10 +1006,44 @@ export default {
       return response.ok ? managePage(`已撤销 ${result.revoked} 个令牌。`) : managePage(result.error_description || "撤销失败。", true);
     }
     if (url.pathname === "/agent") {
-      if (!env.DEVICE_GATEWAY_TOKEN || request.headers.get("authorization") !== `Bearer ${env.DEVICE_GATEWAY_TOKEN}`) {
-        return new Response("Unauthorized", { status: 401 });
+      const authorization = request.headers.get("authorization") || "";
+      let authorizedDeviceId = "";
+      if (!env.DEVICE_GATEWAY_TOKEN || authorization !== `Bearer ${env.DEVICE_GATEWAY_TOKEN}`) {
+        const deviceId = request.headers.get("x-device-id") || "";
+        const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+        const checked = await registry(env).fetch("https://registry/agent/authorize", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ deviceId, token }),
+        });
+        const result = await checked.json();
+        if (!result.authorized) return new Response("Unauthorized", { status: 401 });
+        authorizedDeviceId = deviceId;
       }
-      return registry(env).fetch("https://registry/connect", request);
+      const headers = new Headers(request.headers);
+      if (authorizedDeviceId) headers.set("x-authorized-device-id", authorizedDeviceId);
+      return registry(env).fetch("https://registry/connect", new Request(request, { headers }));
+    }
+    if (url.pathname === "/agent/enroll" && request.method === "POST") {
+      let body;
+      try {
+        const raw = await request.text();
+        if (raw.length > 4096) return json({ error: "Enrollment request is too large." }, 413);
+        body = JSON.parse(raw);
+      } catch { return json({ error: "Invalid JSON." }, 400); }
+      try {
+        const response = await registry(env).fetch("https://registry/enroll/redeem", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!response.ok) return response;
+        const result = await response.json();
+        const gatewayUrl = `${url.protocol === "https:" ? "wss:" : "ws:"}//${url.host}/agent`;
+        return json({ ...result, gatewayUrl });
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
     }
     if (url.pathname === "/mcp") {
       if (!(await verifyBearer(request, env))) return oauthChallenge(request, env);

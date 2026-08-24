@@ -2,11 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { codexSkillsRoot, installUnifiedDeviceSkill } from "../lib/skill-install.js";
 
 test("codexSkillsRoot honors CODEX_HOME", () => {
-  assert.equal(codexSkillsRoot({ CODEX_HOME: "/tmp/task-codex-home" }), "/tmp/task-codex-home/skills");
+  assert.equal(codexSkillsRoot({ CODEX_HOME: "/tmp/task-codex-home" }), join(resolve("/tmp/task-codex-home"), "skills"));
 });
 
 test("installs the bundled unified device Skill", async () => {
