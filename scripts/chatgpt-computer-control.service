@@ -1,0 +1,15 @@
+[Unit]
+Description=ChatGPT Computer Control (MCP server + device agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CHATGPT_COMPUTER_HOME=/home/hatch/.chatgpt-computer-control
+Environment=HOME=/home/hatch
+ExecStart=/home/hatch/workspace/chatgpt-vps-control/scripts/run-service.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
