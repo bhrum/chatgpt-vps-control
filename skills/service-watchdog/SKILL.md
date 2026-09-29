@@ -60,6 +60,16 @@ Done means all three hold:
 1. `/etc` is ephemeral here: never rely on anything under `/etc` (unit
    files, apt source edits) surviving a reboot. The repo (`~/workspace`)
    and `~` persist — keep every recovery artifact there.
+2. A reboot can also wipe apt-installed packages under `/usr` (seen
+   2026-09-30: `xfwm4`, `xdotool`, `wmctrl`, `x11-utils`,
+   `python3-pyatspi`, `at-spi2-core` all gone). Without them the service
+   start-loops with `Managed Linux desktop requires <binary>` and
+   reinstalling the unit file alone does NOT fix it. The installer script
+   (`scripts/install-systemd-service.sh`) now re-installs the desktop
+   dependency set via apt before enabling the service — always recover
+   through the installer, never by restoring the unit file alone.
+   If `journalctl` shows `Managed Linux desktop requires …` after a
+   reboot, the deps are the problem, not the unit file.
 2. The service needs `CHATGPT_COMPUTER_HOME=/home/hatch/.chatgpt-computer-control`
    and `HOME=/home/hatch` in its environment, or it cannot find its config.
 3. Use the credential-less egress proxy `http://hatch-egress-proxy:3128`.
